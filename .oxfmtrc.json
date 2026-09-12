@@ -1,0 +1,8 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": [".codegraph/**", "coverage/**", "dist/**", "node_modules/**"],
+  "printWidth": 100,
+  "singleQuote": true,
+  "sortImports": true,
+  "sortPackageJson": true
+}

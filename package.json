@@ -1,0 +1,45 @@
+{
+  "name": "@revisium/revo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Standalone distribution and composition entrypoint for Revo",
+  "homepage": "https://github.com/revisium/revo#readme",
+  "license": "MIT",
+  "author": "Anton Kashirov",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/revisium/revo.git"
+  },
+  "bin": {
+    "revo": "dist/bin/revo.js"
+  },
+  "files": [
+    "dist/"
+  ],
+  "type": "module",
+  "exports": {
+    "./layout": "./dist/layout.js",
+    "./release-metadata": "./dist/release-metadata.js"
+  },
+  "scripts": {
+    "build": "tsc -b --clean tsconfig.build.json && tsc -p tsconfig.build.json",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint --type-aware --type-check --deny-warnings --report-unused-disable-directives .",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.2",
+    "oxfmt": "0.62.0",
+    "oxlint": "1.77.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  },
+  "engines": {
+    "node": ">=24.11.1 <25"
+  },
+  "packageManager": "pnpm@11.13.0"
+}
