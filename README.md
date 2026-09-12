@@ -40,14 +40,8 @@ node dist/bin/revo.js --version
 ```
 
 Other commands fail with an explicit placeholder message. This adapter will be replaced by
-`revo-cli` integration; command behavior must not be duplicated here. The package remains private
-and cannot be published until the runtime composition and release train are ready.
-
-## Architecture
-
-- [Single-listener composition](docs/adr/0001-single-listener-composition.md)
-- [Stable and alpha isolation](docs/adr/0002-release-channel-isolation.md)
-- [Database ownership and migrations](docs/adr/0003-database-ownership-and-migrations.md)
+`revo-cli` integration; command behavior must not be duplicated here. The package manifest is
+private during the foundation stage.
 
 ## Development
 

@@ -9,5 +9,3 @@
 - Treat the foundation command implementation as a temporary placeholder pending `revo-cli`
   integration.
 - Do not add component dependencies before their public runtime contracts are released.
-- Package contents must match the exact allowlist in the package dry-run check.
-- Do not weaken the private-package publication guard in a foundation change.

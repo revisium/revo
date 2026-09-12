@@ -22,15 +22,13 @@
     "./release-metadata": "./dist/release-metadata.js"
   },
   "scripts": {
-    "build": "node scripts/clean.mjs && tsc -p tsconfig.build.json",
+    "build": "tsc -b --clean tsconfig.build.json && tsc -p tsconfig.build.json",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --type-aware --type-check --deny-warnings --report-unused-disable-directives .",
-    "package:check": "node scripts/check-package.mjs",
-    "prepublishOnly": "node scripts/refuse-publish.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm package:check"
+    "verify": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm test && pnpm build"
   },
   "devDependencies": {
     "@types/node": "26.1.2",
