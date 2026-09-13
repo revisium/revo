@@ -1,11 +1,15 @@
-# Agent instructions
+# Repository agent instructions
 
-Use the canonical workspace agent playbook and the repository overlays in
-`REPOSITORY.md`, `VERIFICATION.md`, and `REVIEW.md`.
+Read [REPOSITORY.md](REPOSITORY.md), [REVIEW.md](REVIEW.md), and
+[VERIFICATION.md](VERIFICATION.md) before editing.
 
-`revo-cli` owns command grammar, parsing, help, output, and exit codes. This repository owns the
-`revo` binary adapter and injects distribution lifecycle capabilities. Do not duplicate or retire
-`revo-cli`; the foundation adapter is temporary pending package integration.
+Keep the CLI in this repository. Implement commands as thin NestJS entrypoints over product
+services and the public Revo Core runtime; do not deep-import Core internals or move domain
+behavior out of Core.
 
-For local Node setup, run `corepack enable pnpm` once. The `packageManager` field pins the pnpm
-version used by bare `pnpm` commands.
+Prefer behavior-first TDD with readable scenario DSLs and explicit fixtures, including installer
+work. Keep production code and tests SOLID, focused, and at one level of abstraction.
+
+Pull requests use the repository template and a short English description of the final outcome.
+Before handoff, review the exact branch head and require CI, the Sonar quality gate, and scoped open
+issue inspection to pass for that same revision.

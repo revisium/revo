@@ -1,7 +1,7 @@
 # Repository contract
 
-`revo` is the standalone Revo distribution and composition package. It owns the `revo` binary,
-product layout, release channels, process lifecycle, installation, and the final HTTP application.
+`revo` owns the standalone distribution: its CLI, product layout, release channels, installation,
+local process and PostgreSQL lifecycle, and final HTTP application.
 
 ## Source-of-truth order
 
@@ -14,21 +14,19 @@ Generated `dist/`, coverage output, and package tarballs are never source files.
 
 ## Repository boundaries
 
-- `revo-cli` owns command grammar, argument parsing, help, terminal output, and exit codes.
-- `revo-core` owns product APIs, domain behavior, and its database migrations.
-- `revo-admin` owns the static browser application.
-- `revo-tui` owns terminal UI behavior.
-- This repository exposes the `revo` binary as a composition adapter, injects distribution lifecycle
-  capabilities into `revo-cli`, and composes released package versions. It does not copy component
-  source or duplicate command behavior.
+- Revo commands are thin NestJS entrypoints over focused application services.
+- Revo Core owns product APIs, domain behavior, its schema, and migrations. Revo integrates only
+  its public runtime contract.
+- Revo Admin owns the static browser application; Revo TUI owns terminal UI behavior.
+- Revo composes pinned released components without copying their source or domain behavior.
 
-The foundation intentionally contains no component dependency, server, database, daemon, Docker,
-or installer implementation. Its minimal binary is a placeholder pending `revo-cli` integration.
+The foundation intentionally contains no component dependency, server, database, Docker, or
+installer implementation. Add each production capability only in its assigned change.
 
 ## Composition contract
 
 - Revo owns the final Nest/Express application and its single public HTTP listener.
-- Revo Core registers GraphQL, REST, MCP, and health routes through a supported composition API.
+- Core registers backend routes through its public runtime contract.
 - Revo serves Revo Admin static SPA assets and installs its fallback after every backend route.
 - Standalone binds to loopback by default; Docker may explicitly bind to `0.0.0.0`.
 - Stable and alpha use separate configuration, data, state, cache, and runtime directories.
