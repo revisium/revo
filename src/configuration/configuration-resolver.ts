@@ -243,7 +243,7 @@ export class ConfigurationResolver {
     return value;
   }
 
-  private publicUrl(value: string | number | undefined, port: number, source: string): string {
+  private publicUrl(value: ConfigurationValue, port: number, source: string): string {
     if (value === undefined) {
       return `http://127.0.0.1:${port}`;
     }
