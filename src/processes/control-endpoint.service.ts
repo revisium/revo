@@ -218,7 +218,10 @@ function writeFrame(
       clearTimeout(timer);
       resolve();
     };
-    const timer = setTimeout(() => (socket.destroy(), finish()), remaining(deadline));
+    const timer = setTimeout(() => {
+      socket.destroy();
+      finish();
+    }, remaining(deadline));
     socket.once('error', finish);
     socket.once('close', () => socket.off('error', finish));
     socket.end(frame, finish);
@@ -228,7 +231,10 @@ function writeFrame(
 function openServer(server: Server, endpoint: string): Promise<void> {
   return new Promise((resolve, reject) => {
     server.once('error', () => reject(new ControlTransportError()));
-    server.listen(endpoint, () => (server.removeAllListeners('error'), resolve()));
+    server.listen(endpoint, () => {
+      server.removeAllListeners('error');
+      resolve();
+    });
   });
 }
 
