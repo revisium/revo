@@ -32,6 +32,7 @@ const ENV_FIELDS = {
 } as const;
 
 type ValueField = keyof typeof ENV_FIELDS;
+type ConfigurationValue = string | number | undefined;
 
 export class ConfigurationResolver {
   constructor(private readonly fileLoader = new ConfigFileLoader()) {}
@@ -47,15 +48,7 @@ export class ConfigurationResolver {
     });
     const explicitPath = input.flags.config ?? input.env.REVO_CONFIG;
     const configPath = explicitPath ?? path.join(baseLayout.configDir, 'config.json');
-    this.absolutePath(
-      configPath,
-      'config',
-      input.flags.config === undefined
-        ? input.env.REVO_CONFIG === undefined
-          ? 'default'
-          : 'environment'
-        : 'flags',
-    );
+    this.absolutePath(configPath, 'config', this.configPathSource(input));
     const file = this.configurationFile(
       await this.fileLoader.read(configPath, explicitPath !== undefined),
     );
@@ -141,6 +134,12 @@ export class ConfigurationResolver {
       invalidConfiguration('config', 'config-file', 'must be an object');
     }
     const record = value;
+    this.validateFileKeys(record);
+    this.validateFileTypes(record);
+    return this.toConfigurationFile(record);
+  }
+
+  private validateFileKeys(record: Readonly<Record<string, unknown>>): void {
     for (const key of Object.keys(record)) {
       if (!FILE_KEYS.has(key)) {
         invalidConfiguration(key, 'config-file', 'is not supported');
@@ -149,6 +148,9 @@ export class ConfigurationResolver {
     if (record.schemaVersion !== 1) {
       invalidConfiguration('schemaVersion', 'config-file', 'must be 1');
     }
+  }
+
+  private validateFileTypes(record: Readonly<Record<string, unknown>>): void {
     for (const key of ['host', 'publicUrl', 'databaseUrl', 'dataDir', 'logDir'] as const) {
       if (record[key] !== undefined && typeof record[key] !== 'string') {
         invalidConfiguration(key, 'config-file', 'must be a string');
@@ -159,6 +161,11 @@ export class ConfigurationResolver {
         invalidConfiguration(key, 'config-file', 'must be a number');
       }
     }
+  }
+
+  private toConfigurationFile(
+    record: Readonly<Record<string, unknown>>,
+  ): Readonly<ConfigurationFile> {
     return {
       schemaVersion: 1,
       ...(typeof record.databaseUrl === 'string' ? { databaseUrl: record.databaseUrl } : {}),
@@ -178,7 +185,7 @@ export class ConfigurationResolver {
     flags: Readonly<ConfigurationFlags>,
     env: Readonly<Record<string, string | undefined>>,
     file: Readonly<ConfigurationFile>,
-  ): string | number | undefined {
+  ): ConfigurationValue {
     return flags[field] ?? env[ENV_FIELDS[field]] ?? file[field];
   }
 
@@ -201,7 +208,10 @@ export class ConfigurationResolver {
   }
 
   private integer(value: string | number, field: string, maximum: number, source: string): number {
-    const number = typeof value === 'string' ? (value === '' ? Number.NaN : Number(value)) : value;
+    let number = value;
+    if (typeof number === 'string') {
+      number = number === '' ? Number.NaN : Number(number);
+    }
     if (!Number.isInteger(number) || number < 1 || number > maximum) {
       invalidConfiguration(field, source, `must be an integer between 1 and ${maximum}`);
     }
@@ -250,7 +260,7 @@ export class ConfigurationResolver {
         url.hash ||
         (url.pathname !== '' && url.pathname !== '/')
       ) {
-        throw new Error();
+        throw new Error('Not an HTTP(S) origin');
       }
       return url.origin;
     } catch {
@@ -268,7 +278,7 @@ export class ConfigurationResolver {
     try {
       const url = new URL(value);
       if ((url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') || !url.hostname) {
-        throw new Error();
+        throw new Error('Not a PostgreSQL URL');
       }
       return value;
     } catch {
@@ -318,5 +328,15 @@ export class ConfigurationResolver {
         this.absolutePath(value, field, 'environment');
       }
     }
+  }
+
+  private configPathSource(input: Readonly<ConfigurationInput>): string {
+    if (input.flags.config !== undefined) {
+      return 'flags';
+    }
+    if (input.env.REVO_CONFIG !== undefined) {
+      return 'environment';
+    }
+    return 'default';
   }
 }
