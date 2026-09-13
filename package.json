@@ -20,6 +20,7 @@
   "exports": {
     "./configuration": "./dist/configuration/index.js",
     "./layout": "./dist/layout.js",
+    "./postgres": "./dist/postgres/index.js",
     "./processes": "./dist/processes/index.js",
     "./startup-progress": "./dist/startup-progress/index.js",
     "./release-metadata": "./dist/release-metadata.js"
@@ -42,6 +43,12 @@
     "nest-commander": "3.21.0",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2"
+  },
+  "optionalDependencies": {
+    "@embedded-postgres/darwin-arm64": "17.10.0-beta.17",
+    "@embedded-postgres/darwin-x64": "17.10.0-beta.17",
+    "@embedded-postgres/linux-arm64": "17.10.0-beta.17",
+    "@embedded-postgres/linux-x64": "17.10.0-beta.17"
   },
   "devDependencies": {
     "@swc/core": "1.15.47",

@@ -1,3 +1,7 @@
+import type {
+  PreparedEmbeddedPostgres,
+  PrepareEmbeddedPostgresRequest,
+} from '../postgres/index.js';
 import type { StartupProgressFacade, StartupProgressOptions } from '../startup-progress/index.js';
 import type { ControlRecord, ControlStopResult } from './control-endpoint.types.js';
 
@@ -24,5 +28,8 @@ export type PublishedControl =
       readonly endpoint: string;
       readonly stopResult: Promise<ControlStopResult>;
       readonly progress?: StartupProgressFacade;
+      prepareEmbeddedPostgres?(
+        request: PrepareEmbeddedPostgresRequest,
+      ): Promise<PreparedEmbeddedPostgres>;
       close(): Promise<void>;
     };
