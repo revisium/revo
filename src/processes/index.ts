@@ -1,5 +1,6 @@
 export { ManagedProcessError } from './managed-process-error.js';
 export { ControlClientService } from './control-client.service.js';
+export { ControlDiscoveryService } from './control-discovery.service.js';
 export { ControlEndpointService } from './control-endpoint.service.js';
 export { ControlTransportError } from './control-protocol.js';
 export type {
@@ -11,6 +12,12 @@ export type {
 } from './control-endpoint.types.js';
 export { ManagedProcessService } from './managed-process.service.js';
 export { ProcessIdentityError, ProcessIdentityService } from './process-identity.service.js';
+export { PublishedControlError, PublishedControlService } from './published-control.service.js';
+export type {
+  ControlDiscovery,
+  OpenPublishedControlRequest,
+  PublishedControl,
+} from './control-discovery.types.js';
 export { ProcessesModule } from './processes.module.js';
 export { ServerOwnershipService } from './server-ownership.service.js';
 export type { HeldServerOwnership, ServerOwnership } from './ownership.types.js';

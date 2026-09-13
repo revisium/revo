@@ -4,29 +4,35 @@ import { DarwinProcessIdentityAdapter } from './adapters/darwin-process-identity
 import { LinuxProcessIdentityAdapter } from './adapters/linux-process-identity.adapter.js';
 import { PosixFlockAdapter } from './adapters/posix-flock.adapter.js';
 import { ControlClientService } from './control-client.service.js';
+import { ControlDiscoveryService } from './control-discovery.service.js';
 import { ControlEndpointService } from './control-endpoint.service.js';
 import { ManagedProcessService } from './managed-process.service.js';
 import { ProcessExitWaiter } from './process-exit-waiter.js';
 import { PROCESS_IDENTITY_PLATFORM, ProcessIdentityService } from './process-identity.service.js';
+import { PublishedControlService } from './published-control.service.js';
 import { ServerOwnershipService } from './server-ownership.service.js';
 
 @Module({
   exports: [
     ControlClientService,
+    ControlDiscoveryService,
     ControlEndpointService,
     ManagedProcessService,
     ProcessIdentityService,
+    PublishedControlService,
     ServerOwnershipService,
   ],
   providers: [
     DarwinProcessIdentityAdapter,
     ControlClientService,
+    ControlDiscoveryService,
     ControlEndpointService,
     LinuxProcessIdentityAdapter,
     ManagedProcessService,
     PosixFlockAdapter,
     ProcessExitWaiter,
     ProcessIdentityService,
+    PublishedControlService,
     ServerOwnershipService,
     { provide: PROCESS_IDENTITY_PLATFORM, useValue: process.platform },
   ],
