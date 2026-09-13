@@ -82,29 +82,10 @@ export class PublishedControlService {
           )),
       };
     } catch {
-      const cleanupFailures: ('endpoint' | 'metadata' | 'ownership')[] = [];
-      if (endpoint) {
-        try {
-          await endpoint.close();
-        } catch {
-          cleanupFailures.push('endpoint');
-        }
-      }
-      if (temporaryPath) {
-        try {
-          await unlink(temporaryPath);
-        } catch (error) {
-          if (errorCode(error) !== 'ENOENT') {
-            cleanupFailures.push('metadata');
-          }
-        }
-      }
-      try {
-        await lease.release();
-      } catch {
-        cleanupFailures.push('ownership');
-      }
-      throw new PublishedControlError('startup', cleanupFailures);
+      throw new PublishedControlError(
+        'startup',
+        await cleanupStartup(endpoint, temporaryPath, lease),
+      );
     }
   }
 
@@ -144,6 +125,36 @@ export class PublishedControlService {
       throw new PublishedControlError('close');
     }
   }
+}
+
+async function cleanupStartup(
+  endpoint: Awaited<ReturnType<ControlEndpointService['listen']>> | undefined,
+  temporaryPath: string | undefined,
+  lease: Extract<Awaited<ReturnType<ServerOwnershipService['acquire']>>, { kind: 'held' }>,
+) {
+  const failures: ('endpoint' | 'metadata' | 'ownership')[] = [];
+  if (endpoint) {
+    try {
+      await endpoint.close();
+    } catch {
+      failures.push('endpoint');
+    }
+  }
+  if (temporaryPath) {
+    try {
+      await unlink(temporaryPath);
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') {
+        failures.push('metadata');
+      }
+    }
+  }
+  try {
+    await lease.release();
+  } catch {
+    failures.push('ownership');
+  }
+  return failures;
 }
 
 async function publishRecord(temporaryPath: string, locatorPath: string, record: unknown) {

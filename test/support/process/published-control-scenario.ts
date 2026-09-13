@@ -1,5 +1,5 @@
 import { execFile, fork, type ChildProcess } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -53,7 +53,7 @@ export class PublishedControlScenario {
     const discovery = await new ControlDiscoveryService().read(alias);
     return {
       canonical: discovery.kind === 'found' ? discovery.record.canonicalDataDir : undefined,
-      dataDir: fixture.dataDir,
+      dataDir: await realpath(fixture.dataDir),
       separateRuntime: held.kind === 'held' && !held.endpoint.startsWith(fixture.dataDir),
     };
   }
