@@ -18,6 +18,7 @@
   ],
   "type": "module",
   "exports": {
+    "./configuration": "./dist/configuration/index.js",
     "./layout": "./dist/layout.js",
     "./release-metadata": "./dist/release-metadata.js"
   },
