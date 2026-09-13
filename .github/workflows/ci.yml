@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 jobs:
-  ownership-platforms:
-    name: Ownership (${{ matrix.os }})
+  process-platforms:
+    name: Processes (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -43,11 +43,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Verify ownership
+      - name: Verify process services
         run: |
-          node -p "'ownership platform=' + process.platform + ' arch=' + process.arch"
+          node -p "'process platform=' + process.platform + ' arch=' + process.arch"
           pnpm build
-          pnpm exec vitest run test/scenarios/ownership.test.ts
+          pnpm exec vitest run test/scenarios/ownership.test.ts test/scenarios/managed-process.test.ts
 
   verify:
     runs-on: ubuntu-latest
