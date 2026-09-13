@@ -27,18 +27,27 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint --type-aware --type-check --deny-warnings --report-unused-disable-directives .",
     "sonar:issues:local": "bash scripts/sonar-issues-local.sh",
-    "test": "vitest run",
-    "test:cov": "vitest run --coverage",
+    "test": "pnpm build && vitest run",
+    "test:cov": "pnpm build && vitest run --coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm build && pnpm test:cov"
+    "verify": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm test:cov"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.1.28",
+    "@nestjs/core": "11.1.28",
+    "nest-commander": "3.21.0",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
   },
   "devDependencies": {
+    "@swc/core": "1.15.47",
     "@types/node": "26.1.2",
     "@vitest/coverage-v8": "4.1.10",
     "oxfmt": "0.62.0",
     "oxlint": "1.77.0",
     "oxlint-tsgolint": "7.0.2001",
     "typescript": "7.0.2",
+    "unplugin-swc": "1.5.10",
     "vitest": "4.1.10"
   },
   "engines": {

@@ -1,6 +1,17 @@
 #!/usr/bin/env node
 
-import packageMetadata from '../../package.json' with { type: 'json' };
-import { runFoundationCli } from '../foundation-cli.js';
+// oxlint-disable-next-line import/no-unassigned-import -- decorators require this side effect first
+import 'reflect-metadata';
+import { CliBootstrapService } from '../cli/cli-bootstrap.service.js';
+import { OutputService } from '../cli/output.service.js';
+import { PackageMetadataService } from '../cli/package-metadata.service.js';
 
-process.exitCode = runFoundationCli(process.argv.slice(2), packageMetadata.version, console);
+const output = new OutputService();
+const bootstrap = new CliBootstrapService(new PackageMetadataService(), output);
+
+try {
+  process.exitCode = await bootstrap.run();
+} catch (error: unknown) {
+  output.writeError(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}

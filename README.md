@@ -10,14 +10,14 @@
 
 ## Status
 
-Distribution foundation. A temporary binary adapter supports only `revo --version`; cross-platform
-channel layout resolution and release metadata validation are also implemented. Product commands
-remain in `revo-cli` and are not integrated yet.
+Production CLI foundation. The `revo` binary provides help and version commands through a thin
+NestJS application context. Cross-platform channel layout resolution and release metadata
+validation are also implemented; server and installation commands arrive in later production
+stages.
 
 ## Responsibilities
 
-- Expose the `revo` binary.
-- Inject distribution lifecycle capabilities into `revo-cli`.
+- Own the `revo` command grammar, help, output, and exit codes.
 - Own installation, channel-isolated data layout, services, and process lifecycle.
 - Compose compatible releases of `revo-core`, `revo-admin`, and `revo-tui` behind one HTTP listener.
 - Select and manage an embedded PostgreSQL process for standalone installations.
@@ -26,29 +26,27 @@ remain in `revo-cli` and are not integrated yet.
 
 - `revo-core` owns product APIs, domain behavior, and database migrations.
 - `revo-admin` owns the static browser SPA.
-- `revo-cli` owns command grammar, parsing, help, output, and exit codes.
 - `revo-tui` owns terminal UI behavior.
 - Dependencies flow from `revo` to released component packages; components do not import `revo`.
 
-## Foundation CLI
+## CLI
 
-After building, the only successful command is:
+The current commands are:
 
 ```sh
-pnpm build
+node dist/bin/revo.js --help
 node dist/bin/revo.js --version
+node dist/bin/revo.js version
 ```
 
-Other commands fail with an explicit placeholder message. This adapter will be replaced by
-`revo-cli` integration; command behavior must not be duplicated here. The package manifest is
-private during the foundation stage.
+Running `revo` without arguments displays help. Unknown commands and options fail with exit code 2.
+The package manifest remains private during the foundation stage.
 
 ## Development
 
-Use Node.js 24.11.1 and pnpm 11.13.0:
+Use Node.js 26.8.2 and pnpm 12.4.1 in an isolated development environment:
 
 ```sh
-corepack enable pnpm
 pnpm install --frozen-lockfile
 pnpm verify
 ```
