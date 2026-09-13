@@ -48,7 +48,10 @@ export class EmbeddedPostgresReadiness {
   close(): Promise<void> {
     this.closing = true;
     this.controller?.abort();
-    return (this.closeOperation ??= this.performClose());
+    if (!this.closeOperation) {
+      this.closeOperation = this.performClose();
+    }
+    return this.closeOperation;
   }
 
   private async performInitialize(request: EmbeddedPostgresReadinessRequest) {
@@ -196,7 +199,7 @@ export class EmbeddedPostgresReadiness {
     if (this.inFlightSql.size === 0) {
       return;
     }
-    await untilDeadline(Promise.allSettled([...this.inFlightSql]), deadline).catch(() => {
+    await untilDeadline(Promise.allSettled(this.inFlightSql), deadline).catch(() => {
       this.cleanupFailed = true;
     });
   }
@@ -289,10 +292,12 @@ const rejectDispatch = (signal: AbortSignal, closing: boolean, deadline: number)
   }
 };
 
-const safeError = (error: unknown, signal: AbortSignal) =>
-  error instanceof EmbeddedPostgresError
-    ? error
-    : new EmbeddedPostgresError(signal.aborted ? 'cancelled' : 'process');
+const safeError = (error: unknown, signal: AbortSignal) => {
+  if (error instanceof EmbeddedPostgresError) {
+    return error;
+  }
+  return new EmbeddedPostgresError(signal.aborted ? 'cancelled' : 'process');
+};
 
 const errorCode = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

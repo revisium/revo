@@ -48,11 +48,35 @@ describe('embedded PostgreSQL SQL readiness', () => {
         message: 'Embedded PostgreSQL preparation failed',
         hasCause: false,
       },
-      closes: ['resolved', 'resolved'],
+      closes: ['fulfilled', 'fulfilled'],
       sessionGone: true,
       databaseExists: false,
       serverAlive: true,
     });
+  }, 15_000);
+
+  it('enforces the server-side statement timeout for blocked readiness SQL', async () => {
+    const result = await scenario.observesServerStatementTimeout();
+    expect(result).toMatchObject({
+      outcome: {
+        name: 'EmbeddedPostgresError',
+        message: 'Embedded PostgreSQL preparation failed',
+        hasCause: false,
+      },
+      observedTimeout: true,
+      sessionGone: true,
+      databaseExists: false,
+      serverAlive: true,
+    });
+    const expectedClose =
+      result.close === 'resolved'
+        ? 'resolved'
+        : {
+            name: 'EmbeddedPostgresError',
+            message: 'Embedded PostgreSQL preparation failed',
+            hasCause: false,
+          };
+    expect(result.close).toEqual(expectedClose);
   }, 15_000);
 
   it('converts a terminated blocked SQL connection into a safe owned failure', async () => {

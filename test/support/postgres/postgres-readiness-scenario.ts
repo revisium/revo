@@ -59,15 +59,14 @@ export class PostgresReadinessScenario {
       const readiness = new EmbeddedPostgresReadiness();
       const pending = observed(cluster.initialize(NONCE, PASSWORD, readiness));
       const session = await waitForBlockedReadiness(blocker, Date.now() + 2000);
-      const closes = await Promise.all([
-        readiness.close().then(() => 'resolved'),
-        readiness.close().then(() => 'resolved'),
-      ]);
+      const closes = Promise.allSettled([readiness.close(), readiness.close()]);
+      await blocker.query('SELECT pg_cancel_backend($1)', [session]);
+      const settledCloses = await closes;
       const outcome = await pending;
       await blocker.query('ROLLBACK');
       return {
         outcome,
-        closes,
+        closes: settledCloses.map(({ status }) => status),
         sessionGone: await waitForSessionGone(blocker, session, Date.now() + 1000),
         databaseExists: await cluster.databaseExists(),
         serverAlive: await cluster.isAlive(),
@@ -96,6 +95,32 @@ export class PostgresReadinessScenario {
         outcome,
         close,
         sessionGone: await waitForSessionGone(blocker, session, Date.now() + 1000),
+        serverAlive: await cluster.isAlive(),
+      };
+    } finally {
+      await readiness.close().catch(() => undefined);
+      await blocker.query('ROLLBACK').catch(() => undefined);
+      await blocker.end();
+    }
+  }
+
+  async observesServerStatementTimeout() {
+    const cluster = await this.cluster('scram');
+    const blocker = await cluster.client('postgres');
+    const readiness = new EmbeddedPostgresReadiness();
+    try {
+      await blockDatabaseInspection(blocker);
+      const pending = observed(cluster.initialize(NONCE, PASSWORD, readiness));
+      const session = await waitForBlockedReadiness(blocker, Date.now() + 2000);
+      const outcome = await pending;
+      const close = await observed(readiness.close());
+      await blocker.query('ROLLBACK');
+      return {
+        outcome,
+        close,
+        observedTimeout: await cluster.waitForStatementTimeout(Date.now() + 1000),
+        sessionGone: await waitForSessionGone(blocker, session, Date.now() + 1000),
+        databaseExists: await cluster.databaseExists(),
         serverAlive: await cluster.isAlive(),
       };
     } finally {
@@ -165,6 +190,7 @@ class ClusterFixture {
     readonly port: number,
     private readonly process: OwnedProcess,
     private readonly processes: ManagedProcessService,
+    private readonly statementTimeout: () => boolean,
   ) {}
 
   static async start(authentication: 'scram' | 'trust') {
@@ -180,8 +206,9 @@ class ClusterFixture {
       const reservation = await new LoopbackPortAllocator().reserve();
       const port = reservation.port;
       await reservation.release();
-      process = await startPostgres(processes, binaries.postgres, data, root, port);
-      const fixture = new ClusterFixture(root, port, process, processes);
+      const started = await startPostgres(processes, binaries.postgres, data, root, port);
+      process = started.process;
+      const fixture = new ClusterFixture(root, port, process, processes, started.statementTimeout);
       await fixture.waitUntilAlive(Date.now() + 5000);
       return fixture;
     } catch (primary) {
@@ -254,6 +281,21 @@ class ClusterFixture {
     });
   }
 
+  observedStatementTimeout() {
+    return this.statementTimeout();
+  }
+
+  async waitForStatementTimeout(deadline: number): Promise<boolean> {
+    if (this.observedStatementTimeout()) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return this.waitForStatementTimeout(deadline);
+  }
+
   async close() {
     await this.processes.stop(this.process, { graceMs: 1000, killWaitMs: 5000 });
     await this.process.completion;
@@ -322,13 +364,25 @@ const startPostgres = async (
       `unix_socket_directories=${root}`,
       '-c',
       `cluster_name=${NONCE}`,
+      '-c',
+      'log_min_messages=ERROR',
+      '-c',
+      'log_min_error_statement=ERROR',
     ],
     cwd: root,
     env: { LC_ALL: 'C' },
     stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' },
   });
+  const marker = 'canceling statement due to statement timeout';
+  let tail = '';
+  let observed = false;
+  process.stderr?.on('data', (chunk) => {
+    const combined = tail + String(chunk);
+    observed ||= combined.includes(marker);
+    tail = combined.slice(-(marker.length - 1));
+  });
   process.stderr?.resume();
-  return process;
+  return { process, statementTimeout: () => observed };
 };
 
 const blockDatabaseInspection = async (client: Client) => {
