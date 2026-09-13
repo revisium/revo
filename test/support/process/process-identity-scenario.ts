@@ -94,8 +94,8 @@ export class ProcessIdentityScenario {
   }
   async provesMismatchedLinuxPidIsUnknown() {
     const root = await this.linuxFixture();
-    const stat = await import('node:fs/promises').then(({ readFile }) =>
-      readFile(join(root, '123/stat'), 'utf8'),
+    const stat = await import('node:fs/promises').then(({ readFile: readFixtureFile }) =>
+      readFixtureFile(join(root, '123/stat'), 'utf8'),
     );
     await writeFile(join(root, '123/stat'), stat.replace(/^123/u, '999'));
     return new LinuxProcessIdentityAdapter(root).capture(123);
