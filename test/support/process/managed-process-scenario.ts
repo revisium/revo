@@ -18,6 +18,12 @@ import { ProcessesModule } from '../../../src/processes/processes.module.js';
 
 const CHILD = resolve(dirname(fileURLToPath(import.meta.url)), 'managed-child.mjs');
 
+interface EnvironmentReport {
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly env: Record<string, string>;
+}
+
 class MissingExitObservation extends ProcessExitWaiter {
   override async wait(): Promise<boolean> {
     return false;
@@ -89,13 +95,12 @@ export class ManagedProcessScenario {
     readonly cwd: string;
     readonly env: Readonly<Record<string, string>>;
   }> {
-    const report = JSON.parse(await this.output(handle)) as {
-      readonly argv: readonly string[];
-      readonly cwd: string;
-      readonly env: Record<string, string>;
-    };
+    const report: unknown = JSON.parse(await this.output(handle));
+    if (!isEnvironmentReport(report)) {
+      throw new Error('Expected a valid managed process environment report.');
+    }
     if (process.platform === 'darwin') {
-      delete report.env?.__CF_USER_TEXT_ENCODING;
+      delete report.env['__CF_USER_TEXT_ENCODING'];
     }
     return report;
   }
@@ -169,6 +174,22 @@ export class ManagedProcessScenario {
     await Promise.all(this.unrelated.map((child) => waitForExit(child)));
     await rm(this.root, { force: true, recursive: true });
   }
+}
+
+function isEnvironmentReport(value: unknown): value is EnvironmentReport {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const report = value as Record<string, unknown>;
+  return (
+    typeof report.cwd === 'string' &&
+    Array.isArray(report.argv) &&
+    report.argv.every((argument) => typeof argument === 'string') &&
+    typeof report.env === 'object' &&
+    report.env !== null &&
+    !Array.isArray(report.env) &&
+    Object.values(report.env).every((entry) => typeof entry === 'string')
+  );
 }
 
 function waitForExit(child: ChildProcess): Promise<void> {
