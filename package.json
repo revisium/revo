@@ -26,12 +26,15 @@
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --type-aware --type-check --deny-warnings --report-unused-disable-directives .",
+    "sonar:issues:local": "bash scripts/sonar-issues-local.sh",
     "test": "vitest run",
+    "test:cov": "vitest run --coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm test && pnpm build"
+    "verify": "pnpm format:check && pnpm typecheck && pnpm lint && pnpm build && pnpm test:cov"
   },
   "devDependencies": {
     "@types/node": "26.1.2",
+    "@vitest/coverage-v8": "4.1.10",
     "oxfmt": "0.62.0",
     "oxlint": "1.77.0",
     "oxlint-tsgolint": "7.0.2001",
@@ -39,7 +42,7 @@
     "vitest": "4.1.10"
   },
   "engines": {
-    "node": ">=24.11.1 <25"
+    "node": ">=26.8.2 <27"
   },
-  "packageManager": "pnpm@11.13.0"
+  "packageManager": "pnpm@12.4.1"
 }
