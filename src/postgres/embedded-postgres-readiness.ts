@@ -48,9 +48,7 @@ export class EmbeddedPostgresReadiness {
   close(): Promise<void> {
     this.closing = true;
     this.controller?.abort();
-    if (!this.closeOperation) {
-      this.closeOperation = this.performClose();
-    }
+    this.closeOperation ??= this.performClose();
     return this.closeOperation;
   }
 
