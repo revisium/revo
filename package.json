@@ -21,6 +21,7 @@
     "./configuration": "./dist/configuration/index.js",
     "./layout": "./dist/layout.js",
     "./processes": "./dist/processes/index.js",
+    "./startup-progress": "./dist/startup-progress/index.js",
     "./release-metadata": "./dist/release-metadata.js"
   },
   "scripts": {

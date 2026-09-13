@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 
+import { StartupProgressDiscoveryService } from '../startup-progress/index.js';
+import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
 import { DarwinProcessIdentityAdapter } from './adapters/darwin-process-identity.adapter.js';
 import { LinuxProcessIdentityAdapter } from './adapters/linux-process-identity.adapter.js';
 import { PosixFlockAdapter } from './adapters/posix-flock.adapter.js';
@@ -21,6 +23,7 @@ import { ServerOwnershipService } from './server-ownership.service.js';
     ProcessIdentityService,
     PublishedControlService,
     ServerOwnershipService,
+    StartupProgressDiscoveryService,
   ],
   providers: [
     DarwinProcessIdentityAdapter,
@@ -34,6 +37,8 @@ import { ServerOwnershipService } from './server-ownership.service.js';
     ProcessIdentityService,
     PublishedControlService,
     ServerOwnershipService,
+    StartupProgressDiscoveryService,
+    StartupProgressJournalWriter,
     { provide: PROCESS_IDENTITY_PLATFORM, useValue: process.platform },
   ],
 })

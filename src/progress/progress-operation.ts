@@ -11,6 +11,7 @@ export class ProgressOperation {
   private readonly phaseStarted = new Map<string, number>();
   private readonly phaseElapsed = new Map<string, number>();
   private lastElapsed = 0;
+  private sequence = 0;
   private terminal = false;
 
   constructor(
@@ -67,7 +68,7 @@ export class ProgressOperation {
     const candidate = {
       schemaVersion: PROGRESS_SCHEMA_VERSION,
       operationId: this.options.operationId,
-      sequence: this.history.length + 1,
+      sequence: this.sequence + 1,
       phase,
       status,
       elapsedMs,
@@ -79,6 +80,7 @@ export class ProgressOperation {
       throw new Error('Invalid progress event input');
     }
     this.lastElapsed = elapsedMs;
+    this.sequence = parsed.sequence;
     if (status === 'started') {
       this.phaseStarted.set(phase, elapsedMs);
       this.phaseElapsed.set(phase, 0);
@@ -89,7 +91,16 @@ export class ProgressOperation {
       ...parsed,
       ...(parsed.counters ? { counters: Object.freeze({ ...parsed.counters }) } : {}),
     });
-    this.history.push(event);
+    if (status === 'progress' || status === 'started') {
+      this.history.splice(
+        0,
+        this.history.length,
+        ...this.history.filter((record) => record.status !== 'progress'),
+        event,
+      );
+    } else {
+      this.history.push(event);
+    }
     if (terminal) {
       this.terminal = true;
     }

@@ -14,6 +14,13 @@ describe('progress events and rendering', () => {
     ]);
     expect(result.duplicate).toEqual([]);
   });
+  it('keeps one latest progress record ordered after all retained transitions', () => {
+    const events = new ProgressScenario().singleCurrentProgressRemainsOrdered();
+    expect(events.map(({ sequence }) => sequence)).toEqual([1, 3, 5, 6]);
+    expect(events.filter(({ status }) => status === 'progress')).toEqual([
+      expect.objectContaining({ sequence: 6, phase: 'runtime-extract' }),
+    ]);
+  });
   it('keeps snapshots immutable and elapsed time monotonic across clock rollback', () => {
     const result = new ProgressScenario().clockRollbackAndImmutableSnapshots();
     expect(result.frozen).toBe(true);
