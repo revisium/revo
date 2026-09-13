@@ -84,9 +84,15 @@ export class ManagedProcessScenario {
     return Buffer.concat(chunks).toString('utf8');
   }
 
-  async environment(handle: OwnedProcess): Promise<unknown> {
+  async environment(handle: OwnedProcess): Promise<{
+    readonly argv: readonly string[];
+    readonly cwd: string;
+    readonly env: Readonly<Record<string, string>>;
+  }> {
     const report = JSON.parse(await this.output(handle)) as {
-      env?: Record<string, string>;
+      readonly argv: readonly string[];
+      readonly cwd: string;
+      readonly env: Record<string, string>;
     };
     if (process.platform === 'darwin') {
       delete report.env?.__CF_USER_TEXT_ENCODING;
