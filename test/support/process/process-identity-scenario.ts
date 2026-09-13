@@ -9,9 +9,7 @@ import {
   DarwinProcessIdentityAdapter,
   type DarwinBinding,
 } from '../../../src/processes/adapters/darwin-process-identity.adapter.js';
-import {
-  LinuxProcessIdentityAdapter,
-} from '../../../src/processes/adapters/linux-process-identity.adapter.js';
+import { LinuxProcessIdentityAdapter } from '../../../src/processes/adapters/linux-process-identity.adapter.js';
 import { ProcessIdentityService } from '../../../src/processes/process-identity.service.js';
 import type { ProcessIdentity } from '../../../src/processes/process-identity.types.js';
 import { ProcessesModule } from '../../../src/processes/processes.module.js';
@@ -147,10 +145,7 @@ export class ProcessIdentityScenario {
       '123e4567-e89b-42d3-a456-426614174000\n',
     );
     const fields = ['S', ...Array.from({ length: 18 }, () => '0'), '18446744073709551614'];
-    await writeFile(
-      join(fixtureRoot, '123/stat'),
-      `123 (worker ) name) ${fields.join(' ')}\n`,
-    );
+    await writeFile(join(fixtureRoot, '123/stat'), `123 (worker ) name) ${fields.join(' ')}\n`);
     await writeFile(join(fixtureRoot, '123/status'), 'Uid:\t1000\t1000\t1000\t1000\n');
     return fixtureRoot;
   }
