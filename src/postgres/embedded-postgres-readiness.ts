@@ -20,6 +20,8 @@ export const isPendingEmbeddedPostgresReadiness = (error: unknown) =>
   error instanceof EmbeddedPostgresReadinessPendingError;
 export const isTerminalEmbeddedPostgresReadiness = (error: unknown) =>
   error instanceof EmbeddedPostgresReadinessTerminalError;
+export const isStartupNonceMismatch = (error: unknown) =>
+  error instanceof EmbeddedPostgresReadinessTerminalError && error.kind === 'nonce-mismatch';
 
 /** Internal SQL boundary for a PostgreSQL process whose lifecycle is owned elsewhere. */
 export class EmbeddedPostgresReadiness {
@@ -141,7 +143,7 @@ export class EmbeddedPostgresReadiness {
           throw new EmbeddedPostgresReadinessPendingError();
         }
         if (isPostgresReportedError(error)) {
-          throw new EmbeddedPostgresReadinessTerminalError();
+          throw new EmbeddedPostgresReadinessTerminalError('postgres-error');
         }
         throw error;
       }
@@ -162,7 +164,7 @@ export class EmbeddedPostgresReadiness {
           this.cleanupFailed = true;
         }
         if (isPostgresReportedError(error)) {
-          throw new EmbeddedPostgresReadinessTerminalError();
+          throw new EmbeddedPostgresReadinessTerminalError('postgres-error');
         }
         throw error;
       }
@@ -290,7 +292,7 @@ const validateRequest = (request: EmbeddedPostgresReadinessRequest) => {
 const verifyStartupNonce = async (client: Client, expected: string) => {
   const result = await client.query<{ cluster_name: string }>('SHOW cluster_name');
   if (result.rows[0]?.cluster_name !== expected) {
-    throw new EmbeddedPostgresReadinessTerminalError();
+    throw new EmbeddedPostgresReadinessTerminalError('nonce-mismatch');
   }
 };
 
@@ -341,7 +343,7 @@ class EmbeddedPostgresReadinessPendingError extends EmbeddedPostgresError {
 }
 
 class EmbeddedPostgresReadinessTerminalError extends EmbeddedPostgresError {
-  constructor() {
+  constructor(readonly kind: 'nonce-mismatch' | 'postgres-error') {
     super('process');
   }
 }

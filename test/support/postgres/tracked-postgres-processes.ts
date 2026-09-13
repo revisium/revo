@@ -7,7 +7,6 @@ import type {
 
 export interface TrackedPostgresProcessesOptions {
   readonly failFirstPostgresStop?: boolean;
-  readonly wrongStartupNonce?: boolean;
 }
 
 export class TrackedPostgresProcesses extends ManagedProcessService {
@@ -23,11 +22,7 @@ export class TrackedPostgresProcesses extends ManagedProcessService {
 
   override async start(request: ManagedProcessRequest) {
     const postgres = request.args[0] === '-D';
-    const process = await super.start(
-      postgres && this.options.wrongStartupNonce
-        ? { ...request, args: [...request.args, '-c', 'cluster_name=foreign'] }
-        : request,
-    );
+    const process = await super.start(request);
     if (postgres) {
       this.postgresStarts += 1;
       this.postgres = process;

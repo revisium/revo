@@ -283,7 +283,6 @@ export class PostgresLifecycleScenario {
     const fixture = await this.fixture();
     const processes = new TrackedPostgresProcesses({
       failFirstPostgresStop: true,
-      wrongStartupNonce: true,
     });
     const resource = new EmbeddedPostgresResourceService(
       new EmbeddedPostgresPreparationService(processes),
@@ -291,6 +290,15 @@ export class PostgresLifecycleScenario {
     );
     const owner = await this.open(fixture, FIRST_OPERATION, undefined, resource);
     try {
+      await owner.prepareEmbeddedPostgres?.({
+        signal: new AbortController().signal,
+        timeoutMs: 30_000,
+      });
+      await writeFile(
+        join(fixture.dataDir, 'postgres-password'),
+        'ffffffffffffffffffffffffffffffff',
+        { mode: 0o600 },
+      );
       const first = await this.start(owner).then(
         () => 'resolved',
         () => 'rejected',

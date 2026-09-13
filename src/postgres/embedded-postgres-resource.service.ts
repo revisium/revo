@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
 
 import { ManagedProcessService } from '../processes/managed-process.service.js';
-import type { OwnedProcess } from '../processes/managed-process.types.js';
+import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
 import {
   EmbeddedPostgresPreparationService,
@@ -13,6 +13,7 @@ import {
 import {
   EmbeddedPostgresReadiness,
   isPendingEmbeddedPostgresReadiness,
+  isStartupNonceMismatch,
   isTerminalEmbeddedPostgresReadiness,
 } from './embedded-postgres-readiness.js';
 import type {
@@ -93,10 +94,12 @@ export class OwnedEmbeddedPostgresResource {
     if (this.server || this.serverCompletion || this.stopFailure) {
       return Promise.reject(new EmbeddedPostgresError('process'));
     }
-    return (this.active = this.performStart(request).finally(() => {
+    const operation = this.performStart(request).finally(() => {
       this.active = undefined;
       this.controller = undefined;
-    }));
+    });
+    this.active = operation;
+    return operation;
   }
 
   close(): Promise<void> {
@@ -205,6 +208,51 @@ export class OwnedEmbeddedPostgresResource {
     }
     rejectCancellation(signal);
     const startupNonce = `revo-${randomBytes(16).toString('hex')}`;
+    const attempt = await this.spawnAttempt(
+      executable,
+      clusterDir,
+      reservation.port,
+      startupNonce,
+      signal,
+    );
+    const attemptController = new AbortController();
+    const attemptSignal = AbortSignal.any([signal, attemptController.signal]);
+    try {
+      const outcome = await Promise.race([
+        this.waitUntilReady(
+          reservation.port,
+          password,
+          startupNonce,
+          attemptSignal,
+          deadline,
+          () => attempt.exited,
+        ).then(() => 'ready' as const),
+        attempt.child.completion.then(() => 'exited' as const),
+      ]);
+      if (outcome === 'exited') {
+        throw new EmbeddedPostgresError('process');
+      }
+      return {
+        kind: 'ready',
+        port: reservation.port,
+        child: attempt.child,
+        exited: () => attempt.exited !== undefined,
+      };
+    } catch (error) {
+      attemptController.abort();
+      return this.resolveFailedAttempt(attempt, error, signal, deadline);
+    } finally {
+      attemptController.abort();
+    }
+  }
+
+  private async spawnAttempt(
+    executable: string,
+    clusterDir: string,
+    port: number,
+    startupNonce: string,
+    signal: AbortSignal,
+  ): Promise<TrackedAttempt> {
     const spawnController = new AbortController();
     const abortSpawn = () => spawnController.abort();
     signal.addEventListener('abort', abortSpawn, { once: true });
@@ -218,7 +266,7 @@ export class OwnedEmbeddedPostgresResource {
           '-h',
           HOST,
           '-p',
-          String(reservation.port),
+          String(port),
           '-c',
           'unix_socket_directories=',
           '-c',
@@ -237,10 +285,13 @@ export class OwnedEmbeddedPostgresResource {
       signal.removeEventListener('abort', abortSpawn);
     }
     this.server = child;
-    const diagnostic = captureDiagnostic(child.stderr);
-    let exited: import('../processes/managed-process.types.js').ProcessCompletion | undefined;
+    const attempt: TrackedAttempt = {
+      child,
+      diagnostic: captureDiagnostic(child.stderr),
+      exited: undefined,
+    };
     const serverCompletion = child.completion.then((completion) => {
-      exited = completion;
+      attempt.exited = completion;
       if (this.server === child) {
         this.server = undefined;
         this.started = undefined;
@@ -250,53 +301,49 @@ export class OwnedEmbeddedPostgresResource {
       }
     });
     this.serverCompletion = serverCompletion;
-    const attemptController = new AbortController();
-    const attemptSignal = AbortSignal.any([signal, attemptController.signal]);
-    try {
-      const outcome = await Promise.race([
-        this.waitUntilReady(
-          reservation.port,
-          password,
-          startupNonce,
-          attemptSignal,
-          deadline,
-          () => exited,
-        ).then(() => 'ready' as const),
-        child.completion.then(() => 'exited' as const),
-      ]);
-      if (outcome === 'exited') {
-        throw new EmbeddedPostgresError('process');
-      }
-      return { kind: 'ready', port: reservation.port, child, exited: () => exited !== undefined };
-    } catch (error) {
-      attemptController.abort();
-      let failure = error;
-      if (signal.aborted) {
-        await this.readiness.close().catch(() => {
-          failure = new EmbeddedPostgresError('process');
-        });
-      }
-      if (!exited && !isTerminalEmbeddedPostgresReadiness(error)) {
-        try {
-          exited = await raceCancellation(child.completion, signal, deadline, () => undefined);
-        } catch (waitError) {
-          failure = waitError;
-        }
-      }
-      if (!exited) {
-        await this.stopServer();
-      }
-      const completion = exited;
-      if (!completion) {
-        throw safeError(failure, signal);
-      }
-      if (!signal.aborted && isBindConflict(await diagnostic, completion)) {
-        return { kind: 'bind-conflict' };
-      }
-      throw failure;
-    } finally {
-      attemptController.abort();
+    return attempt;
+  }
+
+  private async resolveFailedAttempt(
+    attempt: TrackedAttempt,
+    error: unknown,
+    signal: AbortSignal,
+    deadline: number,
+  ): Promise<{ kind: 'bind-conflict' }> {
+    let failure = error;
+    const retryableBindFailure = this.canBecomeBindConflict(error);
+    if (signal.aborted) {
+      await this.readiness.close().catch(() => {
+        failure = new EmbeddedPostgresError('process');
+      });
     }
+    if (!attempt.exited && retryableBindFailure) {
+      try {
+        attempt.exited = await raceCancellation(attempt.child.completion, signal, deadline, () =>
+          this.stopServer(),
+        );
+      } catch (waitError) {
+        failure = waitError;
+      }
+    }
+    if (!attempt.exited) {
+      await this.stopServer();
+    }
+    if (!attempt.exited) {
+      throw safeError(failure, signal);
+    }
+    if (
+      retryableBindFailure &&
+      !signal.aborted &&
+      isBindConflict(await attempt.diagnostic, attempt.exited)
+    ) {
+      return { kind: 'bind-conflict' };
+    }
+    throw failure;
+  }
+
+  private canBecomeBindConflict(error: unknown) {
+    return isStartupNonceMismatch(error) || !isTerminalEmbeddedPostgresReadiness(error);
   }
 
   private async waitUntilReady(
@@ -373,6 +420,12 @@ interface ReadyAttempt {
   readonly exited: () => boolean;
 }
 
+interface TrackedAttempt {
+  readonly child: OwnedProcess;
+  readonly diagnostic: Promise<string>;
+  exited: ProcessCompletion | undefined;
+}
+
 const validateRequest = (request: StartDatabaseRequest) => {
   if (
     request.signal.aborted ||
@@ -389,10 +442,13 @@ const rejectCancellation = (signal: AbortSignal) => {
     throw new EmbeddedPostgresError('cancelled');
   }
 };
-const safeError = (error: unknown, signal: AbortSignal) =>
-  error instanceof EmbeddedPostgresError
-    ? error
-    : new EmbeddedPostgresError(signal.aborted ? 'cancelled' : 'process');
+const safeError = (error: unknown, signal: AbortSignal) => {
+  if (error instanceof EmbeddedPostgresError) {
+    return error;
+  }
+  const reason = signal.aborted ? 'cancelled' : 'process';
+  return new EmbeddedPostgresError(reason);
+};
 const retryableReadiness = (error: unknown) => isPendingEmbeddedPostgresReadiness(error);
 const isBindConflict = (
   diagnostic: string,
