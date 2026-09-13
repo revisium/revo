@@ -1,4 +1,14 @@
 export { ManagedProcessError } from './managed-process-error.js';
+export { ControlClientService } from './control-client.service.js';
+export { ControlEndpointService } from './control-endpoint.service.js';
+export { ControlTransportError } from './control-protocol.js';
+export type {
+  ControlLimits,
+  ControlRecord,
+  ControlStopResult,
+  HeldControlEndpoint,
+  ListenControlEndpointRequest,
+} from './control-endpoint.types.js';
 export { ManagedProcessService } from './managed-process.service.js';
 export { ProcessIdentityError, ProcessIdentityService } from './process-identity.service.js';
 export { ProcessesModule } from './processes.module.js';
