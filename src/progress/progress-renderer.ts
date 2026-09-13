@@ -32,14 +32,15 @@ export class ProgressRenderer {
     }
     if (event.status === 'failed') {
       this.closeLine();
-      this.options.stderr(
-        `${event.phase}: failed [${event.code}]${event.logPath ? ` Log: ${event.logPath}` : ''}\n`,
-      );
+      const logSuffix = event.logPath ? ` Log: ${event.logPath}` : '';
+      this.options.stderr(`${event.phase}: failed [${event.code}]${logSuffix}\n`);
       this.finished = true;
       return;
     }
     const counters = renderCounters(event);
-    const timing = ` ${event.elapsedMs}ms${event.stageElapsedMs === undefined ? '' : ` (stage ${event.stageElapsedMs}ms)`}`;
+    const stageTiming =
+      event.stageElapsedMs === undefined ? '' : ` (stage ${event.stageElapsedMs}ms)`;
+    const timing = ` ${event.elapsedMs}ms${stageTiming}`;
     const line = `${event.phase}: ${event.status}${timing}${counters}`;
     if (this.options.isTty && (event.status === 'started' || event.status === 'progress')) {
       const padding = ' '.repeat(Math.max(0, this.lineWidth - line.length));

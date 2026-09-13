@@ -15,7 +15,6 @@ export const PROGRESS_PHASES = [
   'installation-activate',
 ] as const;
 
-export type ProgressPhase = string;
 export type ProgressStatus = 'started' | 'progress' | 'completed' | 'failed' | 'ready';
 export interface ProgressCounters {
   readonly bytesReceived?: number;
@@ -30,7 +29,7 @@ export interface ProgressEvent {
   readonly schemaVersion: typeof PROGRESS_SCHEMA_VERSION;
   readonly operationId: string;
   readonly sequence: number;
-  readonly phase: ProgressPhase;
+  readonly phase: string;
   readonly status: ProgressStatus;
   readonly elapsedMs: number;
   readonly counters?: ProgressCounters;

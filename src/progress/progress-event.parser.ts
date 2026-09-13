@@ -2,7 +2,6 @@ import {
   PROGRESS_SCHEMA_VERSION,
   type ProgressCounters,
   type ProgressEvent,
-  type ProgressPhase,
   type ProgressStatus,
 } from './progress-event.js';
 
@@ -129,8 +128,7 @@ function validShape(value: Record<string, unknown>): boolean {
   }
   return !OPTIONAL.some((key) => Object.hasOwn(value, key));
 }
-const isPhase = (value: unknown): value is ProgressPhase =>
-  typeof value === 'string' && PHASE.test(value);
+const isPhase = (value: unknown): value is string => typeof value === 'string' && PHASE.test(value);
 const isStatus = (value: unknown): value is ProgressStatus =>
   value === 'started' ||
   value === 'progress' ||
@@ -163,8 +161,8 @@ function safeText(value: string): boolean {
     return false;
   }
   for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
-    if (codeUnit < 32 || codeUnit === 127) {
+    const codePoint = value.codePointAt(index);
+    if (codePoint === undefined || codePoint < 32 || codePoint === 127) {
       return false;
     }
   }

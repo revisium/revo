@@ -2,15 +2,14 @@ import {
   PROGRESS_SCHEMA_VERSION,
   type ProgressCounters,
   type ProgressEvent,
-  type ProgressPhase,
 } from './progress-event.js';
 import { parseProgressEvent } from './progress-event.parser.js';
 
 export class ProgressOperation {
   private readonly origin: number;
   private readonly history: ProgressEvent[] = [];
-  private readonly phaseStarted = new Map<ProgressPhase, number>();
-  private readonly phaseElapsed = new Map<ProgressPhase, number>();
+  private readonly phaseStarted = new Map<string, number>();
+  private readonly phaseElapsed = new Map<string, number>();
   private lastElapsed = 0;
   private terminal = false;
 
@@ -19,19 +18,19 @@ export class ProgressOperation {
   ) {
     this.origin = options.now();
   }
-  start(phase: ProgressPhase) {
+  start(phase: string) {
     return this.emit(phase, 'started', {});
   }
   progress(
-    phase: ProgressPhase,
+    phase: string,
     details: { readonly counters?: ProgressCounters; readonly stageElapsedMs?: number } = {},
   ) {
     return this.emit(phase, 'progress', details);
   }
-  complete(phase: ProgressPhase) {
+  complete(phase: string) {
     return this.emit(phase, 'completed', {});
   }
-  fail(phase: ProgressPhase, details: { readonly code: string; readonly logPath?: string }) {
+  fail(phase: string, details: { readonly code: string; readonly logPath?: string }) {
     return this.emit(phase, 'failed', details, true);
   }
   /** Caller declares ownership, control identity, and the real readiness probe already complete. */
@@ -42,12 +41,7 @@ export class ProgressOperation {
     return Object.freeze(this.history.filter((event) => event.sequence > sequence));
   }
 
-  private emit(
-    phase: ProgressPhase,
-    status: ProgressEvent['status'],
-    details: object,
-    terminal = false,
-  ) {
+  private emit(phase: string, status: ProgressEvent['status'], details: object, terminal = false) {
     if (this.terminal) {
       return undefined;
     }
@@ -61,12 +55,15 @@ export class ProgressOperation {
       throw new Error('Invalid progress event input');
     }
     const elapsedMs = Math.max(this.lastElapsed, Math.max(0, this.options.now() - this.origin));
-    const stageElapsedMs =
-      status === 'completed'
-        ? this.nextStageElapsed(phase, elapsedMs - (this.phaseStarted.get(phase) ?? elapsedMs))
-        : typeof suppliedStageElapsed === 'number'
-          ? this.nextStageElapsed(phase, suppliedStageElapsed)
-          : undefined;
+    let stageElapsedMs: number | undefined;
+    if (status === 'completed') {
+      stageElapsedMs = this.nextStageElapsed(
+        phase,
+        elapsedMs - (this.phaseStarted.get(phase) ?? elapsedMs),
+      );
+    } else if (typeof suppliedStageElapsed === 'number') {
+      stageElapsedMs = this.nextStageElapsed(phase, suppliedStageElapsed);
+    }
     const candidate = {
       schemaVersion: PROGRESS_SCHEMA_VERSION,
       operationId: this.options.operationId,
@@ -98,7 +95,7 @@ export class ProgressOperation {
     }
     return event;
   }
-  private nextStageElapsed(phase: ProgressPhase, elapsedMs: number) {
+  private nextStageElapsed(phase: string, elapsedMs: number) {
     return Math.max(this.phaseElapsed.get(phase) ?? 0, Math.max(0, elapsedMs));
   }
 }
