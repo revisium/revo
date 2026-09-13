@@ -32,3 +32,7 @@ export type {
   StopProcessRequest,
 } from './managed-process.types.js';
 export type { StartupProgressFacade, StartupProgressOptions } from '../startup-progress/index.js';
+export type {
+  PreparedEmbeddedPostgres,
+  PrepareEmbeddedPostgresRequest,
+} from '../postgres/index.js';

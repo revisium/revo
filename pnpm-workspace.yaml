@@ -1,5 +1,9 @@
 packages: []
 
 allowBuilds:
-  '@swc/core': true
-  koffi: true
+  '@embedded-postgres/darwin-arm64@17.10.0-beta.17': true
+  '@embedded-postgres/darwin-x64@17.10.0-beta.17': true
+  '@embedded-postgres/linux-arm64@17.10.0-beta.17': true
+  '@embedded-postgres/linux-x64@17.10.0-beta.17': true
+  '@swc/core@1.15.47': true
+  'koffi@3.2.1': true

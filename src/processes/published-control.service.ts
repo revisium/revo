@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { EmbeddedPostgresPreparationService } from '../postgres/embedded-postgres-preparation.service.js';
 import { OwnedStartupProgress } from '../startup-progress/startup-progress-facade.js';
 import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
 import {
@@ -36,6 +37,8 @@ export class PublishedControlService {
     @Inject(ControlDiscoveryService) private readonly discovery = new ControlDiscoveryService(),
     @Inject(StartupProgressJournalWriter)
     private readonly progressJournal = new StartupProgressJournalWriter(),
+    @Inject(EmbeddedPostgresPreparationService)
+    private readonly postgres = new EmbeddedPostgresPreparationService(),
   ) {}
 
   async open(request: OpenPublishedControlRequest): Promise<PublishedControl> {
@@ -62,6 +65,7 @@ export class PublishedControlService {
       const progress = request.startupProgress
         ? new OwnedStartupProgress(this.progressJournal, canonicalDataDir, request.startupProgress)
         : undefined;
+      const postgres = progress ? this.postgres.bind(canonicalDataDir, progress) : undefined;
       await progress?.initialize();
       const record = {
         schemaVersion: 1 as const,
@@ -75,17 +79,52 @@ export class PublishedControlService {
       };
       temporaryPath = join(canonicalDataDir, `.revo-control.${instanceId}.tmp`);
       await publishRecord(temporaryPath, join(canonicalDataDir, CONTROL_FILE), record);
-      let closePromise: Promise<void> | undefined;
+      let finalClose: Promise<void> | undefined;
+      let progressClose: Promise<void> | undefined;
+      let finalState: 'pending' | 'success' | 'failure' = 'pending';
+      const finalize = () => {
+        progressClose ??= progress?.close();
+        if (!finalClose) {
+          finalClose = (async () => {
+            await postgres?.settled();
+            await progressClose;
+            await this.closeOwned(createdEndpoint, canonicalDataDir, instanceId, token, lease);
+          })();
+          void finalClose.then(
+            () => {
+              finalState = 'success';
+            },
+            () => {
+              finalState = 'failure';
+            },
+          );
+        }
+        return finalClose;
+      };
       return {
         kind: 'held',
         endpoint: createdEndpoint.endpoint,
         stopResult: createdEndpoint.stopResult,
         ...(progress ? { progress } : {}),
-        close: () =>
-          (closePromise ??= (async () => {
-            await progress?.close();
-            await this.closeOwned(createdEndpoint, canonicalDataDir, instanceId, token, lease);
-          })()),
+        ...(postgres ? { prepareEmbeddedPostgres: postgres.prepare.bind(postgres) } : {}),
+        close: async () => {
+          const postgresClose = postgres?.close();
+          progressClose ??= progress?.close();
+          try {
+            await postgresClose;
+          } catch {
+            if (finalClose) {
+              if (finalState !== 'pending') {
+                await finalClose;
+                return;
+              }
+              throw new PublishedControlError('close');
+            }
+            void finalize().catch(() => undefined);
+            throw new PublishedControlError('close');
+          }
+          await finalize();
+        },
       };
     } catch {
       throw new PublishedControlError(
