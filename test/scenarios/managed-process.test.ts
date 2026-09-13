@@ -22,7 +22,7 @@ describe('managed child process', () => {
       }),
     );
 
-    const report = JSON.parse(await scenario.output(handle));
+    const report = await scenario.environment(handle);
     expect(report).toEqual({
       cwd: expect.any(String),
       env: { ONLY_THIS: 'present' },

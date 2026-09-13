@@ -84,6 +84,16 @@ export class ManagedProcessScenario {
     return Buffer.concat(chunks).toString('utf8');
   }
 
+  async environment(handle: OwnedProcess): Promise<unknown> {
+    const report = JSON.parse(await this.output(handle)) as {
+      env?: Record<string, string>;
+    };
+    if (process.platform === 'darwin') {
+      delete report.env?.__CF_USER_TEXT_ENCODING;
+    }
+    return report;
+  }
+
   async begin(handle: OwnedProcess): Promise<unknown> {
     const reply = new Promise<unknown>((resolveReply) => {
       const unsubscribe = handle.subscribe?.((message) => {

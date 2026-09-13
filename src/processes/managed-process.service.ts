@@ -254,7 +254,8 @@ class ManagedOwnedProcess implements OwnedProcess {
   }
 
   stop(request: StopProcessRequest): Promise<void> {
-    return (this.stopOperation ??= this.performStop(request));
+    this.stopOperation ??= this.performStop(request);
+    return this.stopOperation;
   }
 
   private async performStop(request: StopProcessRequest): Promise<void> {
