@@ -91,14 +91,7 @@ export class ProgressOperation {
       ...parsed,
       ...(parsed.counters ? { counters: Object.freeze({ ...parsed.counters }) } : {}),
     });
-    if (status === 'progress') {
-      this.history.splice(
-        0,
-        this.history.length,
-        ...this.history.filter((record) => record.status !== 'progress'),
-        event,
-      );
-    } else if (status === 'started') {
+    if (status === 'progress' || status === 'started') {
       this.history.splice(
         0,
         this.history.length,

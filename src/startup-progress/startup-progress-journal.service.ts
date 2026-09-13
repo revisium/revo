@@ -137,7 +137,9 @@ function parseDocument(content: string | undefined): ProgressDocument | undefine
     const value: unknown = JSON.parse(content);
     if (
       !record(value) ||
-      Object.keys(value).sort().join(',') !== 'events,operationId,schemaVersion' ||
+      Object.keys(value)
+        .sort((left, right) => left.localeCompare(right, 'en'))
+        .join(',') !== 'events,operationId,schemaVersion' ||
       value.schemaVersion !== STARTUP_PROGRESS_SCHEMA_VERSION ||
       typeof value.operationId !== 'string' ||
       !Array.isArray(value.events)
