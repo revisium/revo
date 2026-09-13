@@ -9,7 +9,9 @@ import {
   DarwinProcessIdentityAdapter,
   type DarwinBinding,
 } from '../../../src/processes/adapters/darwin-process-identity.adapter.js';
-import { LinuxProcessIdentityAdapter } from '../../../src/processes/adapters/linux-process-identity.adapter.js';
+import {
+  LinuxProcessIdentityAdapter,
+} from '../../../src/processes/adapters/linux-process-identity.adapter.js';
 import { ProcessIdentityService } from '../../../src/processes/process-identity.service.js';
 import type { ProcessIdentity } from '../../../src/processes/process-identity.types.js';
 import { ProcessesModule } from '../../../src/processes/processes.module.js';
