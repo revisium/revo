@@ -55,10 +55,12 @@ export class OwnedEmbeddedPostgresPreparation {
     if (this.childCompletion) {
       return Promise.reject(new EmbeddedPostgresError('cancelled'));
     }
-    return (this.active = this.perform(request).finally(() => {
+    const preparation = this.perform(request).finally(() => {
       this.active = undefined;
       this.controller = undefined;
-    }));
+    });
+    this.active = preparation;
+    return preparation;
   }
 
   async close(): Promise<void> {
