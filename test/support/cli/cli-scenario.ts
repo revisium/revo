@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { CommandFactory } from 'nest-commander';
 import { vi } from 'vitest';
 
 import { CliBootstrapService } from '../../../src/cli/cli-bootstrap.service.js';
@@ -73,6 +74,30 @@ export class CliScenario {
       return { exitCode, signal: null, stderr: stderr.join(''), stdout: stdout.join('') };
     } finally {
       process.argv = previousArgv;
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+  }
+
+  static async failApplicationWith(failure: unknown): Promise<CliResult> {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    const applicationSpy = vi.spyOn(CommandFactory, 'run').mockRejectedValue(failure);
+    try {
+      const bootstrap = new CliBootstrapService(new PackageMetadataService(), new OutputService());
+      const exitCode = await bootstrap.run();
+
+      return { exitCode, signal: null, stderr: stderr.join(''), stdout: stdout.join('') };
+    } finally {
+      applicationSpy.mockRestore();
       stdoutSpy.mockRestore();
       stderrSpy.mockRestore();
     }

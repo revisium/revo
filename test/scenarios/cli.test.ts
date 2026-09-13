@@ -33,17 +33,17 @@ describe('Revo CLI', () => {
     expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: '', stdout: '0.0.0\n' });
   });
 
-  it.each([{ args: ['unknown'] }, { args: ['--unknown'] }])(
-    'rejects invalid input $args without framework noise',
-    async ({ args }) => {
-      const result = await CliScenario.run(args);
+  it.each([
+    { args: ['unknown'], error: "error: unknown command 'unknown'\n" },
+    { args: ['--unknown'], error: "error: unknown option '--unknown'\n" },
+  ])('rejects invalid input $args without framework noise', async ({ args, error }) => {
+    const result = await CliScenario.run(args);
 
-      expect(result.exitCode).toBe(2);
-      expect(result.stdout).toBe('');
-      expect(result.stderr).toMatch(/unknown (command|option)/i);
-      expect(result.stderr).not.toMatch(/\n\s+at |NestFactory|\[Nest\]/i);
-    },
-  );
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe(error);
+    expect(result.stderr).not.toMatch(/\n\s+at |NestFactory|\[Nest\]/i);
+  });
 
   it('injects replaced package metadata in a real Nest application context', async () => {
     const output = await CliScenario.runVersionWithMetadata('9.8.7');
@@ -61,5 +61,15 @@ describe('Revo CLI', () => {
     expect(help.stdout).toContain('Usage: revo');
     expect(invalid).toMatchObject({ exitCode: 2, stdout: '' });
     expect(invalid.stderr).toContain("unknown command 'unknown'");
+  });
+
+  it.each([
+    { failure: new Error('startup failed'), stderr: 'startup failed\n' },
+    { failure: 'startup rejected', stderr: 'startup rejected\n' },
+    { failure: new Error('already terminated\n'), stderr: 'already terminated\n' },
+  ])('reports an application startup failure once: $stderr', async ({ failure, stderr }) => {
+    const result = await CliScenario.failApplicationWith(failure);
+
+    expect(result).toMatchObject({ exitCode: 1, stdout: '', stderr });
   });
 });
