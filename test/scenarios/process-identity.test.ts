@@ -64,4 +64,39 @@ describe('process identity', () => {
       failed: { kind: 'unknown', reason: 'unavailable' },
     });
   });
+  it('distinguishes Linux infrastructure failure from a missing process', async () => {
+    await expect(scenario.observesLinuxInfrastructureBoundaries()).resolves.toEqual([
+      { kind: 'unknown', reason: 'unavailable' },
+      { kind: 'unknown', reason: 'malformed' },
+      { kind: 'missing' },
+    ]);
+    await expect(scenario.safelyRejectsUnavailableCapture()).resolves.toEqual({
+      name: 'ProcessIdentityError',
+      message: 'Process identity could not be captured',
+      cause: undefined,
+    });
+  });
+  it('validates persisted records before touching the operating system', async () => {
+    const result = await scenario.validatesRecordsBeforeSystemInspection();
+    expect(result.invalid).toEqual(
+      Array.from({ length: 6 }, () => ({ kind: 'unknown', reason: 'invalid-record' })),
+    );
+    expect(result.foreign).toEqual({ kind: 'mismatch' });
+    expect(result.calls).toBe(0);
+  });
+  it('maps Darwin missing, denied, zombie, malformed and load failures', async () => {
+    await expect(scenario.observesDarwinFailures()).resolves.toEqual([
+      { kind: 'missing' },
+      { kind: 'unknown', reason: 'denied' },
+      { kind: 'missing' },
+      { kind: 'unknown', reason: 'malformed' },
+      { kind: 'unknown', reason: 'unavailable' },
+    ]);
+  });
+  it('rejects missing and incomplete Linux Uid status fields', async () => {
+    await expect(scenario.observesMalformedLinuxStatus()).resolves.toEqual([
+      { kind: 'unknown', reason: 'malformed' },
+      { kind: 'unknown', reason: 'malformed' },
+    ]);
+  });
 });

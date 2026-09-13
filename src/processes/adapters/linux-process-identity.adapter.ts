@@ -10,6 +10,9 @@ const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const code = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
 const PROC_ROOT = Symbol('PROC_ROOT');
+type BootIdResult =
+  | { readonly kind: 'valid'; readonly bootId: string }
+  | Extract<IdentityObservation, { readonly kind: 'unknown' }>;
 
 @Injectable()
 export class LinuxProcessIdentityAdapter implements ProcessIdentityAdapter {
@@ -19,17 +22,28 @@ export class LinuxProcessIdentityAdapter implements ProcessIdentityAdapter {
     if (!validPid(pid)) {
       return { kind: 'unknown', reason: 'invalid-record' };
     }
-    let bootId: string;
+    const boot = await this.readBootId();
+    if (boot.kind !== 'valid') {
+      return boot;
+    }
+    const { bootId } = boot;
+    return this.captureFromProc(pid, bootId);
+  }
+
+  private async readBootId(): Promise<BootIdResult> {
     try {
-      bootId = (await readFile(join(this.procRoot, 'sys/kernel/random/boot_id'), 'utf8'))
+      const bootId = (await readFile(join(this.procRoot, 'sys/kernel/random/boot_id'), 'utf8'))
         .trim()
         .toLowerCase();
+      return BOOT_ID.test(bootId)
+        ? { kind: 'valid', bootId }
+        : { kind: 'unknown', reason: 'malformed' };
     } catch (error) {
       return { kind: 'unknown', reason: code(error) === 'EACCES' ? 'denied' : 'unavailable' };
     }
-    if (!BOOT_ID.test(bootId)) {
-      return { kind: 'unknown', reason: 'malformed' };
-    }
+  }
+
+  private async captureFromProc(pid: number, bootId: string): Promise<IdentityObservation> {
     try {
       const directory = join(this.procRoot, String(pid));
       const first = parseLinuxStat(await readFile(join(directory, 'stat'), 'utf8'));

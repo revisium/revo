@@ -30,7 +30,8 @@ export class DarwinProcessIdentityAdapter implements ProcessIdentityAdapter {
     }
     let binding: DarwinBinding;
     try {
-      binding = await (this.binding ??= this.loadBinding());
+      this.binding ??= this.loadBinding();
+      binding = await this.binding;
     } catch {
       return { kind: 'unknown', reason: 'unavailable' };
     }

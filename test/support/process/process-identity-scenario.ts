@@ -11,7 +11,10 @@ import {
 } from '../../../src/processes/adapters/darwin-process-identity.adapter.js';
 import { LinuxProcessIdentityAdapter } from '../../../src/processes/adapters/linux-process-identity.adapter.js';
 import { ProcessIdentityService } from '../../../src/processes/process-identity.service.js';
-import type { ProcessIdentity } from '../../../src/processes/process-identity.types.js';
+import type {
+  IdentityObservation,
+  ProcessIdentity,
+} from '../../../src/processes/process-identity.types.js';
 import { ProcessesModule } from '../../../src/processes/processes.module.js';
 
 export class ProcessIdentityScenario {
@@ -92,6 +95,90 @@ export class ProcessIdentityScenario {
     await writeFile(join(root, '123/status'), 'Uid:\t1000\t1001\t1000\t1000\n');
     return new LinuxProcessIdentityAdapter(root).capture(123);
   }
+  async observesLinuxInfrastructureBoundaries() {
+    const missingBoot = await this.linuxFixture();
+    await rm(join(missingBoot, 'sys/kernel/random/boot_id'));
+    const invalidBoot = await this.linuxFixture();
+    await writeFile(join(invalidBoot, 'sys/kernel/random/boot_id'), 'not-a-boot-id');
+    const missingPid = await this.linuxFixture();
+    await rm(join(missingPid, '123'), { recursive: true });
+    const inspect = (root: string) => new LinuxProcessIdentityAdapter(root).capture(123);
+    return Promise.all([inspect(missingBoot), inspect(invalidBoot), inspect(missingPid)]);
+  }
+  async safelyRejectsUnavailableCapture() {
+    const root = await this.linuxFixture();
+    await rm(join(root, 'sys/kernel/random/boot_id'));
+    try {
+      await new ProcessIdentityService(
+        new LinuxProcessIdentityAdapter(root),
+        new DarwinProcessIdentityAdapter(),
+        'linux',
+      ).capture(123);
+      return undefined;
+    } catch (error) {
+      return error instanceof Error
+        ? { name: error.name, message: error.message, cause: error.cause }
+        : error;
+    }
+  }
+  async validatesRecordsBeforeSystemInspection() {
+    const boundary = new BoundaryAdapter();
+    const service = new ProcessIdentityService(
+      boundary,
+      new DarwinProcessIdentityAdapter(),
+      'linux',
+    );
+    const birth = { bootId: '123e4567-e89b-42d3-a456-426614174000', startTicks: '1' };
+    const records = [
+      { platform: 'linux', pid: 0, uid: 1, birth },
+      { platform: 'linux', pid: 1, uid: 4_294_967_296, birth },
+      { platform: 'linux', pid: 1, uid: 1, birth: { bootId: birth.bootId } },
+      { platform: 'linux', pid: 1, uid: 1, birth: { ...birth, startTicks: '01' } },
+      {
+        platform: 'linux',
+        pid: 1,
+        uid: 1,
+        birth: { ...birth, startTicks: '18446744073709551616' },
+      },
+      { platform: 'darwin', pid: 1, uid: 1, birth: { seconds: '1', microseconds: '1000000' } },
+    ];
+    const invalid = await Promise.all(records.map((record) => service.inspect(record)));
+    const foreign = await service.inspect({
+      platform: 'darwin',
+      pid: 1,
+      uid: 1,
+      birth: { seconds: '1', microseconds: '1' },
+    });
+    return { invalid, foreign, calls: boundary.calls };
+  }
+  async observesDarwinFailures() {
+    const expected = {
+      platform: 'darwin' as const,
+      pid: 77,
+      uid: 501,
+      birth: { seconds: '2', microseconds: '3' },
+    };
+    const inspect = (adapter: DarwinProcessIdentityAdapter) =>
+      new ProcessIdentityService(new LinuxProcessIdentityAdapter(), adapter, 'darwin').inspect(
+        expected,
+      );
+    return Promise.all([
+      inspect(FixtureDarwinAdapter.zero(3)),
+      inspect(FixtureDarwinAdapter.zero(1)),
+      inspect(FixtureDarwinAdapter.buffer(77, 5)),
+      inspect(FixtureDarwinAdapter.buffer(78, 2)),
+      inspect(new FailingDarwinAdapter()),
+    ]);
+  }
+  async observesMalformedLinuxStatus() {
+    return Promise.all(
+      ['Name:\tworker\n', 'Uid:\t1000\t1000\t1000\n'].map(async (status) => {
+        const root = await this.linuxFixture();
+        await writeFile(join(root, '123/status'), status);
+        return new LinuxProcessIdentityAdapter(root).capture(123);
+      }),
+    );
+  }
   async provesMismatchedLinuxPidIsUnknown() {
     const root = await this.linuxFixture();
     const stat = await readFile(join(root, '123/stat'), 'utf8');
@@ -160,5 +247,40 @@ class FixtureDarwinAdapter extends DarwinProcessIdentityAdapter {
       ...this.fixture,
       pidInfo: (...args) => (this.result === 136 ? this.fixture.pidInfo(...args) : this.result),
     };
+  }
+  static zero(errno: number) {
+    return new FixtureDarwinAdapter({
+      pidInfo: () => 0,
+      errno: () => errno,
+      noSuchProcess: [3],
+      denied: [1, 13],
+    });
+  }
+  static buffer(pid: number, status: number) {
+    const buffer = Buffer.alloc(136);
+    buffer.writeUInt32LE(status, 4);
+    buffer.writeInt32LE(pid, 12);
+    buffer.writeUInt32LE(501, 20);
+    buffer.writeUInt32LE(501, 28);
+    buffer.writeBigUInt64LE(2n, 120);
+    buffer.writeBigUInt64LE(3n, 128);
+    return new FixtureDarwinAdapter({
+      pidInfo: (_p, _f, _a, destination) => (buffer.copy(destination), 136),
+      errno: () => 0,
+      noSuchProcess: [3],
+      denied: [1, 13],
+    });
+  }
+}
+class FailingDarwinAdapter extends DarwinProcessIdentityAdapter {
+  protected override async loadBinding(): Promise<DarwinBinding> {
+    throw new Error('native unavailable');
+  }
+}
+class BoundaryAdapter extends LinuxProcessIdentityAdapter {
+  calls = 0;
+  async capture(): Promise<IdentityObservation> {
+    this.calls += 1;
+    throw new Error('must not inspect');
   }
 }
