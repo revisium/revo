@@ -31,3 +31,4 @@ export type {
   ProcessStdio,
   StopProcessRequest,
 } from './managed-process.types.js';
+export type { StartupProgressFacade, StartupProgressOptions } from '../startup-progress/index.js';

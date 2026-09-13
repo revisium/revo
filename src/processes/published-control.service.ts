@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { OwnedStartupProgress } from '../startup-progress/startup-progress-facade.js';
+import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
 import {
   CONTROL_FILE,
   ControlDiscoveryService,
@@ -32,6 +34,8 @@ export class PublishedControlService {
     @Inject(ProcessIdentityService) private readonly identity = new ProcessIdentityService(),
     @Inject(ControlEndpointService) private readonly endpoints = new ControlEndpointService(),
     @Inject(ControlDiscoveryService) private readonly discovery = new ControlDiscoveryService(),
+    @Inject(StartupProgressJournalWriter)
+    private readonly progressJournal = new StartupProgressJournalWriter(),
   ) {}
 
   async open(request: OpenPublishedControlRequest): Promise<PublishedControl> {
@@ -55,6 +59,10 @@ export class PublishedControlService {
         identity: { version: request.version, channel: request.channel, canonicalDataDir, process },
       });
       endpoint = createdEndpoint;
+      const progress = request.startupProgress
+        ? new OwnedStartupProgress(this.progressJournal, canonicalDataDir, request.startupProgress)
+        : undefined;
+      await progress?.initialize();
       const record = {
         schemaVersion: 1 as const,
         instanceId,
@@ -72,14 +80,12 @@ export class PublishedControlService {
         kind: 'held',
         endpoint: createdEndpoint.endpoint,
         stopResult: createdEndpoint.stopResult,
+        ...(progress ? { progress } : {}),
         close: () =>
-          (closePromise ??= this.closeOwned(
-            createdEndpoint,
-            canonicalDataDir,
-            instanceId,
-            token,
-            lease,
-          )),
+          (closePromise ??= (async () => {
+            await progress?.close();
+            await this.closeOwned(createdEndpoint, canonicalDataDir, instanceId, token, lease);
+          })()),
       };
     } catch {
       throw new PublishedControlError(

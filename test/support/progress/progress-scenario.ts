@@ -23,6 +23,16 @@ export class ProgressScenario {
     };
   }
 
+  singleCurrentProgressRemainsOrdered() {
+    this.operation.start('runtime-download');
+    this.operation.progress('runtime-download', { counters: { bytesReceived: 1 } });
+    this.operation.complete('runtime-download');
+    this.operation.progress('runtime-download', { counters: { bytesReceived: 2 } });
+    this.operation.start('runtime-extract');
+    this.operation.progress('runtime-extract', { stageElapsedMs: 1 });
+    return this.operation.eventsAfter(0);
+  }
+
   clockRollbackAndImmutableSnapshots() {
     const started = this.operation.start('postgres-start');
     this.now = 150;
