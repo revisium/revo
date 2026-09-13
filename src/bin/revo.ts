@@ -9,12 +9,9 @@ import { PackageMetadataService } from '../cli/package-metadata.service.js';
 const output = new OutputService();
 const bootstrap = new CliBootstrapService(new PackageMetadataService(), output);
 
-void bootstrap.run().then(
-  (exitCode) => {
-    process.exitCode = exitCode;
-  },
-  (error: unknown) => {
-    output.writeError(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
-  },
-);
+try {
+  process.exitCode = await bootstrap.run();
+} catch (error: unknown) {
+  output.writeError(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}
