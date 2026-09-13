@@ -103,7 +103,10 @@ export class ProcessIdentityScenario {
       ['1.23e2', '+123', '0x7b'].map(async (prefix) => {
         const root = await this.linuxFixture();
         const stat = await readFile(join(root, '123/stat'), 'utf8');
-        await writeFile(join(root, '123/stat'), stat.replace(/^123/u, prefix));
+        await writeFile(
+          join(root, '123/stat'),
+          stat.replace(/^123/u, prefix),
+        );
         return new LinuxProcessIdentityAdapter(root).capture(123);
       }),
     );
