@@ -184,7 +184,7 @@ export class PostgresReadinessScenario {
   }
 }
 
-class ClusterFixture {
+export class ClusterFixture {
   private constructor(
     readonly root: string,
     readonly port: number,
@@ -193,7 +193,7 @@ class ClusterFixture {
     private readonly statementTimeout: () => boolean,
   ) {}
 
-  static async start(authentication: 'scram' | 'trust') {
+  static async start(authentication: 'scram' | 'trust', requestedPort?: number) {
     const root = await mkdtemp('/tmp/pr-');
     const processes = new ManagedProcessService();
     let process: OwnedProcess | undefined;
@@ -203,9 +203,17 @@ class ClusterFixture {
       const binaries = await loadEmbeddedPostgresBinaries();
       await writeFile(passwordFile, PASSWORD, { mode: 0o600 });
       await initializeCluster(processes, binaries.initdb, data, passwordFile, root, authentication);
-      const reservation = await new LoopbackPortAllocator().reserve();
-      const port = reservation.port;
-      await reservation.release();
+      const reservation =
+        requestedPort === undefined ? await new LoopbackPortAllocator().reserve() : undefined;
+      let port: number;
+      if (requestedPort !== undefined) {
+        port = requestedPort;
+      } else if (reservation !== undefined) {
+        port = reservation.port;
+      } else {
+        throw new Error('loopback port reservation missing');
+      }
+      await reservation?.release();
       const started = await startPostgres(processes, binaries.postgres, data, root, port);
       process = started.process;
       const fixture = new ClusterFixture(root, port, process, processes, started.statementTimeout);

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
-import { EmbeddedPostgresPreparationService } from '../postgres/embedded-postgres-preparation.service.js';
+import { EmbeddedPostgresResourceService } from '../postgres/embedded-postgres-resource.service.js';
 import { OwnedStartupProgress } from '../startup-progress/startup-progress-facade.js';
 import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
 import {
@@ -37,8 +37,8 @@ export class PublishedControlService {
     @Inject(ControlDiscoveryService) private readonly discovery = new ControlDiscoveryService(),
     @Inject(StartupProgressJournalWriter)
     private readonly progressJournal = new StartupProgressJournalWriter(),
-    @Inject(EmbeddedPostgresPreparationService)
-    private readonly postgres = new EmbeddedPostgresPreparationService(),
+    @Inject(EmbeddedPostgresResourceService)
+    private readonly postgres = new EmbeddedPostgresResourceService(),
   ) {}
 
   async open(request: OpenPublishedControlRequest): Promise<PublishedControl> {
@@ -106,7 +106,10 @@ export class PublishedControlService {
         endpoint: createdEndpoint.endpoint,
         stopResult: createdEndpoint.stopResult,
         ...(progress ? { progress } : {}),
-        ...(postgres ? { prepareEmbeddedPostgres: postgres.prepare.bind(postgres) } : {}),
+        ...(postgres
+          ? { prepareEmbeddedPostgres: postgres.prepareEmbeddedPostgres.bind(postgres) }
+          : {}),
+        ...(postgres ? { startDatabase: postgres.start.bind(postgres) } : {}),
         close: async () => {
           const postgresClose = postgres?.close();
           progressClose ??= progress?.close();

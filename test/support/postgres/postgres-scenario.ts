@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import { EmbeddedPostgresPreparationService } from '../../../src/postgres/embedded-postgres-preparation.service.js';
+import { EmbeddedPostgresResourceService } from '../../../src/postgres/embedded-postgres-resource.service.js';
 import { ManagedProcessError } from '../../../src/processes/managed-process-error.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type {
@@ -14,6 +15,7 @@ import type {
 } from '../../../src/processes/managed-process.types.js';
 import { PublishedControlService } from '../../../src/processes/published-control.service.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
+import { BlockingJournal } from '../startup-progress/blocking-journal.js';
 
 const operationId = '1234567890abcdef1234567890abcdef';
 
@@ -117,73 +119,79 @@ export class PostgresScenario {
     if (held.kind !== 'held' || !held.prepareEmbeddedPostgres || !held.progress) {
       throw new Error('owner missing');
     }
-    const preparation = held.prepareEmbeddedPostgres({
-      signal: new AbortController().signal,
-      timeoutMs: 60_000,
-    });
-    await process.started;
-    const coalesced = held.prepareEmbeddedPostgres({
-      signal: new AbortController().signal,
-      timeoutMs: 60_000,
-    });
-    journal.blockNext();
-    const pendingProgress = held.progress.progress('postgres-initialization');
-    await journal.entered;
-    const firstClosePending = held.close().then(
-      () => 'resolved',
-      () => 'rejected',
-    );
-    const secondClose = await Promise.race([
-      held.close().then(
+    try {
+      const preparation = held.prepareEmbeddedPostgres({
+        signal: new AbortController().signal,
+        timeoutMs: 60_000,
+      });
+      await process.started;
+      const coalesced = held.prepareEmbeddedPostgres({
+        signal: new AbortController().signal,
+        timeoutMs: 60_000,
+      });
+      journal.blockNext();
+      const pendingProgress = held.progress.progress('postgres-initialization');
+      await journal.entered;
+      const firstClosePending = held.close().then(
         () => 'resolved',
         () => 'rejected',
-      ),
-      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
-    ]);
-    const busy = await this.open(fixture);
-    await process.exit();
-    await process.exited;
-    const beforeDrain = await this.open(fixture);
-    const beforeDrainClose = await held.close().then(
-      () => 'resolved',
-      () => 'rejected',
-    );
-    journal.release();
-    await pendingProgress;
-    const firstClose = await firstClosePending;
-    const outcome = await preparation.then(
-      () => 'resolved',
-      () => 'rejected',
-    );
-    const replacement = await this.acquireEventually(fixture);
-    if (replacement.kind !== 'held') {
-      throw new Error('replacement owner missing');
+      );
+      const secondClose = await Promise.race([
+        held.close().then(
+          () => 'resolved',
+          () => 'rejected',
+        ),
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
+      ]);
+      const busy = await this.open(fixture);
+      await process.exit();
+      await process.exited;
+      const beforeDrain = await this.open(fixture);
+      const beforeDrainClose = await held.close().then(
+        () => 'resolved',
+        () => 'rejected',
+      );
+      journal.release();
+      await pendingProgress;
+      const firstClose = await firstClosePending;
+      const outcome = await preparation.then(
+        () => 'resolved',
+        () => 'rejected',
+      );
+      const replacement = await this.acquireEventually(fixture);
+      if (replacement.kind !== 'held') {
+        throw new Error('replacement owner missing');
+      }
+      await held.close();
+      const retained = await Promise.all([
+        lstat(join(fixture.dataDir, 'postgres')).then(
+          () => true,
+          () => false,
+        ),
+        lstat(join(fixture.dataDir, 'postgres-password')).then(
+          () => true,
+          () => false,
+        ),
+      ]);
+      await replacement.close();
+      return {
+        firstClose,
+        secondClose,
+        outcome,
+        coalesced: coalesced === preparation,
+        busy: busy.kind,
+        beforeDrain: beforeDrain.kind,
+        beforeDrainClose,
+        replacement: replacement.kind,
+        retained,
+        secretByPathOnly: process.request?.args.some((value) => value.includes('--pwfile=')),
+        environment: process.request?.env,
+      };
+    } finally {
+      journal.release();
+      await process.exit().catch(() => undefined);
+      await held.close().catch(() => undefined);
     }
-    await held.close();
-    const retained = await Promise.all([
-      lstat(join(fixture.dataDir, 'postgres')).then(
-        () => true,
-        () => false,
-      ),
-      lstat(join(fixture.dataDir, 'postgres-password')).then(
-        () => true,
-        () => false,
-      ),
-    ]);
-    await replacement.close();
-    return {
-      firstClose,
-      secondClose,
-      outcome,
-      coalesced: coalesced === preparation,
-      busy: busy.kind,
-      beforeDrain: beforeDrain.kind,
-      beforeDrainClose,
-      replacement: replacement.kind,
-      retained,
-      secretByPathOnly: process.request?.args.some((value) => value.includes('--pwfile=')),
-      environment: process.request?.env,
-    };
   }
 
   async cleanup() {
@@ -207,13 +215,14 @@ export class PostgresScenario {
     postgres?: EmbeddedPostgresPreparationService,
     journal?: StartupProgressJournalWriter,
   ) {
+    const resource = postgres ? new EmbeddedPostgresResourceService(postgres) : undefined;
     return new PublishedControlService(
       undefined,
       undefined,
       undefined,
       undefined,
       journal,
-      postgres,
+      resource,
     ).open({
       ...fixture,
       version: '1.0.0',
@@ -235,35 +244,6 @@ export class PostgresScenario {
         this.acquireEventually(fixture, deadline),
       );
     });
-  }
-}
-
-class BlockingJournal extends StartupProgressJournalWriter {
-  private blocked = false;
-  private releaseWrite!: () => void;
-  private notifyEntered!: () => void;
-  entered: Promise<void> = Promise.resolve();
-  private gate: Promise<void> = Promise.resolve();
-
-  blockNext() {
-    this.blocked = true;
-    this.entered = new Promise((resolve) => {
-      this.notifyEntered = resolve;
-    });
-    this.gate = new Promise((resolve) => {
-      this.releaseWrite = resolve;
-    });
-  }
-  release() {
-    this.releaseWrite();
-  }
-  override async write(...parameters: Parameters<StartupProgressJournalWriter['write']>) {
-    if (this.blocked) {
-      this.blocked = false;
-      this.notifyEntered();
-      await this.gate;
-    }
-    return super.write(...parameters);
   }
 }
 
