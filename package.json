@@ -20,6 +20,7 @@
   "exports": {
     "./configuration": "./dist/configuration/index.js",
     "./layout": "./dist/layout.js",
+    "./processes": "./dist/processes/index.js",
     "./release-metadata": "./dist/release-metadata.js"
   },
   "scripts": {
@@ -36,6 +37,7 @@
   "dependencies": {
     "@nestjs/common": "11.1.28",
     "@nestjs/core": "11.1.28",
+    "koffi": "3.2.1",
     "nest-commander": "3.21.0",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2"
