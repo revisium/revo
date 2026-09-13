@@ -177,19 +177,19 @@ export class ManagedProcessScenario {
 }
 
 function isEnvironmentReport(value: unknown): value is EnvironmentReport {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  if (!isRecord(value) || !isRecord(value.env)) {
     return false;
   }
-  const report = value as Record<string, unknown>;
   return (
-    typeof report.cwd === 'string' &&
-    Array.isArray(report.argv) &&
-    report.argv.every((argument) => typeof argument === 'string') &&
-    typeof report.env === 'object' &&
-    report.env !== null &&
-    !Array.isArray(report.env) &&
-    Object.values(report.env).every((entry) => typeof entry === 'string')
+    typeof value.cwd === 'string' &&
+    Array.isArray(value.argv) &&
+    value.argv.every((argument) => typeof argument === 'string') &&
+    Object.values(value.env).every((entry) => typeof entry === 'string')
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function waitForExit(child: ChildProcess): Promise<void> {
