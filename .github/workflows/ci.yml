@@ -47,7 +47,7 @@ jobs:
         run: |
           node -p "'process platform=' + process.platform + ' arch=' + process.arch"
           pnpm build
-          pnpm exec vitest run test/scenarios/ownership.test.ts test/scenarios/managed-process.test.ts test/scenarios/process-identity.test.ts test/scenarios/control-endpoint.test.ts
+          pnpm exec vitest run test/scenarios/ownership.test.ts test/scenarios/managed-process.test.ts test/scenarios/process-identity.test.ts test/scenarios/control-endpoint.test.ts test/scenarios/control-discovery.test.ts
 
   verify:
     runs-on: ubuntu-latest
