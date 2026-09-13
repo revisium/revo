@@ -1,6 +1,5 @@
 import { execFile } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -194,7 +193,7 @@ export class PostgresScenario {
   }
 
   private async fixture() {
-    const root = await mkdtemp(join(tmpdir(), 'revo-pg-'));
+    const root = await mkdtemp('/tmp/pg-');
     this.roots.push(root);
     const dataDir = join(root, 'data');
     const runtimeDir = join(root, 'run');
