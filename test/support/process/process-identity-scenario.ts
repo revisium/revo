@@ -17,7 +17,7 @@ import { ProcessesModule } from '../../../src/processes/processes.module.js';
 export class ProcessIdentityScenario {
   private readonly service = new ProcessIdentityService();
   private child: ChildProcess | undefined;
-  private fixtureRoot?: string;
+  private readonly fixtureRoots = new Set<string>();
   async capturesCurrentProcessThroughNest(): Promise<ProcessIdentity> {
     const context = await NestFactory.createApplicationContext(ProcessesModule, { logger: false });
     try {
@@ -94,21 +94,19 @@ export class ProcessIdentityScenario {
   }
   async provesMismatchedLinuxPidIsUnknown() {
     const root = await this.linuxFixture();
-    const stat = await import('node:fs/promises').then(({ readFile: readFixtureFile }) =>
-      readFixtureFile(join(root, '123/stat'), 'utf8'),
-    );
+    const stat = await readFile(join(root, '123/stat'), 'utf8');
     await writeFile(join(root, '123/stat'), stat.replace(/^123/u, '999'));
     return new LinuxProcessIdentityAdapter(root).capture(123);
   }
   async provesMalformedLinuxPidPrefixesAreUnknown() {
-    const root = await this.linuxFixture();
-    const originalStat = await readFile(join(root, '123/stat'), 'utf8');
-    const observations = [];
-    for (const prefix of ['1.23e2', '+123', '0x7b']) {
-      await writeFile(join(root, '123/stat'), originalStat.replace(/^123/u, prefix));
-      observations.push(await new LinuxProcessIdentityAdapter(root).capture(123));
-    }
-    return observations;
+    return Promise.all(
+      ['1.23e2', '+123', '0x7b'].map(async (prefix) => {
+        const root = await this.linuxFixture();
+        const stat = await readFile(join(root, '123/stat'), 'utf8');
+        await writeFile(join(root, '123/stat'), stat.replace(/^123/u, prefix));
+        return new LinuxProcessIdentityAdapter(root).capture(123);
+      }),
+    );
   }
   async provesDarwinBoundary() {
     const buffer = Buffer.alloc(136);
@@ -133,25 +131,26 @@ export class ProcessIdentityScenario {
   }
   async cleanup(): Promise<void> {
     this.child?.kill('SIGKILL');
-    if (this.fixtureRoot) {
-      await rm(this.fixtureRoot, { recursive: true, force: true });
-    }
+    await Promise.all(
+      [...this.fixtureRoots].map((root) => rm(root, { recursive: true, force: true })),
+    );
   }
   private async linuxFixture(): Promise<string> {
-    this.fixtureRoot = await mkdtemp(join(tmpdir(), 'revo-identity-'));
-    await mkdir(join(this.fixtureRoot, 'sys/kernel/random'), { recursive: true });
-    await mkdir(join(this.fixtureRoot, '123'));
+    const fixtureRoot = await mkdtemp(join(tmpdir(), 'revo-identity-'));
+    this.fixtureRoots.add(fixtureRoot);
+    await mkdir(join(fixtureRoot, 'sys/kernel/random'), { recursive: true });
+    await mkdir(join(fixtureRoot, '123'));
     await writeFile(
-      join(this.fixtureRoot, 'sys/kernel/random/boot_id'),
+      join(fixtureRoot, 'sys/kernel/random/boot_id'),
       '123e4567-e89b-42d3-a456-426614174000\n',
     );
     const fields = ['S', ...Array.from({ length: 18 }, () => '0'), '18446744073709551614'];
     await writeFile(
-      join(this.fixtureRoot, '123/stat'),
+      join(fixtureRoot, '123/stat'),
       `123 (worker ) name) ${fields.join(' ')}\n`,
     );
-    await writeFile(join(this.fixtureRoot, '123/status'), 'Uid:\t1000\t1000\t1000\t1000\n');
-    return this.fixtureRoot;
+    await writeFile(join(fixtureRoot, '123/status'), 'Uid:\t1000\t1000\t1000\t1000\n');
+    return fixtureRoot;
   }
 }
 class FixtureDarwinAdapter extends DarwinProcessIdentityAdapter {
