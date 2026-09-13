@@ -16,6 +16,11 @@ export interface EmbeddedPostgresReadinessRequest {
   readonly timeoutMs: number;
 }
 
+export const isPendingEmbeddedPostgresReadiness = (error: unknown) =>
+  error instanceof EmbeddedPostgresReadinessPendingError;
+export const isTerminalEmbeddedPostgresReadiness = (error: unknown) =>
+  error instanceof EmbeddedPostgresReadinessTerminalError;
+
 /** Internal SQL boundary for a PostgreSQL process whose lifecycle is owned elsewhere. */
 export class EmbeddedPostgresReadiness {
   private active: Promise<void> | undefined;
@@ -129,7 +134,17 @@ export class EmbeddedPostgresReadiness {
     client.on('error', onClientError);
     this.clients.add(client);
     try {
-      await untilDeadline(Promise.race([client.connect(), clientFailure]), sqlDeadline);
+      try {
+        await untilDeadline(Promise.race([client.connect(), clientFailure]), sqlDeadline);
+      } catch (error) {
+        if (isPendingStartupError(error)) {
+          throw new EmbeddedPostgresReadinessPendingError();
+        }
+        if (isPostgresReportedError(error)) {
+          throw new EmbeddedPostgresReadinessTerminalError();
+        }
+        throw error;
+      }
       rejectCancellation(signal);
       await untilDeadline(
         this.observeSql(verifyStartupNonce(client, request.startupNonce)),
@@ -145,6 +160,9 @@ export class EmbeddedPostgresReadiness {
       } catch (error) {
         if (isTransportFailure(error)) {
           this.cleanupFailed = true;
+        }
+        if (isPostgresReportedError(error)) {
+          throw new EmbeddedPostgresReadinessTerminalError();
         }
         throw error;
       }
@@ -272,7 +290,7 @@ const validateRequest = (request: EmbeddedPostgresReadinessRequest) => {
 const verifyStartupNonce = async (client: Client, expected: string) => {
   const result = await client.query<{ cluster_name: string }>('SHOW cluster_name');
   if (result.rows[0]?.cluster_name !== expected) {
-    throw new EmbeddedPostgresError('process');
+    throw new EmbeddedPostgresReadinessTerminalError();
   }
 };
 
@@ -304,6 +322,29 @@ const isTransportFailure = (error: unknown) => {
   const code = errorCode(error);
   return code?.startsWith('08') === true || code === '57P01';
 };
+
+const isPendingStartupError = (error: unknown) => {
+  const code = errorCode(error);
+  return code === 'ECONNREFUSED' || code === '57P03';
+};
+const isPostgresReportedError = (error: unknown) =>
+  typeof error === 'object' &&
+  error !== null &&
+  'severity' in error &&
+  typeof error.severity === 'string' &&
+  errorCode(error) !== undefined;
+
+class EmbeddedPostgresReadinessPendingError extends EmbeddedPostgresError {
+  constructor() {
+    super('process');
+  }
+}
+
+class EmbeddedPostgresReadinessTerminalError extends EmbeddedPostgresError {
+  constructor() {
+    super('process');
+  }
+}
 
 async function untilDeadline<T>(operation: Promise<T>, deadline: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;

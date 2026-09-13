@@ -292,6 +292,9 @@ async function readPrivateFile(path: string) {
   }
 }
 
+export const readEmbeddedPostgresCredential = (canonicalDataDir: string) =>
+  readPrivateFile(join(canonicalDataDir, 'postgres-password'));
+
 async function validatePrivateFile(path: string) {
   let file: FileHandle | undefined;
   try {

@@ -35,4 +35,6 @@ export type { StartupProgressFacade, StartupProgressOptions } from '../startup-p
 export type {
   PreparedEmbeddedPostgres,
   PrepareEmbeddedPostgresRequest,
+  StartedEmbeddedDatabase,
+  StartDatabaseRequest,
 } from '../postgres/index.js';
