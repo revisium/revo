@@ -21,7 +21,8 @@ export class PosixFlockAdapter {
   private binding: Promise<FlockBinding> | undefined;
 
   async lock(file: FileHandle): Promise<NativeLock | undefined> {
-    const binding = await (this.binding ??= this.loadBinding());
+    this.binding ??= this.loadBinding();
+    const binding = await this.binding;
     const result = binding.call(file.fd, LOCK_EX | LOCK_NB);
     const errno = result === -1 ? binding.errno() : undefined;
     if (result === 0) {
@@ -65,10 +66,10 @@ export class PosixFlockAdapter {
 
   private platformCloseOnExec(platform: NodeJS.Platform): number {
     if (platform === 'linux') {
-      return 0x80_000;
+      return 0x80000;
     }
     if (platform === 'darwin') {
-      return 0x100_0000;
+      return 0x1000000;
     }
     throw new Error(`Server ownership is unsupported on ${platform}.`);
   }

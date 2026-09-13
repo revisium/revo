@@ -93,9 +93,9 @@ export class ServerOwnershipService {
   private async closeAfterFailure(file: FileHandle): Promise<void> {
     try {
       await file.close();
-    } catch (closeFailure) {
+    } catch (error_) {
       throw new Error('Server ownership descriptor could not be closed after a failure.', {
-        cause: closeFailure,
+        cause: error_,
       });
     }
   }
