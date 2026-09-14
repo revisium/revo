@@ -8,9 +8,14 @@ import { EmbeddedPostgresReadiness } from '../../../src/postgres/embedded-postgr
 import { LoopbackPortAllocator } from '../../../src/postgres/loopback-port-allocator.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type { OwnedProcess } from '../../../src/processes/managed-process.types.js';
+import { ProcessExitWaiter } from '../../../src/processes/process-exit-waiter.js';
 
 const PASSWORD = 'fixture-password';
 const NONCE = 'revo-readiness-fixture';
+const INITDB_TIMEOUT_MS = 10_000;
+const PROCESS_STOP = { graceMs: 1_000, killWaitMs: 5_000 } as const;
+
+export const REAL_PG_SCENARIO_TIMEOUT_MS = 35_000;
 
 export class PostgresReadinessScenario {
   private readonly clusters: ClusterFixture[] = [];
@@ -224,7 +229,9 @@ export class ClusterFixture {
         await processes.stop(process, { graceMs: 1000, killWaitMs: 5000 }).catch(() => undefined);
         await process.completion;
       }
-      await rm(root, { recursive: true, force: true });
+      if (!(primary instanceof RetainedFixtureProcessError)) {
+        await rm(root, { recursive: true, force: true });
+      }
       throw primary;
     }
   }
@@ -384,11 +391,28 @@ const initializeCluster = async (
     stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' },
   });
   initdb.stderr?.resume();
+  const completed = await new ProcessExitWaiter().wait(initdb.completion, INITDB_TIMEOUT_MS);
+  if (!completed) {
+    try {
+      await processes.stop(initdb, PROCESS_STOP);
+      await initdb.completion;
+    } catch {
+      throw new RetainedFixtureProcessError();
+    }
+    throw new Error('fixture initdb timed out');
+  }
   const completion = await initdb.completion;
   if (completion.exitCode !== 0 || completion.signal !== null) {
     throw new Error('fixture initdb failed');
   }
 };
+
+class RetainedFixtureProcessError extends Error {
+  constructor() {
+    super('fixture process cleanup could not be confirmed');
+    this.name = 'RetainedFixtureProcessError';
+  }
+}
 
 const startPostgres = async (
   processes: ManagedProcessService,

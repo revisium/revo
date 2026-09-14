@@ -1,13 +1,17 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { ExternalPostgresLifecycleScenario } from '../support/postgres/external-postgres-lifecycle-scenario.js';
+import {
+  ExternalPostgresLifecycleScenario,
+  REAL_PG_CLEANUP_TIMEOUT_MS,
+} from '../support/postgres/external-postgres-lifecycle-scenario.js';
+import { REAL_PG_SCENARIO_TIMEOUT_MS } from '../support/postgres/postgres-readiness-scenario.js';
 
 describe('external PostgreSQL owned client lifecycle', () => {
   let scenario = new ExternalPostgresLifecycleScenario();
   afterEach(async () => {
     await scenario.cleanup();
     scenario = new ExternalPostgresLifecycleScenario();
-  });
+  }, REAL_PG_CLEANUP_TIMEOUT_MS);
 
   it('selects the configured database without preparing, creating, or owning PostgreSQL', async () => {
     await expect(scenario.connectsToTheSelectedDatabaseWithoutOwningTheServer()).resolves.toEqual({
@@ -94,10 +98,14 @@ describe('external PostgreSQL owned client lifecycle', () => {
     expect(result.listenerAlive).toBe(true);
   });
 
-  it('isolates a real child connection from hostile PostgreSQL environment defaults', async () => {
-    await expect(scenario.isolatesHostilePostgresEnvironmentInARealChild()).resolves.toEqual({
-      explicit: { kind: 'ready', database: 'postgres' },
-      missingPassword: { kind: 'failed', name: expect.any(String) },
-    });
-  });
+  it(
+    'isolates a real child connection from hostile PostgreSQL environment defaults',
+    async () => {
+      await expect(scenario.isolatesHostilePostgresEnvironmentInARealChild()).resolves.toEqual({
+        explicit: { kind: 'ready', database: 'postgres' },
+        missingPassword: { kind: 'failed', name: expect.any(String) },
+      });
+    },
+    REAL_PG_SCENARIO_TIMEOUT_MS,
+  );
 });
