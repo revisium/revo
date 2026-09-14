@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 
 import { EmbeddedPostgresPreparationService } from '../postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresResourceService } from '../postgres/embedded-postgres-resource.service.js';
+import { ExternalPostgresResourceService } from '../postgres/external-postgres-resource.service.js';
 import { LoopbackPortAllocator } from '../postgres/loopback-port-allocator.js';
 import { StartupProgressDiscoveryService } from '../startup-progress/index.js';
 import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
@@ -32,6 +33,7 @@ import { ServerOwnershipService } from './server-ownership.service.js';
     DarwinProcessIdentityAdapter,
     EmbeddedPostgresPreparationService,
     EmbeddedPostgresResourceService,
+    ExternalPostgresResourceService,
     LoopbackPortAllocator,
     ControlClientService,
     ControlDiscoveryService,

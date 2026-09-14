@@ -9,3 +9,9 @@ export interface StartedEmbeddedDatabase {
   readonly kind: 'embedded';
   readonly port: number;
 }
+
+export interface StartedExternalDatabase {
+  readonly kind: 'external';
+}
+
+export type StartedDatabase = StartedEmbeddedDatabase | StartedExternalDatabase;

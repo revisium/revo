@@ -21,9 +21,12 @@ if (held.kind === 'held' && held.progress) {
   await held.progress.progress('runtime-extract', { stageElapsedMs: 1 });
 }
 process.send?.({ kind: held.kind });
-process.on('message', async () => {
+const closeAndExit = async () => {
   if (held.kind === 'held') {
     await held.close();
   }
   process.exit(0);
+};
+process.on('message', () => {
+  void closeAndExit().then(undefined, () => process.exit(1));
 });
