@@ -91,14 +91,7 @@ export class ServerHostEntry {
       return;
     }
     if (message.type === 'start') {
-      if (this.state === 'committed') {
-        return;
-      }
-      if (this.state !== 'awaiting-start') {
-        this.fail('SERVER_HOST_INVALID_MESSAGE', 2);
-      } else {
-        this.beginStart(message);
-      }
+      this.receiveStart(message);
       return;
     }
     if (message.operationId !== this.operationId) {
@@ -114,6 +107,17 @@ export class ServerHostEntry {
       return;
     }
     this.commit();
+  }
+
+  private receiveStart(message: ServerHostStartMessage): void {
+    if (this.state === 'committed') {
+      return;
+    }
+    if (this.state !== 'awaiting-start') {
+      this.fail('SERVER_HOST_INVALID_MESSAGE', 2);
+    } else {
+      this.beginStart(message);
+    }
   }
 
   private beginStart(message: ServerHostStartMessage): void {
@@ -313,7 +317,7 @@ export class ServerHostEntry {
   }
 
   private async finishAfterSends(exitCode: 0 | 1 | 2): Promise<void> {
-    await Promise.allSettled([...this.pendingSends]);
+    await Promise.allSettled(this.pendingSends);
     let terminalExitCode = exitCode;
     try {
       await this.processPort.close(Date.now() + SEND_MILLISECONDS);
