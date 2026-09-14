@@ -5,7 +5,12 @@ import { NodeServerHostProcessPort } from '../../../dist/server/server-host-proc
 
 const root = process.env.REVO_SERVER_HOST_ROOT;
 const deadline = Date.now() + 3_000;
-process.once('disconnect', () => writeFile(`${root}/disconnect-observed`, 'disconnect-observed'));
+const disconnectObserved = new Promise((resolve, reject) => {
+  process.once('disconnect', () => {
+    writeFile(`${root}/disconnect-observed`, 'disconnect-observed').then(resolve, reject);
+  });
+});
+const disconnectRejectionObserved = disconnectObserved.then(undefined, () => undefined);
 let resolveOutcome;
 let resolveReleased;
 const outcome = new Promise((resolve) => (resolveOutcome = resolve));
@@ -32,6 +37,8 @@ const entry = new ServerHostEntry(new NodeServerHostProcessPort(), {
 });
 
 await entry.start();
+await disconnectRejectionObserved;
+await disconnectObserved;
 await writeFile(`${root}/entry-completed`, 'entry-completed');
 
 async function waitFor(path, gateDeadline) {

@@ -39,6 +39,7 @@ interface HeldPublishedControlBase {
   readonly stopDelivery: Promise<ControlStopDeliveryResult>;
   readonly progress?: StartupProgressFacade;
   close(): Promise<void>;
+  ownershipReleased(): Promise<void>;
 }
 
 export type PublishedControl =
