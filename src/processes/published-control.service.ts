@@ -134,6 +134,7 @@ export class PublishedControlService {
       };
       const common = {
         kind: 'held' as const,
+        canonicalDataDir,
         endpoint: createdEndpoint.endpoint,
         stopResult: createdEndpoint.stopResult,
         ...(progress ? { progress } : {}),

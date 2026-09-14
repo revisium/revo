@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
@@ -26,6 +26,10 @@ export interface CoreHostStartOptions {
   readonly onStage: (message: CoreHostStageMessage) => Promise<void>;
   readonly signal: AbortSignal;
 }
+
+export type CoreHostCompletionState =
+  | { readonly kind: 'not-spawned' }
+  | { readonly kind: 'exited'; readonly completion: ProcessCompletion };
 
 type CoreHostProcessErrorCode =
   | 'revo.core-host.aborted'
@@ -57,7 +61,10 @@ export class CoreHostProcessError extends Error {
 
 @Injectable()
 export class CoreHostProcessService {
-  constructor(private readonly processes = new ManagedProcessService()) {}
+  constructor(
+    @Inject(ManagedProcessService)
+    private readonly processes = new ManagedProcessService(),
+  ) {}
 
   open(binding: CoreHostProcessBinding): CoreHostProcessResource {
     return new CoreHostProcessResource(binding, this.processes);
@@ -69,6 +76,8 @@ export class CoreHostProcessResource {
   private spawnOperation: Promise<OwnedProcess> | undefined;
   private lateCleanup: Promise<void> | undefined;
   private completion: ProcessCompletion | undefined;
+  private spawnRejected = false;
+  private spawnAdmissionClosed = false;
   private phase: LifecyclePhase = 'idle';
   private failure: CoreHostProcessError | undefined;
   private readonly messages: CoreHostMessage[] = [];
@@ -103,7 +112,11 @@ export class CoreHostProcessResource {
         ipc: true,
         stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
       })
-      .then((child) => this.register(child));
+      .then((child) => this.register(child))
+      .catch((error: unknown) => {
+        this.spawnRejected = true;
+        throw error;
+      });
     const abort = () => this.latch('revo.core-host.aborted');
     options.signal.addEventListener('abort', abort, { once: true });
     try {
@@ -135,7 +148,18 @@ export class CoreHostProcessResource {
   }
 
   close(deadline: number): Promise<void> {
+    this.spawnAdmissionClosed = true;
     return this.terminate(deadline);
+  }
+
+  async completionState(): Promise<CoreHostCompletionState> {
+    if (this.child) {
+      return { kind: 'exited', completion: await this.child.completion };
+    }
+    if (this.spawnAdmissionClosed && (!this.spawnOperation || this.spawnRejected)) {
+      return { kind: 'not-spawned' };
+    }
+    throw new CoreHostProcessError('revo.core-host.invalid-state');
   }
 
   settled(): Promise<ProcessCompletion> {
@@ -298,6 +322,9 @@ export class CoreHostProcessResource {
       try {
         child = await untilDeadline(this.spawnOperation, deadline);
       } catch {
+        if (this.spawnRejected) {
+          return;
+        }
         this.retainLateCleanup();
         throw new CoreHostProcessError('revo.core-host.stop');
       }

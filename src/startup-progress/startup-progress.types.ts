@@ -16,6 +16,12 @@ export interface StartupProgressCursor {
   readonly sequence: number;
 }
 
+export interface StartupReadyContext {
+  readonly signal: AbortSignal;
+  readonly deadline: number;
+  readonly assertRunning: () => void;
+}
+
 export type StartupProgressRead =
   | {
       readonly kind: 'events';
@@ -36,7 +42,10 @@ export interface StartupProgressFacade {
     phase: string,
     details: { readonly code: string; readonly logPath?: string },
   ): Promise<ProgressEvent>;
-  ready(details: { readonly url: string; readonly reused?: true }): Promise<ProgressEvent>;
+  ready(
+    details: { readonly url: string; readonly reused?: true },
+    context?: StartupReadyContext,
+  ): Promise<ProgressEvent>;
 }
 
 export class StartupProgressError extends Error {

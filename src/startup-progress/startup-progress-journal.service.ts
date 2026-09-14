@@ -15,6 +15,7 @@ import {
   StartupProgressError,
   type StartupProgressCursor,
   type StartupProgressRead,
+  type StartupReadyContext,
 } from './startup-progress.types.js';
 
 interface ProgressDocument {
@@ -29,6 +30,7 @@ export class StartupProgressJournalWriter {
     canonicalDataDir: string,
     operationId: string,
     events: readonly ProgressEvent[],
+    readyContext?: StartupReadyContext,
   ): Promise<void> {
     const document = { schemaVersion: STARTUP_PROGRESS_SCHEMA_VERSION, operationId, events };
     const serialized = `${JSON.stringify(document)}\n`;
@@ -59,6 +61,12 @@ export class StartupProgressJournalWriter {
         await file.writeFile(serialized, 'utf8');
       } finally {
         await file.close();
+      }
+      if (readyContext) {
+        if (readyContext.signal.aborted || Date.now() >= readyContext.deadline) {
+          throw new StartupProgressError('closed');
+        }
+        readyContext.assertRunning();
       }
       await rename(temporaryPath, join(canonicalDataDir, STARTUP_PROGRESS_FILE));
     } catch (error) {

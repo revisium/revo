@@ -26,6 +26,7 @@ export interface OpenPublishedControlRequest {
 
 interface HeldPublishedControlBase {
   readonly kind: 'held';
+  readonly canonicalDataDir: string;
   readonly endpoint: string;
   readonly stopResult: Promise<ControlStopResult>;
   readonly progress?: StartupProgressFacade;

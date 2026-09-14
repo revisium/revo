@@ -10,6 +10,7 @@ import {
   StartupProgressError,
   type StartupProgressFacade,
   type StartupProgressOptions,
+  type StartupReadyContext,
 } from './startup-progress.types.js';
 
 export class OwnedStartupProgress implements StartupProgressFacade {
@@ -57,9 +58,13 @@ export class OwnedStartupProgress implements StartupProgressFacade {
       this.operation.fail(phase, details),
     );
   }
-  ready(details: { readonly url: string; readonly reused?: true }) {
-    return this.enqueueTerminal('server-start', 'ready', details, () =>
-      this.operation.ready(details),
+  ready(details: { readonly url: string; readonly reused?: true }, context?: StartupReadyContext) {
+    return this.enqueueTerminal(
+      'server-start',
+      'ready',
+      details,
+      () => this.operation.ready(details),
+      context,
     );
   }
   close(): Promise<void> {
@@ -67,7 +72,10 @@ export class OwnedStartupProgress implements StartupProgressFacade {
     return this.queue;
   }
 
-  private enqueue(create: () => ProgressEvent | undefined): Promise<ProgressEvent> {
+  private enqueue(
+    create: () => ProgressEvent | undefined,
+    context?: StartupReadyContext,
+  ): Promise<ProgressEvent> {
     if (this.closed || this.disabled) {
       return Promise.reject(new StartupProgressError('closed'));
     }
@@ -86,7 +94,7 @@ export class OwnedStartupProgress implements StartupProgressFacade {
         throw new StartupProgressError('closed');
       }
       try {
-        await this.persist();
+        await this.persist(context);
         this.lastPersistedSequence = event.sequence;
         return event;
       } catch (error) {
@@ -124,6 +132,7 @@ export class OwnedStartupProgress implements StartupProgressFacade {
     status: 'failed' | 'ready',
     details: object,
     create: () => ProgressEvent | undefined,
+    context?: StartupReadyContext,
   ) {
     return this.enqueue(() => {
       const previous = this.operation.eventsAfter(0).at(-1);
@@ -143,7 +152,7 @@ export class OwnedStartupProgress implements StartupProgressFacade {
         return this.operation.fail(phase, { code: 'PROGRESS_JOURNAL_LIMIT' });
       }
       return create();
-    }).then((event) => {
+    }, context).then((event) => {
       if (event.status === 'failed' && event.code === 'PROGRESS_JOURNAL_LIMIT') {
         this.disabled = true;
         throw new StartupProgressError('limit');
@@ -151,11 +160,12 @@ export class OwnedStartupProgress implements StartupProgressFacade {
       return event;
     });
   }
-  private persist() {
+  private persist(context?: StartupReadyContext) {
     return this.journal.write(
       this.canonicalDataDir,
       this.operationId,
       this.operation.eventsAfter(0),
+      context,
     );
   }
 }
