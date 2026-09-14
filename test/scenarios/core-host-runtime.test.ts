@@ -343,21 +343,35 @@ describe('published Core child process', () => {
     const stdout = captureBounded(child.stdout);
     const stderr = captureBounded(child.stderr);
     const messages: unknown[] = [];
+    let observedCompletion: Awaited<typeof child.completion> | undefined;
+    void child.completion.then((completion) => {
+      observedCompletion = completion;
+    });
     child.subscribe?.((message) => messages.push(message));
-    const deadline = Date.now() + 15_000;
     try {
-      await child.send?.({ protocol: CORE_HOST_PROTOCOL, type: 'hello' });
-      await waitFor(messages, 'booted', deadline);
-      await child.send?.({
-        ...start,
-        databaseUrl: 'postgresql://user:SECRET-marker@127.0.0.1:1/missing',
-        temporaryWorkingDirectoryRoot: join(root, 'work'),
-        agentWorkspaceDirectory: join(root, 'sessions'),
-      });
-      await waitFor(messages, 'failed', deadline);
-      const completion = await withinDeadline(child.completion, deadline);
-      await withinDeadline(Promise.all([stdout.completed, stderr.completed]), deadline);
+      const bootDeadline = Date.now() + 10_000;
+      await withinDeadline(
+        child.send?.({ protocol: CORE_HOST_PROTOCOL, type: 'hello' }) ??
+          Promise.reject(new Error('Core child IPC unavailable')),
+        bootDeadline,
+      );
+      await waitFor(messages, 'booted', bootDeadline, () => observedCompletion);
+
+      const failureDeadline = Date.now() + 15_000;
+      await withinDeadline(
+        child.send?.({
+          ...start,
+          databaseUrl: 'postgresql://user:SECRET-marker@127.0.0.1:99999/missing',
+          temporaryWorkingDirectoryRoot: join(root, 'work'),
+          agentWorkspaceDirectory: join(root, 'sessions'),
+        }) ?? Promise.reject(new Error('Core child IPC unavailable')),
+        failureDeadline,
+      );
+      await waitFor(messages, 'failed', failureDeadline, () => observedCompletion);
+      const completion = await withinDeadline(child.completion, failureDeadline);
+      await withinDeadline(Promise.all([stdout.completed, stderr.completed]), failureDeadline);
       expect(completion.exitCode).toBe(1);
+      expect(completion.signal).toBeNull();
       expect(JSON.stringify(messages)).not.toContain('SECRET-marker');
       expect(`${stdout.text()}${stderr.text()}`).not.toContain('SECRET-marker');
       expect(stdout.bytes()).toBeLessThanOrEqual(8192);
@@ -365,12 +379,15 @@ describe('published Core child process', () => {
       expect(stdout.failed() || stderr.failed()).toBe(false);
     } finally {
       const cleanupDeadline = Date.now() + 6_000;
-      await processes.stop(child, { graceMs: 500, killWaitMs: 2_000 });
+      await withinDeadline(
+        processes.stop(child, { graceMs: 500, killWaitMs: 2_000 }),
+        cleanupDeadline,
+      );
       await withinDeadline(child.completion, cleanupDeadline);
       await withinDeadline(Promise.all([stdout.completed, stderr.completed]), cleanupDeadline);
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 35_000);
 
   it('handles a real parent disconnect before the entrypoint finishes booting', async () => {
     const root = await mkdtemp('/tmp/revo-core-host-disconnect-');
@@ -483,16 +500,29 @@ async function startCoreChild(
   });
 }
 
-async function waitFor(messages: unknown[], type: string, deadline = Date.now() + 30_000) {
-  if (Date.now() >= deadline) {
-    throw new Error(`Core child did not send ${type}`);
-  }
+async function waitFor(
+  messages: unknown[],
+  type: string,
+  deadline = Date.now() + 30_000,
+  completion: () =>
+    | { readonly exitCode: number | null; readonly signal: string | null }
+    | undefined = () => undefined,
+) {
   const message = messages.map(parseCoreHostMessage).find((candidate) => candidate?.type === type);
   if (message) {
     return message;
   }
+  const observedCompletion = completion();
+  if (observedCompletion) {
+    throw new Error(
+      `Core child exited before sending ${type}: exitCode=${String(observedCompletion.exitCode)} signal=${String(observedCompletion.signal)}`,
+    );
+  }
+  if (Date.now() >= deadline) {
+    throw new Error(`Core child did not send ${type}`);
+  }
   await new Promise((resolve) => setTimeout(resolve, 10));
-  return waitFor(messages, type, deadline);
+  return waitFor(messages, type, deadline, completion);
 }
 
 const graphql = (url: string) =>
