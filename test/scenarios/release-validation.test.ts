@@ -41,6 +41,24 @@ describe('installation release contract', () => {
     expect(parseInstallationReleaseManifest(fixture.manifest)).toEqual(fixture.manifest);
   });
 
+  it('rejects toolchain fields that do not match the declared schema version', () => {
+    const legacyFixture = releaseManifestFixture();
+    expect(() =>
+      parseInstallationReleaseManifest({
+        ...legacyFixture.manifest,
+        schemaVersion: 'revo-install/v2',
+      }),
+    ).toThrow(/schema/);
+
+    const futureFixture = futureReleaseManifestFixture();
+    expect(() =>
+      parseInstallationReleaseManifest({
+        ...futureFixture.manifest,
+        schemaVersion: 'revo-install/v1',
+      }),
+    ).toThrow(/schema/);
+  });
+
   it.each(['nodeArchive', 'nodeShasums'] as const)(
     'accepts v2 only when every %s URL matches its policy locator',
     (locator) => {
@@ -139,7 +157,7 @@ describe('installation release contract', () => {
 
   it('decodes an unsupported installation schema version but rejects it by policy', () => {
     const fixture = releaseManifestFixture();
-    const manifest = { ...fixture.manifest, schemaVersion: 'revo-install/v2' };
+    const manifest = { ...fixture.manifest, schemaVersion: 'revo-install/v99' };
     expect(parseInstallationReleaseManifest(manifest)).toEqual(manifest);
     expect(() => validateInstallationReleaseManifest(manifest, releasePolicyFixture())).toThrow(
       /schema version/,
