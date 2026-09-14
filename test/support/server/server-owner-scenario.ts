@@ -189,6 +189,8 @@ export class ServerOwnerScenario {
 
   async retriesFailedHeldCleanup() {
     const controlled = await this.controlledOwner(new OwnerJournal(), false, true);
+    let ownershipReleased = false;
+    void controlled.owner.ownershipReleased().then(() => (ownershipReleased = true));
     await controlled.owner.start(new AbortController().signal);
     const first = await controlled.owner.close().then(
       () => 'closed' as const,
@@ -196,12 +198,21 @@ export class ServerOwnerScenario {
     );
     const outcome = await controlled.owner.outcome();
     const contender = await new ServerOwnershipService().acquire(this.dataDir);
+    const releasedBeforeRetry = ownershipReleased;
     await controlled.owner.close();
+    await controlled.owner.ownershipReleased();
     const replacement = await new ServerOwnershipService().acquire(this.dataDir);
     if (replacement.kind === 'held') {
       await replacement.release();
     }
-    return { first, outcome, contender: contender.kind, replacement: replacement.kind };
+    return {
+      first,
+      outcome,
+      contender: contender.kind,
+      releasedBeforeRetry,
+      releasedAfterRetry: ownershipReleased,
+      replacement: replacement.kind,
+    };
   }
 
   async latchesStopBeforeOwnerAssignment() {

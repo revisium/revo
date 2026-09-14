@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SERVER_HOST_PROTOCOL } from '../../src/server/server-host-protocol.js';
-import { ServerHostScenario } from '../support/server/server-host-scenario.js';
+import {
+  ServerHostScenario,
+  realIpcDisconnectBeforeOwnerOpens,
+} from '../support/server/server-host-scenario.js';
 
 describe('Private server host', () => {
   afterEach(() => vi.useRealTimers());
@@ -250,6 +253,14 @@ describe('Private server host', () => {
       code: 'SERVER_HOST_BUSY',
     });
     expect(scenario.owner.startCalls).toBe(0);
+  });
+
+  it('delivers private IPC and closes a late owner before terminal channel exit', async () => {
+    await expect(realIpcDisconnectBeforeOwnerOpens()).resolves.toEqual({
+      completion: { code: 0, signal: null },
+      cleanup: 'closed',
+      terminalBeforeRelease: false,
+    });
   });
 });
 

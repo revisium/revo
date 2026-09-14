@@ -1,3 +1,9 @@
+import { fork } from 'node:child_process';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve as resolvePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { onTestFinished } from 'vitest';
 
 import {
@@ -12,6 +18,8 @@ import {
 } from '../../../src/server/server-host-protocol.js';
 import type { ServerOwnerOutcome } from '../../../src/server/server-owner.service.js';
 import { OPERATION_ID, validStartMessage } from './server-host-message.js';
+
+const IPC_CHILD = resolvePath(dirname(fileURLToPath(import.meta.url)), 'server-host-ipc-child.mjs');
 
 class Deferred<T> {
   readonly promise: Promise<T>;
@@ -234,4 +242,146 @@ export class ServerHostScenario {
 
 function operation(type: 'commit' | 'cancel', operationId: string): ServerHostParentMessage {
   return { protocol: SERVER_HOST_PROTOCOL, type, operationId };
+}
+
+export async function realIpcDisconnectBeforeOwnerOpens() {
+  const root = await mkdtemp(join(tmpdir(), 'revo-server-host-ipc-'));
+  const deadline = Date.now() + 3_000;
+  const child = fork(IPC_CHILD, [], {
+    env: { REVO_SERVER_HOST_ROOT: root },
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+  });
+  const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolveExit) => child.once('exit', (code, signal) => resolveExit({ code, signal })),
+  );
+  let observedExit = false;
+  void completion.then(() => (observedExit = true));
+  let cleanupCompleted = false;
+  let result:
+    | {
+        readonly completion: { code: number | null; signal: NodeJS.Signals | null };
+        readonly cleanup: string;
+        readonly terminalBeforeRelease: boolean;
+      }
+    | undefined;
+  let operationError: unknown;
+  let cleanupError: unknown;
+  try {
+    try {
+      await beforeDeadline(
+        new Promise<void>((resolveBooted, rejectBooted) => {
+          child.once('error', rejectBooted);
+          child.once('message', (message: unknown) => {
+            if (
+              typeof message !== 'object' ||
+              message === null ||
+              !('type' in message) ||
+              message.type !== 'booted'
+            ) {
+              rejectBooted(new Error('Unexpected server host boot message'));
+              return;
+            }
+            child.send(validStartMessage(), (error) =>
+              error ? rejectBooted(error) : resolveBooted(),
+            );
+          });
+        }),
+        deadline,
+      );
+      await waitForFile(join(root, 'open-entered'), deadline);
+      child.disconnect();
+      await waitForFile(join(root, 'disconnect-observed'), deadline);
+      await writeFile(join(root, 'allow-owner'), 'allow-owner');
+      await waitForFile(join(root, 'close-entered'), deadline);
+      const terminalBeforeRelease = await fileExists(join(root, 'entry-completed'));
+      await writeFile(join(root, 'release-close'), 'release-close');
+      await waitForFile(join(root, 'entry-completed'), deadline);
+      const exit = await beforeDeadline(completion, deadline);
+      observedExit = true;
+      const cleanup = await readFile(join(root, 'closed'), 'utf8');
+      cleanupCompleted = true;
+      result = { completion: exit, cleanup, terminalBeforeRelease };
+    } catch (error: unknown) {
+      operationError = error;
+    }
+  } finally {
+    try {
+      if (!observedExit) {
+        const cleanupDeadline = Date.now() + 3_000;
+        let gateFailure = false;
+        await beforeDeadline(
+          Promise.all([
+            writeFile(join(root, 'allow-owner'), 'allow-owner'),
+            writeFile(join(root, 'release-close'), 'release-close'),
+          ]),
+          Math.min(cleanupDeadline, Date.now() + 500),
+        ).catch(() => (gateFailure = true));
+        child.kill('SIGTERM');
+        try {
+          await beforeDeadline(completion, Math.min(cleanupDeadline, Date.now() + 1_000));
+        } catch {
+          child.kill('SIGKILL');
+          await beforeDeadline(completion, cleanupDeadline);
+        }
+        observedExit = true;
+        if (gateFailure) {
+          cleanupError = new Error('Server host fixture cleanup gates failed');
+        }
+      }
+      if (cleanupCompleted && observedExit) {
+        await rm(root, { recursive: true, force: true });
+      }
+    } catch (error: unknown) {
+      cleanupError = error;
+    }
+  }
+  if (cleanupError !== undefined) {
+    throw cleanupError;
+  }
+  if (operationError !== undefined) {
+    throw operationError;
+  }
+  if (result === undefined) {
+    throw new Error('Server host fixture completed without a result');
+  }
+  return result;
+}
+
+async function waitForFile(path: string, deadline: number): Promise<void> {
+  if (await fileExists(path)) {
+    return;
+  }
+  if (Date.now() >= deadline) {
+    throw new Error('Server host IPC fixture deadline exceeded');
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await waitForFile(path, deadline);
+}
+
+const fileExists = (path: string) =>
+  stat(path).then(
+    () => true,
+    () => false,
+  );
+
+function beforeDeadline<T>(pending: Promise<T>, deadline: number): Promise<T> {
+  if (Date.now() >= deadline) {
+    return Promise.reject(new Error('Server host IPC fixture deadline exceeded'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('Server host IPC fixture deadline exceeded')),
+      Math.max(0, deadline - Date.now()),
+    );
+    void pending.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }

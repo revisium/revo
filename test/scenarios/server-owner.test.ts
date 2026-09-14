@@ -128,6 +128,8 @@ describe('Server owner composition', () => {
         cleanup: 'retained',
       },
       contender: 'busy',
+      releasedBeforeRetry: false,
+      releasedAfterRetry: true,
       replacement: 'held',
     });
   });

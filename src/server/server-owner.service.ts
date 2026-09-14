@@ -218,6 +218,10 @@ export class ServerOwnerResource {
     return this.outcomeOperation;
   }
 
+  ownershipReleased(): Promise<void> {
+    return this.held.ownershipReleased();
+  }
+
   status(): ControlServerStatus {
     if (this.lifecyclePhase === 'running' && this.effectiveListener) {
       return {
