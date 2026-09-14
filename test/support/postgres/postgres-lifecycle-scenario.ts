@@ -6,6 +6,7 @@ import { Client } from 'pg';
 
 import { EmbeddedPostgresPreparationService } from '../../../src/postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresResourceService } from '../../../src/postgres/embedded-postgres-resource.service.js';
+import { EmbeddedPostgresError } from '../../../src/postgres/embedded-postgres.types.js';
 import {
   LoopbackPortAllocator,
   type ReservedLoopbackPort,
@@ -242,7 +243,7 @@ export class PostgresLifecycleScenario {
       const controller = new AbortController();
       const starting = owner
         .startDatabase?.({ signal: controller.signal, timeoutMs: 30_000 })
-        .then(toOutcome, toRejectedOutcome);
+        .then(toOutcome, toDiagnosticRejectedOutcome);
       if (!starting) {
         throw new Error('database owner missing');
       }
@@ -297,7 +298,7 @@ export class PostgresLifecycleScenario {
     const owner = await this.open(fixture, FIRST_OPERATION, undefined, resource, journal);
     journal.blockPostgresCompletion();
     try {
-      const starting = this.start(owner).then(toOutcome, toRejectedOutcome);
+      const starting = this.start(owner).then(toOutcome, toDiagnosticRejectedOutcome);
       await waitForGate(journal.entered, starting);
       const closing = closeWhileBlocked
         ? owner.close().then(toOutcome, toRejectedOutcome)
@@ -642,6 +643,15 @@ const readListener = (port: number | undefined) =>
 
 const toOutcome = () => 'resolved' as const;
 const toRejectedOutcome = () => 'rejected' as const;
+const toDiagnosticRejectedOutcome = (error: unknown) =>
+  error instanceof EmbeddedPostgresError
+    ? {
+        kind: 'rejected' as const,
+        reason: error.reason,
+        progressFailure: error.progressFailure,
+        observedCompletion: error.observedCompletion,
+      }
+    : { kind: 'rejected' as const };
 const waitForGate = async (
   gate: Promise<void>,
   outcome: Promise<unknown>,

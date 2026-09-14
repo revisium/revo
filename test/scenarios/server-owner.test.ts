@@ -141,7 +141,19 @@ describe('Server owner composition', () => {
 
   it('releases the real held lease when database startup fails before Core opens', async () => {
     await expect(scenario.cleansLeaseWhenDatabaseStartFails()).resolves.toEqual({
-      startResult: 'revo.server-owner.database',
+      startResult: {
+        code: 'revo.server-owner.database',
+        cleanupCode: undefined,
+        databaseFailure: {
+          code: 'EMBEDDED_POSTGRES_ERROR',
+          reason: 'process',
+          progressFailure: true,
+          observedCompletion: { exitCode: 7, signal: 'SIGABRT' },
+        },
+        message: 'Server owner operation failed.',
+        hasCause: false,
+        safe: true,
+      },
       outcome: {
         kind: 'failed',
         code: 'revo.server-owner.database',
@@ -149,6 +161,39 @@ describe('Server owner composition', () => {
       },
       replacement: 'held',
       starts: 0,
+    });
+  });
+
+  it('preserves safe database diagnostics when startup cleanup also fails', async () => {
+    await expect(scenario.cleansLeaseWhenDatabaseStartFails(true)).resolves.toMatchObject({
+      startResult: {
+        code: 'revo.server-owner.database',
+        cleanupCode: 'revo.server-owner.stop',
+        databaseFailure: {
+          code: 'EMBEDDED_POSTGRES_ERROR',
+          reason: 'process',
+          progressFailure: true,
+          observedCompletion: { exitCode: 7, signal: 'SIGABRT' },
+        },
+        message: 'Server owner operation failed.',
+        hasCause: false,
+        safe: true,
+      },
+      outcome: { kind: 'failed', cleanup: 'retained' },
+      replacement: 'busy',
+      starts: 0,
+    });
+  });
+
+  it.each([
+    ['external', { code: 'revo.postgres.external.lifecycle', reason: 'connection' }],
+    ['unknown', undefined],
+  ] as const)('projects only safe %s database failure fields', async (kind, databaseFailure) => {
+    await expect(scenario.projectsOnlyKnownDatabaseFailure(kind)).resolves.toEqual({
+      databaseFailure,
+      message: 'Server owner operation failed.',
+      hasCause: false,
+      safe: true,
     });
   });
 

@@ -57,4 +57,15 @@ describe('embedded PostgreSQL provision', () => {
       environment: { LC_ALL: 'C' },
     });
   });
+
+  it('preserves an observed initdb exit through a progress failure', async () => {
+    await expect(
+      scenario.preservesObservedInitializationExitWhenProgressFailureRewraps(),
+    ).resolves.toEqual({
+      kind: 'rejected',
+      reason: 'process',
+      progressFailure: true,
+      observedCompletion: { exitCode: 7, signal: null },
+    });
+  });
 });

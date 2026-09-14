@@ -149,7 +149,11 @@ export class OwnedEmbeddedPostgresPreparation {
       this.observeChild(child);
       const completion = await this.awaitCompletion(child);
       if (completion.exitCode !== 0 || completion.signal !== null) {
-        throw new EmbeddedPostgresError(signal.aborted ? 'cancelled' : 'process');
+        throw new EmbeddedPostgresError(
+          signal.aborted ? 'cancelled' : 'process',
+          false,
+          completion,
+        );
       }
       if ((await inspectState(clusterDir, passwordPath)) !== 'ready') {
         throw new EmbeddedPostgresError('invalid');
@@ -164,7 +168,7 @@ export class OwnedEmbeddedPostgresPreparation {
       try {
         await this.progress.fail(phase, { code: `POSTGRES_${primary.reason.toUpperCase()}` });
       } catch {
-        throw new EmbeddedPostgresError(primary.reason, true);
+        throw new EmbeddedPostgresError(primary.reason, true, primary.observedCompletion);
       }
       throw primary;
     }

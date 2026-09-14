@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 
 import { EmbeddedPostgresPreparationService } from '../../../src/postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresResourceService } from '../../../src/postgres/embedded-postgres-resource.service.js';
+import { EmbeddedPostgresError } from '../../../src/postgres/embedded-postgres.types.js';
 import { ManagedProcessError } from '../../../src/processes/managed-process-error.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type {
@@ -200,6 +201,36 @@ export class PostgresScenario {
     }
   }
 
+  async preservesObservedInitializationExitWhenProgressFailureRewraps() {
+    const fixture = await this.fixture();
+    const held = await this.open(
+      fixture,
+      new EmbeddedPostgresPreparationService(new ImmediateFailedProcess()),
+      new FailedProgressJournal(),
+    );
+    if (held.kind !== 'held' || !held.prepareEmbeddedPostgres) {
+      throw new Error('owner missing');
+    }
+    try {
+      return await held
+        .prepareEmbeddedPostgres({ signal: new AbortController().signal, timeoutMs: 1000 })
+        .then(
+          () => ({ kind: 'resolved' as const }),
+          (error: unknown) =>
+            error instanceof EmbeddedPostgresError
+              ? {
+                  kind: 'rejected' as const,
+                  reason: error.reason,
+                  progressFailure: error.progressFailure,
+                  observedCompletion: error.observedCompletion,
+                }
+              : { kind: 'unexpected' as const },
+        );
+    } finally {
+      await held.close().catch(() => undefined);
+    }
+  }
+
   async cleanup() {
     await Promise.all(
       this.roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
@@ -300,5 +331,20 @@ class FailingCancellationProcess extends ManagedProcessService {
       throw new Error('process not started');
     }
     await this.stop(this.owned, { graceMs: 0, killWaitMs: 5000 });
+  }
+}
+
+class ImmediateFailedProcess extends ManagedProcessService {
+  override async start(): Promise<OwnedProcess> {
+    return { completion: Promise.resolve({ exitCode: 7, signal: null }) };
+  }
+}
+
+class FailedProgressJournal extends StartupProgressJournalWriter {
+  override async write(...parameters: Parameters<StartupProgressJournalWriter['write']>) {
+    if (parameters[2].at(-1)?.status === 'failed') {
+      throw new Error('secret progress write failure');
+    }
+    return super.write(...parameters);
   }
 }

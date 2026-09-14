@@ -17,11 +17,23 @@ export interface PreparedEmbeddedPostgres {
 
 export class EmbeddedPostgresError extends Error {
   readonly code = 'EMBEDDED_POSTGRES_ERROR';
+  readonly observedCompletion?: {
+    readonly exitCode: number | null;
+    readonly signal: string | null;
+  };
+
   constructor(
     readonly reason: 'cancelled' | 'invalid' | 'process' | 'unsupported',
     readonly progressFailure = false,
+    observedCompletion?: { readonly exitCode: number | null; readonly signal: string | null },
   ) {
     super('Embedded PostgreSQL preparation failed');
     this.name = 'EmbeddedPostgresError';
+    if (reason === 'process' && observedCompletion) {
+      this.observedCompletion = {
+        exitCode: observedCompletion.exitCode,
+        signal: observedCompletion.signal,
+      };
+    }
   }
 }

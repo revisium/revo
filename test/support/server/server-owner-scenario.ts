@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { NestFactory } from '@nestjs/core';
 
 import { CoreHostProcessService } from '../../../src/core-host/core-host-process.service.js';
+import { EmbeddedPostgresError, ExternalPostgresError } from '../../../src/postgres/index.js';
 import { ControlClientService } from '../../../src/processes/control-client.service.js';
 import { ControlDiscoveryService } from '../../../src/processes/control-discovery.service.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
@@ -238,12 +239,30 @@ export class ServerOwnerScenario {
     return { opened, completion };
   }
 
-  async cleansLeaseWhenDatabaseStartFails() {
-    const controlled = await this.controlledOwner(new OwnerJournal(), false, false, false, true);
+  async cleansLeaseWhenDatabaseStartFails(failCleanup = false) {
+    const controlled = await this.controlledOwner(
+      new OwnerJournal(),
+      false,
+      failCleanup,
+      false,
+      'embedded',
+    );
     const startResult = await controlled.owner.start(new AbortController().signal).then(
       () => undefined,
       (error: unknown) =>
-        error instanceof Error && 'code' in error ? String(error.code) : 'unexpected',
+        error instanceof Error && 'code' in error
+          ? {
+              code: String(error.code),
+              cleanupCode:
+                'cleanupCode' in error && typeof error.cleanupCode === 'string'
+                  ? error.cleanupCode
+                  : undefined,
+              databaseFailure: 'databaseFailure' in error ? error.databaseFailure : undefined,
+              message: error.message,
+              hasCause: 'cause' in error,
+              safe: !JSON.stringify(error).includes('secret-database-detail'),
+            }
+          : 'unexpected',
     );
     const outcome = await controlled.owner.outcome();
     const replacement = await new ServerOwnershipService().acquire(this.dataDir);
@@ -256,6 +275,22 @@ export class ServerOwnerScenario {
       replacement: replacement.kind,
       starts: controlled.processes.startCalls,
     };
+  }
+
+  async projectsOnlyKnownDatabaseFailure(kind: 'external' | 'unknown') {
+    const controlled = await this.controlledOwner(new OwnerJournal(), false, false, false, kind);
+    return controlled.owner.start(new AbortController().signal).then(
+      () => ({ kind: 'resolved' as const }),
+      (error: unknown) =>
+        error instanceof Error && 'databaseFailure' in error
+          ? {
+              databaseFailure: error.databaseFailure,
+              message: error.message,
+              hasCause: 'cause' in error,
+              safe: !String(error).includes('secret-database-detail'),
+            }
+          : { kind: 'unexpected' as const },
+    );
   }
 
   async cancelsBeforeReadyCommit() {
@@ -387,7 +422,7 @@ export class ServerOwnerScenario {
     failFirstStop: boolean,
     failFirstHeldClose = false,
     stopBeforeOwnerAssignment = false,
-    failDatabaseStart = false,
+    databaseFailure: false | 'embedded' | 'external' | 'unknown' = false,
   ) {
     this.journals.push(journal);
     const processes = new OwnerControlledProcesses(failFirstStop);
@@ -402,7 +437,7 @@ export class ServerOwnerScenario {
       journal,
       failFirstHeldClose,
       stopBeforeOwnerAssignment,
-      failDatabaseStart,
+      databaseFailure,
     );
     const service = new ServerOwnerService(controls, new CoreHostProcessService(processes));
     const operationId = this.nextOperation();
@@ -488,7 +523,7 @@ class RealLeaseControlService extends PublishedControlService {
     journal: StartupProgressJournalWriter,
     private readonly failFirstClose = false,
     private readonly stopBeforeOwnerAssignment = false,
-    private readonly failDatabaseStart = false,
+    private readonly databaseFailure: false | 'embedded' | 'external' | 'unknown' = false,
   ) {
     super(undefined, undefined, undefined, undefined, journal);
   }
@@ -506,8 +541,20 @@ class RealLeaseControlService extends PublishedControlService {
     return {
       ...held,
       startDatabase: () =>
-        this.failDatabaseStart
-          ? Promise.reject(new Error('Controlled database start failure'))
+        this.databaseFailure
+          ? Promise.reject(
+              this.databaseFailure === 'embedded'
+                ? Object.assign(
+                    new EmbeddedPostgresError('process', true, {
+                      exitCode: 7,
+                      signal: 'SIGABRT',
+                    }),
+                    { privateDetail: 'secret-database-detail' },
+                  )
+                : this.databaseFailure === 'external'
+                  ? new ExternalPostgresError('connection')
+                  : new Error('secret-database-detail'),
+            )
           : Promise.resolve({ kind: 'external' as const }),
       close: async () => {
         this.closeAttempts += 1;

@@ -12,7 +12,11 @@ import {
   CoreHostProcessService,
 } from '../core-host/core-host-process.service.js';
 import { readEmbeddedPostgresCredential } from '../postgres/embedded-postgres-preparation.service.js';
-import type { StartedDatabase } from '../postgres/index.js';
+import {
+  EmbeddedPostgresError,
+  ExternalPostgresError,
+  type StartedDatabase,
+} from '../postgres/index.js';
 import type { PublishedControl } from '../processes/control-discovery.types.js';
 import type { ControlStopCompletion } from '../processes/control-endpoint.types.js';
 import {
@@ -72,6 +76,17 @@ export class ServerOwnerError extends Error {
   constructor(
     readonly code: ServerOwnerErrorCode,
     readonly cleanupCode?: 'revo.server-owner.stop',
+    readonly databaseFailure?:
+      | {
+          readonly code: 'EMBEDDED_POSTGRES_ERROR';
+          readonly reason: EmbeddedPostgresError['reason'];
+          readonly progressFailure: boolean;
+          readonly observedCompletion?: EmbeddedPostgresError['observedCompletion'];
+        }
+      | {
+          readonly code: 'revo.postgres.external.lifecycle';
+          readonly reason: ExternalPostgresError['reason'];
+        },
   ) {
     super('Server owner operation failed.');
     this.name = 'ServerOwnerError';
@@ -254,7 +269,7 @@ export class ServerOwnerResource {
         await this.close();
       } catch {
         this.resolveFailure(primary.code, 'retained');
-        throw new ServerOwnerError(primary.code, 'revo.server-owner.stop');
+        throw new ServerOwnerError(primary.code, 'revo.server-owner.stop', primary.databaseFailure);
       }
       this.resolveFailure(primary.code, 'completed');
       throw primary;
@@ -281,8 +296,12 @@ export class ServerOwnerResource {
     }
     try {
       return await this.held.startDatabase({ signal, timeoutMs: remaining(deadline) });
-    } catch {
-      throw new ServerOwnerError('revo.server-owner.database');
+    } catch (error) {
+      throw new ServerOwnerError(
+        'revo.server-owner.database',
+        undefined,
+        safeDatabaseFailure(error),
+      );
     }
   }
 
@@ -428,6 +447,28 @@ function normalizeOwnerError(error: unknown, signal: AbortSignal): ServerOwnerEr
   return new ServerOwnerError(
     signal.aborted ? 'revo.server-owner.cancelled' : 'revo.server-owner.core',
   );
+}
+
+function safeDatabaseFailure(error: unknown): ServerOwnerError['databaseFailure'] {
+  if (error instanceof EmbeddedPostgresError) {
+    return {
+      code: error.code,
+      reason: error.reason,
+      progressFailure: error.progressFailure,
+      ...(error.observedCompletion
+        ? {
+            observedCompletion: {
+              exitCode: error.observedCompletion.exitCode,
+              signal: error.observedCompletion.signal,
+            },
+          }
+        : {}),
+    };
+  }
+  if (error instanceof ExternalPostgresError) {
+    return { code: error.code, reason: error.reason };
+  }
+  return undefined;
 }
 
 function isReadyGraphql(value: unknown): boolean {
