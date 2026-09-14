@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { PostgresReadinessScenario } from '../support/postgres/postgres-readiness-scenario.js';
+import {
+  PostgresReadinessScenario,
+  REAL_PG_SCENARIO_TIMEOUT_MS,
+} from '../support/postgres/postgres-readiness-scenario.js';
 
 describe('embedded PostgreSQL SQL readiness', () => {
   let scenario = new PostgresReadinessScenario();
@@ -9,13 +12,17 @@ describe('embedded PostgreSQL SQL readiness', () => {
     scenario = new PostgresReadinessScenario();
   });
 
-  it('verifies the owned cluster before creating and querying the application database', async () => {
-    await expect(scenario.initializesTheOwnedDatabase()).resolves.toEqual({
-      databaseExists: true,
-      query: 42,
-      serverAlive: true,
-    });
-  });
+  it(
+    'verifies the owned cluster before creating and querying the application database',
+    async () => {
+      await expect(scenario.initializesTheOwnedDatabase()).resolves.toEqual({
+        databaseExists: true,
+        query: 42,
+        serverAlive: true,
+      });
+    },
+    REAL_PG_SCENARIO_TIMEOUT_MS,
+  );
 
   it('does not write to a different trust-authenticated PostgreSQL server', async () => {
     await expect(scenario.rejectsAnotherTrustAuthenticatedCluster()).resolves.toEqual({

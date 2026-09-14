@@ -1,9 +1,7 @@
-import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 
 import { Client } from 'pg';
 
@@ -14,13 +12,20 @@ import {
   OwnedExternalPostgresResource,
 } from '../../../src/postgres/external-postgres-resource.service.js';
 import type { PublishedControl } from '../../../src/processes/control-discovery.types.js';
+import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
+import type { OwnedProcess } from '../../../src/processes/managed-process.types.js';
+import { ProcessExitWaiter } from '../../../src/processes/process-exit-waiter.js';
 import { PublishedControlService } from '../../../src/processes/published-control.service.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
 import { BlockingJournal } from '../startup-progress/blocking-journal.js';
 import { ClusterFixture } from './postgres-readiness-scenario.js';
 
 const OPERATION = 'abcdefabcdefabcdefabcdefabcdefab';
-const executeFile = promisify(execFile);
+const CHILD_TIMEOUT_MS = 5_000;
+const CHILD_STOP = { graceMs: 1_000, killWaitMs: 5_000 } as const;
+const MAX_CHILD_OUTPUT_BYTES = 16 * 1024;
+
+export const REAL_PG_CLEANUP_TIMEOUT_MS = 16_000;
 
 export class ExternalPostgresLifecycleScenario {
   private readonly roots: string[] = [];
@@ -28,6 +33,7 @@ export class ExternalPostgresLifecycleScenario {
   private readonly clusters: ClusterFixture[] = [];
   private readonly servers: Server[] = [];
   private readonly sockets = new Set<Socket>();
+  private readonly children = new Map<OwnedProcess, ManagedProcessService>();
 
   async connectsToTheSelectedDatabaseWithoutOwningTheServer() {
     const cluster = await this.cluster();
@@ -273,21 +279,28 @@ export class ExternalPostgresLifecycleScenario {
       PGAPPNAME: 'hostile',
     };
     delete env.PGPASSWORD;
-    const explicit = await executeFile(process.execPath, [child, cluster.connectionUrl()], { env });
-    const missingPassword = await executeFile(
-      process.execPath,
-      [child, `postgres://postgres@127.0.0.1:${cluster.port}/postgres?sslmode=disable`],
-      { env },
+    const explicit = await this.executeChild(child, [cluster.connectionUrl()], env);
+    const missingPassword = await this.executeChild(
+      child,
+      [`postgres://postgres@127.0.0.1:${cluster.port}/postgres?sslmode=disable`],
+      env,
     );
     return {
-      explicit: JSON.parse(explicit.stdout),
-      missingPassword: JSON.parse(missingPassword.stdout),
+      explicit: JSON.parse(explicit),
+      missingPassword: JSON.parse(missingPassword),
     };
   }
 
   async cleanup() {
     await Promise.allSettled(
       this.owners.map((owner) => (owner.kind === 'held' ? owner.close() : Promise.resolve())),
+    );
+    const childCleanup = await Promise.allSettled(
+      [...this.children].map(async ([child, processes]) => {
+        await processes.stop(child, CHILD_STOP);
+        await child.completion;
+        this.children.delete(child);
+      }),
     );
     await Promise.allSettled(this.clusters.map((cluster) => cluster.close()));
     for (const socket of this.sockets) {
@@ -296,9 +309,36 @@ export class ExternalPostgresLifecycleScenario {
     await Promise.all(
       this.servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
     );
+    if (childCleanup.some((result) => result.status === 'rejected')) {
+      throw new Error('External PostgreSQL child cleanup could not be confirmed');
+    }
     await Promise.all(
       this.roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
     );
+  }
+
+  private async executeChild(entry: string, args: readonly string[], env: NodeJS.ProcessEnv) {
+    const processes = new ManagedProcessService();
+    const child = await processes.start({
+      executable: process.execPath,
+      args: [entry, ...args],
+      cwd: process.cwd(),
+      env: definedEnvironment(env),
+      stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+    });
+    this.children.set(child, processes);
+    child.stderr?.resume();
+    const stdout = readOutput(child);
+    void stdout.catch(() => undefined);
+    if (!(await new ProcessExitWaiter().wait(child.completion, CHILD_TIMEOUT_MS))) {
+      await processes.stop(child, CHILD_STOP);
+    }
+    const completion = await child.completion;
+    this.children.delete(child);
+    if (completion.exitCode !== 0 || completion.signal !== null) {
+      throw new Error('External PostgreSQL fixture child failed');
+    }
+    return stdout;
   }
 
   private async cluster() {
@@ -414,6 +454,30 @@ export class ExternalPostgresLifecycleScenario {
           : { kind: 'rejected' as const, name: typeof error, message: String(error) },
     );
   }
+}
+
+const definedEnvironment = (environment: NodeJS.ProcessEnv) =>
+  Object.fromEntries(
+    Object.entries(environment).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+
+async function readOutput(child: OwnedProcess): Promise<string> {
+  if (!child.stdout) {
+    throw new Error('External PostgreSQL fixture child stdout is unavailable');
+  }
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of child.stdout) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    length += buffer.length;
+    if (length > MAX_CHILD_OUTPUT_BYTES) {
+      throw new Error('External PostgreSQL fixture child output is too large');
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, length).toString('utf8');
 }
 
 class DelayedEndClient {
