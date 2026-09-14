@@ -10,13 +10,13 @@ export interface PackageReleaseArtifact extends ReleaseArtifact {
 }
 
 export interface InstallationReleaseManifest {
-  readonly schemaVersion: 'revo-install/v1';
+  readonly schemaVersion: string;
   readonly release: ReleaseMetadata;
   readonly components: {
-    readonly core: { readonly name: '@revisium/revo-core'; readonly version: '0.0.0' };
-    readonly admin: { readonly name: '@revisium/revo-admin'; readonly version: '0.0.0' };
+    readonly core: { readonly name: string; readonly version: string };
+    readonly admin: { readonly name: string; readonly version: string };
   };
-  readonly toolchain: { readonly node: '26.8.2'; readonly pnpm: '12.4.1' };
+  readonly toolchain: { readonly node: string; readonly pnpm: string };
   readonly artifacts: {
     readonly package: PackageReleaseArtifact;
     readonly packageJson: ReleaseArtifact;

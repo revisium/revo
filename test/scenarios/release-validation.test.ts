@@ -1,52 +1,262 @@
 import { createHash } from 'node:crypto';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { verifyReleaseArtifact } from '../../src/installation/artifact-integrity.js';
+import type { InstallationReleaseManifest } from '../../src/installation/metadata.types.js';
+import type { InstallationReleasePolicy } from '../../src/installation/release-policy.js';
 import {
-  parseInstallationReleaseManifest,
+  validateInstallationReleaseManifest,
   validateReleaseChannelUrl,
   validateReleaseManifestUrl,
-  verifyReleaseArtifact,
-} from '../../src/installation/release-validation.js';
-import { releaseManifestFixture } from '../support/installation/release-manifest-fixture.js';
+} from '../../src/installation/release-policy.js';
+import { parseInstallationReleaseManifest } from '../../src/installation/release-validation.js';
+import {
+  releaseManifestFixture,
+  releasePolicyFixture,
+} from '../support/installation/release-manifest-fixture.js';
+
+const ORIGIN = 'https://revo.revisium.io';
+const MIRROR_ORIGIN = 'https://mirror.revisium.io';
+
+interface InstallerAdapter {
+  readonly validateInstallationReleaseManifest: typeof validateInstallationReleaseManifest;
+  readonly verifyReleaseArtifact: typeof verifyReleaseArtifact;
+}
+
+// The compiled adapter is produced by `pnpm build`, which `pnpm test` and
+// `pnpm test:cov` run first; the specifier is assembled at runtime because the
+// emitted JavaScript is outside the TypeScript program.
+const installerAdapter = async (): Promise<InstallerAdapter> => {
+  const specifier = new URL('../../installer/lib/release-metadata.mjs', import.meta.url).href;
+  return await vi.importActual<InstallerAdapter>(specifier);
+};
 
 describe('installation release contract', () => {
+  it.each([
+    {
+      release: '2.7.1',
+      versions: { core: '4.3.2', admin: '5.4.3', node: '28.1.0', pnpm: '13.0.2' },
+    },
+    {
+      release: '3.0.0',
+      versions: {
+        core: '6.0.0-beta.2',
+        admin: '7.8.9+build.4',
+        node: '30.0.0-rc.1',
+        pnpm: '14.2.1',
+      },
+    },
+  ])('preserves valid release-specific versions for release $release', ({ release, versions }) => {
+    const fixture = releaseManifestFixture({ version: release, versions });
+
+    expect(parseInstallationReleaseManifest(fixture.manifest)).toEqual(fixture.manifest);
+  });
+
   it.each(['stable', 'alpha'] as const)(
     'accepts a valid %s manifest and verifies every artifact',
     (channel) => {
-      const fixture = releaseManifestFixture(channel);
-      expect(
-        parseInstallationReleaseManifest(fixture.manifest, {
-          channel,
-          version: fixture.manifest.release.version,
-        }),
-      ).toEqual(fixture.manifest);
+      const fixture = releaseManifestFixture({ channel });
+      const policy = releasePolicyFixture({
+        requested: { channel, version: fixture.manifest.release.version },
+      });
+      const decoded = validateInstallationReleaseManifest(fixture.manifest, policy);
+      expect(decoded).toEqual(fixture.manifest);
+      // Bytes are checked against the descriptors the decoder returned, not the
+      // raw fixture input, so verification only trusts validated metadata.
       const artifacts = [
-        ['package', fixture.manifest.artifacts.package, fixture.bytes.package],
-        ['packageJson', fixture.manifest.artifacts.packageJson, fixture.bytes.packageJson],
-        ['pnpmLock', fixture.manifest.artifacts.pnpmLock, fixture.bytes.pnpmLock],
-        ['pnpmWorkspace', fixture.manifest.artifacts.pnpmWorkspace, fixture.bytes.pnpmWorkspace],
+        [decoded.artifacts.package, fixture.bytes.package],
+        [decoded.artifacts.packageJson, fixture.bytes.packageJson],
+        [decoded.artifacts.pnpmLock, fixture.bytes.pnpmLock],
+        [decoded.artifacts.pnpmWorkspace, fixture.bytes.pnpmWorkspace],
       ] as const;
-      artifacts.forEach(([, descriptor, bytes]) => {
+      artifacts.forEach(([descriptor, bytes]) => {
         expect(verifyReleaseArtifact(bytes, descriptor)).toBe(true);
       });
     },
   );
 
-  it('rejects requested release mismatches, unknown fields, and invalid pins', () => {
+  it('accepts a second root and rejects that manifest from a foreign origin', () => {
+    const mirrorPolicy = releasePolicyFixture({
+      distributionRoot: MIRROR_ORIGIN,
+      registryRoot: 'https://registry.mirror.revisium.io',
+    });
+    const fixture = releaseManifestFixture({ policy: mirrorPolicy });
+    expect(validateInstallationReleaseManifest(fixture.manifest, mirrorPolicy)).toEqual(
+      fixture.manifest,
+    );
+    expect(() =>
+      validateInstallationReleaseManifest(fixture.manifest, releasePolicyFixture()),
+    ).toThrow(/package artifact URL/);
+    const mirrorManifestUrl = `${MIRROR_ORIGIN}/releases/1.2.3/manifest.json`;
+    expect(validateReleaseManifestUrl(mirrorManifestUrl, '1.2.3', mirrorPolicy)).toBe(true);
+    expect(
+      validateReleaseManifestUrl(`${ORIGIN}/releases/1.2.3/manifest.json`, '1.2.3', mirrorPolicy),
+    ).toBe(false);
+  });
+
+  it('rejects requested channel/version policy mismatches', () => {
     const fixture = releaseManifestFixture();
-    expect(() => parseInstallationReleaseManifest(fixture.manifest, { channel: 'alpha' })).toThrow(
-      /channel/,
+    expect(() =>
+      validateInstallationReleaseManifest(
+        fixture.manifest,
+        releasePolicyFixture({ requested: { channel: 'alpha' } }),
+      ),
+    ).toThrow(/channel/);
+    expect(() =>
+      validateInstallationReleaseManifest(
+        fixture.manifest,
+        releasePolicyFixture({ requested: { version: '9.9.9' } }),
+      ),
+    ).toThrow(/version/);
+  });
+
+  it('decodes an unsupported installation schema version but rejects it by policy', () => {
+    const fixture = releaseManifestFixture();
+    const manifest = { ...fixture.manifest, schemaVersion: 'revo-install/v2' };
+    expect(parseInstallationReleaseManifest(manifest)).toEqual(manifest);
+    expect(() => validateInstallationReleaseManifest(manifest, releasePolicyFixture())).toThrow(
+      /schema version/,
     );
-    expect(() => parseInstallationReleaseManifest({ ...fixture.manifest, unknown: true })).toThrow(
+    expect(() =>
+      validateInstallationReleaseManifest(
+        fixture.manifest,
+        releasePolicyFixture({ supportedSchemaVersions: ['revo-install/v2'] }),
+      ),
+    ).toThrow(/schema version/);
+  });
+
+  const malformedKeyCases: ReadonlyArray<
+    [string, (manifest: InstallationReleaseManifest) => unknown, RegExp]
+  > = [
+    ['an unknown root field', (manifest) => ({ ...manifest, unknown: true }), /schema/],
+    [
+      'a missing toolchain key',
+      (manifest) => ({ ...manifest, toolchain: { node: manifest.toolchain.node } }),
       /schema/,
-    );
+    ],
+    [
+      'a nested extra toolchain key',
+      (manifest) => ({ ...manifest, toolchain: { ...manifest.toolchain, bun: '1.0.0' } }),
+      /schema/,
+    ],
+    [
+      'a nested extra artifact key',
+      (manifest) => ({
+        ...manifest,
+        artifacts: {
+          ...manifest.artifacts,
+          pnpmLock: { ...manifest.artifacts.pnpmLock, size: 12 },
+        },
+      }),
+      /artifact/,
+    ],
+    [
+      'a package artifact missing its integrity key',
+      (manifest) => ({
+        ...manifest,
+        artifacts: {
+          ...manifest.artifacts,
+          package: {
+            url: manifest.artifacts.package.url,
+            sha256: manifest.artifacts.package.sha256,
+          },
+        },
+      }),
+      /artifact/,
+    ],
+    [
+      'a nested extra component key',
+      (manifest) => ({
+        ...manifest,
+        components: {
+          ...manifest.components,
+          admin: { ...manifest.components.admin, optional: true },
+        },
+      }),
+      /component/,
+    ],
+  ];
+
+  it.each(malformedKeyCases)('rejects %s', (_name, mutate, pattern) => {
+    const fixture = releaseManifestFixture();
+    expect(() => parseInstallationReleaseManifest(mutate(fixture.manifest))).toThrow(pattern);
+  });
+
+  it.each(['0'.repeat(63), '0'.repeat(65), 'g'.repeat(64), 'A'.repeat(64), ''])(
+    'rejects malformed artifact SHA-256 %s',
+    (sha256) => {
+      const fixture = releaseManifestFixture();
+      expect(() =>
+        parseInstallationReleaseManifest({
+          ...fixture.manifest,
+          artifacts: {
+            ...fixture.manifest.artifacts,
+            packageJson: { ...fixture.manifest.artifacts.packageJson, sha256 },
+          },
+        }),
+      ).toThrow(/artifact/);
+    },
+  );
+
+  it.each(['24.0', 'not-a-version'])('rejects malformed toolchain SemVer %s', (node) => {
+    const fixture = releaseManifestFixture();
     expect(() =>
       parseInstallationReleaseManifest({
         ...fixture.manifest,
-        toolchain: { node: '24.0.0', pnpm: '12.4.1' },
+        toolchain: { ...fixture.manifest.toolchain, node },
       }),
     ).toThrow(/schema/);
+  });
+
+  it('rejects component pins with malformed SemVer', () => {
+    const fixture = releaseManifestFixture();
+    expect(() =>
+      parseInstallationReleaseManifest({
+        ...fixture.manifest,
+        components: {
+          ...fixture.manifest.components,
+          core: { ...fixture.manifest.components.core, version: 'not-a-version' },
+        },
+      }),
+    ).toThrow(/component/);
+  });
+
+  it.each(['@revisium/revo-core-next', 'revo-core', '@scope-1/core.pkg_2'])(
+    'preserves a component pin that uses the valid package name %s',
+    (name) => {
+      const fixture = releaseManifestFixture();
+      const manifest = {
+        ...fixture.manifest,
+        components: {
+          ...fixture.manifest.components,
+          core: { ...fixture.manifest.components.core, name },
+        },
+      };
+      expect(parseInstallationReleaseManifest(manifest)).toEqual(manifest);
+    },
+  );
+
+  it.each([
+    '',
+    '@revisium/',
+    '@/revo-core',
+    'Revo-Core',
+    '@Revisium/revo-core',
+    '.revo-core',
+    'revo core',
+    `@revisium/${'a'.repeat(214)}`,
+  ])('rejects the malformed component package name %s', (name) => {
+    const fixture = releaseManifestFixture();
+    expect(() =>
+      parseInstallationReleaseManifest({
+        ...fixture.manifest,
+        components: {
+          ...fixture.manifest.components,
+          core: { ...fixture.manifest.components.core, name },
+        },
+      }),
+    ).toThrow(/component/);
   });
 
   it.each([
@@ -57,7 +267,7 @@ describe('installation release contract', () => {
     'https://REVO.REVISIUM.IO/releases/1.2.3/manifest.json',
     'https://revo.revisium.io:443/releases/1.2.3/manifest.json',
   ])('rejects unsafe distribution URL %s', (url) => {
-    expect(validateReleaseManifestUrl(url, '1.2.3')).toBe(false);
+    expect(validateReleaseManifestUrl(url, '1.2.3', releasePolicyFixture())).toBe(false);
   });
 
   it.each([
@@ -69,37 +279,122 @@ describe('installation release contract', () => {
   ])('rejects unsafe package URL %s', (url) => {
     const fixture = releaseManifestFixture();
     expect(() =>
-      parseInstallationReleaseManifest({
-        ...fixture.manifest,
-        artifacts: {
-          ...fixture.manifest.artifacts,
-          package: { ...fixture.manifest.artifacts.package, url },
+      validateInstallationReleaseManifest(
+        {
+          ...fixture.manifest,
+          artifacts: {
+            ...fixture.manifest.artifacts,
+            package: { ...fixture.manifest.artifacts.package, url },
+          },
         },
-      }),
-    ).toThrow(/artifact/);
+        releasePolicyFixture(),
+      ),
+    ).toThrow(/package artifact URL/);
+  });
+
+  it.each([
+    'https://revo.revisium.io/releases/1.2.3/../manifest.json',
+    'https://revo.revisium.io/releases/./1.2.3/manifest.json',
+    'https://revo.revisium.io/releases/1.2.3/%2e%2e/manifest.json',
+    'https://revo.revisium.io/releases/1.2.3/%2E%2E/manifest.json',
+    'http://revo.revisium.io/releases/1.2.3/manifest.json',
+    'https://user:pass@revo.revisium.io/releases/1.2.3/manifest.json',
+    'https://revo.revisium.io/releases/1.2.3/manifest.json?x=1',
+    'https://revo.revisium.io/releases/1.2.3/manifest.json#x',
+    'https://revo.revisium.io/releases/1.2.3/manifest.json?',
+    'https://revo.revisium.io/releases/1.2.3/manifest.json#',
+  ])('rejects noncanonical candidate manifest URL %s', (url) => {
+    expect(validateReleaseManifestUrl(url, '1.2.3', releasePolicyFixture())).toBe(false);
+  });
+
+  it.each([
+    (version: string) => `http://revo.revisium.io/releases/${version}/manifest.json`,
+    (version: string) => `https://user:pass@revo.revisium.io/releases/${version}/manifest.json`,
+    (version: string) => `${ORIGIN}/releases/${version}/../manifest.json`,
+    (version: string) => `${ORIGIN}/releases/${version}/%2e%2e/manifest.json`,
+    (version: string) => `${ORIGIN}/releases/${version}/manifest.json?x=1`,
+    (version: string) => `${ORIGIN}/releases/${version}/manifest.json#x`,
+    // Empty `?`/`#` delimiters survive serialization, so a candidate can equal a
+    // noncanonical locator byte for byte and still has to be rejected.
+    (version: string) => `${ORIGIN}/releases/${version}/manifest.json?`,
+    (version: string) => `${ORIGIN}/releases/${version}/manifest.json#`,
+  ])('rejects a candidate that matches a noncanonical policy locator #%#', (manifest) => {
+    const base = releasePolicyFixture();
+    const policy: InstallationReleasePolicy = {
+      ...base,
+      locators: { ...base.locators, manifest },
+    };
+    expect(validateReleaseManifestUrl(manifest('1.2.3'), '1.2.3', policy)).toBe(false);
+  });
+
+  it('rejects a channel pointer that matches a noncanonical policy locator', () => {
+    const base = releasePolicyFixture();
+    const policy: InstallationReleasePolicy = {
+      ...base,
+      locators: { ...base.locators, channel: (channel) => `${ORIGIN}/channels/${channel}.json#x` },
+    };
+    expect(validateReleaseChannelUrl(`${ORIGIN}/channels/stable.json#x`, 'stable', policy)).toBe(
+      false,
+    );
+  });
+
+  it('rejects a manifest whose artifact URLs mix two different roots', () => {
+    const fixture = releaseManifestFixture();
+    const otherRoot = releaseManifestFixture({
+      policy: releasePolicyFixture({ distributionRoot: MIRROR_ORIGIN }),
+    });
+    expect(() =>
+      validateInstallationReleaseManifest(
+        {
+          ...fixture.manifest,
+          artifacts: {
+            ...fixture.manifest.artifacts,
+            packageJson: otherRoot.manifest.artifacts.packageJson,
+          },
+        },
+        releasePolicyFixture(),
+      ),
+    ).toThrow(/packageJson artifact URL/);
+  });
+
+  it('rejects a manifest where artifact URLs are swapped between kinds', () => {
+    const fixture = releaseManifestFixture();
+    expect(() =>
+      validateInstallationReleaseManifest(
+        {
+          ...fixture.manifest,
+          artifacts: {
+            ...fixture.manifest.artifacts,
+            packageJson: {
+              ...fixture.manifest.artifacts.packageJson,
+              url: fixture.manifest.artifacts.pnpmLock.url,
+            },
+          },
+        },
+        releasePolicyFixture(),
+      ),
+    ).toThrow(/packageJson artifact URL/);
   });
 
   it('accepts only the approved manifest and channel pointers', () => {
+    const policy = releasePolicyFixture();
     expect(
-      validateReleaseManifestUrl('https://revo.revisium.io/releases/1.2.3/manifest.json', '1.2.3'),
+      validateReleaseManifestUrl(`${ORIGIN}/releases/1.2.3/manifest.json`, '1.2.3', policy),
     ).toBe(true);
-    expect(
-      validateReleaseChannelUrl('https://revo.revisium.io/channels/stable.json', 'stable'),
-    ).toBe(true);
-    expect(validateReleaseChannelUrl('https://revo.revisium.io/channels/alpha.json', 'alpha')).toBe(
+    expect(validateReleaseChannelUrl(`${ORIGIN}/channels/stable.json`, 'stable', policy)).toBe(
       true,
     );
-    expect(
-      validateReleaseChannelUrl('https://revo.revisium.io/channels/stable.json?x=1', 'stable'),
-    ).toBe(false);
+    expect(validateReleaseChannelUrl(`${ORIGIN}/channels/alpha.json`, 'alpha', policy)).toBe(true);
+    expect(validateReleaseChannelUrl(`${ORIGIN}/channels/stable.json?x=1`, 'stable', policy)).toBe(
+      false,
+    );
   });
 
   it('detects tampering without echoing artifact URLs', () => {
     const fixture = releaseManifestFixture();
-    const descriptor = fixture.manifest.artifacts.packageJson;
-    expect(() => verifyReleaseArtifact(Buffer.from('tampered'), descriptor)).toThrow(
-      /hash verification failed/,
-    );
+    const descriptor = parseInstallationReleaseManifest(fixture.manifest).artifacts.packageJson;
+    // The exact error carries no URL, so a single assertion covers both the
+    // failure and the message shape.
     expect(() => verifyReleaseArtifact(Buffer.from('tampered'), descriptor)).toThrow(
       new Error('Release artifact hash verification failed.'),
     );
@@ -109,7 +404,7 @@ describe('installation release contract', () => {
     const fixture = releaseManifestFixture();
     const bytes = Buffer.from('different package bytes');
     const descriptor = {
-      ...fixture.manifest.artifacts.package,
+      ...parseInstallationReleaseManifest(fixture.manifest).artifacts.package,
       sha256: createHash('sha256').update(bytes).digest('hex'),
     };
     expect(() => verifyReleaseArtifact(bytes, descriptor)).toThrow(/integrity verification failed/);
@@ -130,4 +425,21 @@ describe('installation release contract', () => {
       ).toThrow(/integrity/);
     },
   );
+
+  it('enforces the same explicit policy through the compiled installer adapter', async () => {
+    const adapter = await installerAdapter();
+    const fixture = releaseManifestFixture();
+    const policy = releasePolicyFixture({ requested: { channel: 'stable', version: '1.2.3' } });
+    const decoded = adapter.validateInstallationReleaseManifest(fixture.manifest, policy);
+    expect(decoded).toEqual(fixture.manifest);
+    expect(adapter.verifyReleaseArtifact(fixture.bytes.package, decoded.artifacts.package)).toBe(
+      true,
+    );
+    expect(() =>
+      adapter.validateInstallationReleaseManifest(
+        fixture.manifest,
+        releasePolicyFixture({ requested: { version: '9.9.9' } }),
+      ),
+    ).toThrow(/version/);
+  });
 });
