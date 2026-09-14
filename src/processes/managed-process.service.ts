@@ -36,6 +36,7 @@ export class ManagedProcessService {
       child = spawn(request.executable, [...request.args], {
         cwd: request.cwd,
         env: { ...request.env },
+        detached: request.detached === true,
         shell: false,
         stdio: this.spawnStdio(request),
       });
@@ -122,8 +123,10 @@ export class ManagedProcessService {
 }
 
 class ManagedOwnedProcess implements OwnedProcess {
+  readonly abandonUncertain?: () => Promise<void>;
   readonly cancellationResult?: Promise<ProcessCancellationResult>;
   readonly completion: Promise<ProcessCompletion>;
+  readonly detachCommitted?: () => Promise<void>;
   readonly send?: (message: ProcessMessage) => Promise<void>;
   readonly stderr?: Readable;
   readonly stdin?: Writable;
@@ -136,6 +139,8 @@ class ManagedOwnedProcess implements OwnedProcess {
   private readonly childErrorListener = noop;
   private readonly messageListeners = new Set<(message: unknown) => void>();
   private cancellationRequested = false;
+  private readonly releaseAllowed: boolean;
+  private released = false;
   private resolveCancellation: ((result: ProcessCancellationResult) => void) | undefined;
 
   constructor(
@@ -143,6 +148,7 @@ class ManagedOwnedProcess implements OwnedProcess {
     request: ManagedProcessRequest,
     private readonly exitWaiter: ProcessExitWaiter,
   ) {
+    this.releaseAllowed = Object.values(request.stdio).every((value) => value !== 'pipe');
     this.completion = new Promise((resolveCompletion) => {
       child.once('exit', (exitCode, signal) => {
         this.exited = true;
@@ -187,6 +193,10 @@ class ManagedOwnedProcess implements OwnedProcess {
     if (request.ipc === true) {
       this.send = (message) => this.sendMessage(message);
       this.subscribe = (listener) => this.subscribeToMessages(listener);
+      if (request.detached === true) {
+        this.abandonUncertain = () => this.releaseOwnership();
+        this.detachCommitted = () => this.releaseOwnership();
+      }
     }
   }
 
@@ -268,7 +278,7 @@ class ManagedOwnedProcess implements OwnedProcess {
   }
 
   private async performStop(request: StopProcessRequest): Promise<void> {
-    if (this.exited) {
+    if (this.exited || this.released) {
       return;
     }
     this.signal('SIGTERM');
@@ -298,8 +308,36 @@ class ManagedOwnedProcess implements OwnedProcess {
       : new ManagedProcessError('revo.process.stop', 'Unable to stop the managed process.');
   }
 
+  private releaseOwnership(): Promise<void> {
+    if (this.released) {
+      return Promise.resolve();
+    }
+    if (this.stopOperation !== undefined || this.cancellationRequested) {
+      return Promise.reject(
+        new ManagedProcessError('revo.process.invalid', 'Managed process stop is already active.'),
+      );
+    }
+    if (!this.releaseAllowed) {
+      return Promise.reject(
+        new ManagedProcessError('revo.process.invalid', 'Managed process pipes prevent release.'),
+      );
+    }
+    this.released = true;
+    this.disposeOwnershipListeners();
+    this.resolveCancellation?.({ kind: 'not-requested' });
+    if (this.child.connected) {
+      this.child.disconnect();
+    }
+    this.child.unref();
+    return Promise.resolve();
+  }
+
   private disposeListeners(): void {
     this.child.off('error', this.childErrorListener);
+    this.disposeOwnershipListeners();
+  }
+
+  private disposeOwnershipListeners(): void {
     this.abortSignal?.removeEventListener('abort', this.abortListener ?? noop);
     for (const listener of this.messageListeners) {
       this.child.off('message', listener);
