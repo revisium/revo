@@ -15,6 +15,10 @@ export interface ReleaseMetadata {
   version: string;
 }
 
+export function isSemVerString(value: string): boolean {
+  return SEMVER_PATTERN.test(value);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -38,7 +42,7 @@ export function parseReleaseMetadata(value: unknown): ReleaseMetadata {
   if (value.channel !== 'stable' && value.channel !== 'alpha') {
     throw invalidMetadata('channel must be stable or alpha');
   }
-  if (typeof value.version !== 'string' || !SEMVER_PATTERN.test(value.version)) {
+  if (typeof value.version !== 'string' || !isSemVerString(value.version)) {
     throw invalidMetadata('version must be valid SemVer');
   }
   if (!isRecord(value.npm) || !hasExactKeys(value.npm, ['distTag', 'name'])) {
