@@ -186,7 +186,7 @@ const port = (value: unknown): value is number =>
 const duration = (value: unknown): value is number =>
   Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= 2_147_483_647;
 const environmentName = (value: string) =>
-  value.length <= MAX_ENVIRONMENT_KEY_LENGTH && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(value);
+  value.length <= MAX_ENVIRONMENT_KEY_LENGTH && /^[A-Za-z_]\w*$/u.test(value);
 
 function host(value: unknown): value is string {
   if (!text(value)) {
