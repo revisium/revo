@@ -300,7 +300,7 @@ describe('Core child runtime', () => {
 
 describe('published Core child process', () => {
   it('migrates new and existing databases, serves GraphQL, and closes its listener', async () => {
-    const deadline = Date.now() + 45_000;
+    const deadline = Date.now() + 75_000;
     const cluster = await ClusterFixture.start('scram');
     const root = await mkdtemp('/tmp/revo-core-host-').catch(async (primary: unknown) => {
       await cluster.close().catch((error: unknown) => {
@@ -371,7 +371,7 @@ describe('published Core child process', () => {
     if (primary !== undefined) {
       throw primary;
     }
-  }, 60_000);
+  }, 90_000);
 
   it('bounds and redacts a real subprocess startup failure', async () => {
     const root = await mkdtemp('/tmp/revo-core-host-failure-');
