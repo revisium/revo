@@ -24,6 +24,25 @@ export interface ReleaseManifestFixtureOptions {
   readonly policy?: InstallationReleasePolicy;
 }
 
+export interface FutureReleasePolicy extends InstallationReleasePolicy {
+  readonly locators: InstallationReleasePolicy['locators'] & {
+    readonly nodeArchive: (
+      version: string,
+      platform: NodeArchivePlatform,
+      arch: NodeArchiveArchitecture,
+      format: NodeArchiveFormat,
+    ) => string;
+    readonly nodeShasums: (version: string) => string;
+  };
+}
+
+export interface FutureReleaseManifestFixtureOptions extends Omit<
+  ReleaseManifestFixtureOptions,
+  'policy'
+> {
+  readonly policy?: FutureReleasePolicy;
+}
+
 export interface ReleaseManifestFixture {
   readonly manifest: InstallationReleaseManifest;
   readonly policy: InstallationReleasePolicy;
@@ -32,6 +51,28 @@ export interface ReleaseManifestFixture {
     readonly packageJson: Uint8Array;
     readonly pnpmLock: Uint8Array;
     readonly pnpmWorkspace: Uint8Array;
+  };
+}
+
+export type NodeArchivePlatform = 'darwin' | 'linux' | 'win32';
+export type NodeArchiveArchitecture = 'arm64' | 'x64';
+export type NodeArchiveFormat = 'tar.gz' | 'tar.xz' | 'zip';
+
+export interface NodeArchiveFixture {
+  readonly platform: NodeArchivePlatform;
+  readonly arch: NodeArchiveArchitecture;
+  readonly format: NodeArchiveFormat;
+  readonly url: string;
+  readonly sha256: string;
+}
+
+export interface FutureReleaseManifestFixture extends Omit<ReleaseManifestFixture, 'manifest'> {
+  readonly manifest: InstallationReleaseManifest & {
+    readonly schemaVersion: 'revo-install/v2';
+    readonly toolchain: InstallationReleaseManifest['toolchain'] & {
+      readonly nodeArchives: readonly NodeArchiveFixture[];
+      readonly nodeShasums: { readonly url: string; readonly sha256: string };
+    };
   };
 }
 
@@ -66,6 +107,22 @@ export function releasePolicyFixture(
       },
       manifest: (version) => `${releaseRoot(version)}/manifest.json`,
       channel: (channel) => `${distributionRoot}/channels/${channel}.json`,
+    },
+  };
+}
+
+export function futureReleasePolicyFixture(
+  options: ReleasePolicyFixtureOptions = {},
+): FutureReleasePolicy {
+  const policy = releasePolicyFixture(options);
+  const nodeRoot = (version: string): string => `https://nodejs.org/dist/v${version}`;
+  return {
+    ...policy,
+    locators: {
+      ...policy.locators,
+      nodeArchive: (version, platform, arch, format) =>
+        `${nodeRoot(version)}/node-v${version}-${platform === 'win32' ? 'win' : platform}-${arch}.${format}`,
+      nodeShasums: (version) => `${nodeRoot(version)}/SHASUMS256.txt`,
     },
   };
 }
@@ -120,6 +177,52 @@ export function releaseManifestFixture(
         pnpmWorkspace: {
           url: locators.pnpmWorkspace(release),
           sha256: digest(bytes.pnpmWorkspace, 'sha256'),
+        },
+      },
+    },
+  };
+}
+
+const NODE_26_8_2_ARCHIVES = [
+  ['linux', 'x64', 'tar.xz', '40e1d3225c1c9ae9a2671c98ecb9857e4d5555026394f348645676798840d5c5'],
+  ['linux', 'arm64', 'tar.xz', '81d8f0fdea9dcd3bfdcfeafc5f8359c151f097e9880b0007c0645ca670d07971'],
+  ['darwin', 'x64', 'tar.gz', 'adb8feb2d4987df3d72d2ec46f4fc4b58039c859b8c3f0e3cc2d3c6cbaf8629c'],
+  ['darwin', 'arm64', 'tar.gz', '974b6d5fb2fc7c33ff2354db0902b4e91c2de01ec8acc6de48e543c97e18c9e1'],
+  ['win32', 'x64', 'zip', 'cf02f5d0c06c794b84f277177d5cf3743d0924ca49f6641cd435dd7cb6ee9085'],
+  ['win32', 'arm64', 'zip', 'a4e8362e268f1fcf1735f046e0adb088b28eeb400fb1c33fe5cc94d1a3d42570'],
+] as const;
+
+export function futureReleaseManifestFixture(
+  options: FutureReleaseManifestFixtureOptions = {},
+): FutureReleaseManifestFixture {
+  const policy = options.policy ?? futureReleasePolicyFixture();
+  const fixture = releaseManifestFixture({ ...options, policy });
+  const nodeVersion = fixture.manifest.toolchain.node;
+  const snapshotSha256 =
+    nodeVersion === '26.8.2'
+      ? 'c31cbd53707d1e82ed2094d4554eb13562a8be9521433f8bc4447776a7e7dad3'
+      : digest(Buffer.from(`synthetic Node ${nodeVersion} checksum snapshot`), 'sha256');
+  const nodeArchives = NODE_26_8_2_ARCHIVES.map(([platform, arch, format, sha256]) => ({
+    platform,
+    arch,
+    format,
+    url: policy.locators.nodeArchive(nodeVersion, platform, arch, format),
+    sha256:
+      nodeVersion === '26.8.2'
+        ? sha256
+        : digest(Buffer.from(`synthetic ${nodeVersion} ${platform} ${arch} ${format}`), 'sha256'),
+  }));
+  return {
+    ...fixture,
+    manifest: {
+      ...fixture.manifest,
+      schemaVersion: 'revo-install/v2',
+      toolchain: {
+        ...fixture.manifest.toolchain,
+        nodeArchives,
+        nodeShasums: {
+          url: policy.locators.nodeShasums(nodeVersion),
+          sha256: snapshotSha256,
         },
       },
     },
