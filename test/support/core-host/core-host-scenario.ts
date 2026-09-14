@@ -1,5 +1,10 @@
 import type { RevoCoreRuntime, RevoCoreRuntimeOptions } from '@revisium/revo-core/runtime';
 
+import {
+  CoreChildEntry,
+  type CoreChildProcessPort,
+  type CoreChildRunnerLike,
+} from '../../../src/core-host/core-child-entry.js';
 import type { CoreHostMessage } from '../../../src/core-host/core-child-protocol.js';
 import type { CoreChildTransport } from '../../../src/core-host/core-child-runner.js';
 import { CoreRuntimeService } from '../../../src/core-host/core-runtime.service.js';
@@ -62,6 +67,114 @@ export class CoreChildScenario implements CoreChildTransport {
     }
     await new Promise((resolve) => setTimeout(resolve, 0));
     await this.untilListening();
+  }
+}
+
+export class CoreChildEntryScenario {
+  readonly events: string[] = [];
+  readonly sent: CoreHostMessage[] = [];
+  readonly received: unknown[] = [];
+  disconnectCalls = 0;
+  exitCodes: number[] = [];
+  loadCalls = 0;
+  runnerConstructorCalls = 0;
+  runnerDisconnectCalls = 0;
+  private connectedState = true;
+  private messageListener: ((message: unknown) => void) | undefined;
+  private disconnectListener: (() => void) | undefined;
+  private resolveLoader!: (
+    runner: new (transport: CoreChildTransport) => CoreChildRunnerLike,
+  ) => void;
+  private rejectLoader!: (error: Error) => void;
+  private bootedSend: ReturnType<typeof deferred> | undefined;
+  private readonly loader = new Promise<new (transport: CoreChildTransport) => CoreChildRunnerLike>(
+    (resolve, reject) => {
+      this.resolveLoader = resolve;
+      this.rejectLoader = reject;
+    },
+  );
+
+  start() {
+    const processPort: CoreChildProcessPort = {
+      connected: () => this.connectedState,
+      disconnect: () => {
+        this.connectedState = false;
+        this.disconnectCalls += 1;
+      },
+      onDisconnect: (listener) => {
+        this.disconnectListener = listener;
+      },
+      onMessage: (listener) => {
+        this.messageListener = listener;
+      },
+      send: async (message) => {
+        if (message.type === 'booted' && this.bootedSend) {
+          await this.bootedSend.promise;
+        }
+        if (!this.connectedState) {
+          throw new Error('IPC unavailable');
+        }
+        this.sent.push(message);
+        this.events.push(`sent:${message.type}`);
+      },
+      setExitCode: (exitCode) => this.exitCodes.push(exitCode),
+    };
+    new CoreChildEntry(processPort, () => {
+      this.loadCalls += 1;
+      return this.loader;
+    }).start();
+  }
+  hello() {
+    this.messageListener?.({ protocol: 'revo-core-host/v1', type: 'hello' });
+  }
+  message(value: unknown) {
+    this.messageListener?.(value);
+  }
+  disconnect() {
+    this.connectedState = false;
+    this.disconnectListener?.();
+  }
+  deferBootedSend() {
+    this.bootedSend = deferred();
+  }
+  resolveBootedSend() {
+    this.bootedSend?.resolve();
+  }
+  resolveLoad() {
+    const recordConstruction = () => {
+      this.runnerConstructorCalls += 1;
+    };
+    const recordMessage = (message: unknown) => {
+      this.received.push(message);
+      const type =
+        typeof message === 'object' && message !== null && 'type' in message
+          ? String(message.type)
+          : 'unknown';
+      this.events.push(`received:${type}`);
+    };
+    const recordDisconnect = () => {
+      this.runnerDisconnectCalls += 1;
+    };
+    this.resolveLoader(
+      class implements CoreChildRunnerLike {
+        constructor(private readonly transport: CoreChildTransport) {
+          recordConstruction();
+        }
+        receive(message: unknown) {
+          recordMessage(message);
+        }
+        async disconnected() {
+          recordDisconnect();
+          this.transport.finish(0);
+        }
+      },
+    );
+  }
+  rejectLoad() {
+    this.rejectLoader(new Error('SECRET load failure'));
+  }
+  async settled() {
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
 

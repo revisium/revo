@@ -12,6 +12,7 @@ import {
 import { CoreChildRunner } from '../../src/core-host/core-child-runner.js';
 import { ManagedProcessService } from '../../src/processes/managed-process.service.js';
 import {
+  CoreChildEntryScenario,
   CoreChildScenario,
   DeferredCoreRuntimeService,
 } from '../support/core-host/core-host-scenario.js';
@@ -28,6 +29,83 @@ const start = {
 } as const;
 
 describe('Core child runtime', () => {
+  it('exits before hello without loading the Core runner', async () => {
+    const scenario = new CoreChildEntryScenario();
+    scenario.start();
+    scenario.disconnect();
+    await scenario.settled();
+    expect(scenario.loadCalls).toBe(0);
+    expect(scenario.sent).toEqual([]);
+    expect(scenario.exitCodes).toEqual([0]);
+  });
+
+  it('loads once after hello and forwards buffered start only after booted', async () => {
+    const scenario = new CoreChildEntryScenario();
+    scenario.start();
+    scenario.deferBootedSend();
+    scenario.hello();
+    scenario.hello();
+    scenario.message(start);
+    scenario.message({ protocol: CORE_HOST_PROTOCOL, type: 'shutdown' });
+    expect(scenario.loadCalls).toBe(1);
+    expect(scenario.received).toEqual([]);
+    scenario.resolveLoad();
+    await scenario.settled();
+    scenario.message(start);
+    expect(scenario.received).toEqual([]);
+    scenario.resolveBootedSend();
+    await scenario.settled();
+    expect(scenario.events).toEqual([
+      'sent:booted',
+      'received:start',
+      'received:shutdown',
+      'received:start',
+    ]);
+
+    const disconnected = new CoreChildEntryScenario();
+    disconnected.start();
+    disconnected.deferBootedSend();
+    disconnected.hello();
+    disconnected.message(start);
+    disconnected.resolveLoad();
+    await disconnected.settled();
+    disconnected.disconnect();
+    disconnected.resolveBootedSend();
+    await disconnected.settled();
+    expect(disconnected.sent).toEqual([]);
+    expect(disconnected.received).toEqual([]);
+    expect(disconnected.exitCodes).toEqual([0]);
+  });
+
+  it('does not create a runner or send after disconnect during its import', async () => {
+    const scenario = new CoreChildEntryScenario();
+    scenario.start();
+    scenario.hello();
+    scenario.message(start);
+    scenario.disconnect();
+    scenario.resolveLoad();
+    await scenario.settled();
+    expect(scenario.sent).toEqual([]);
+    expect(scenario.received).toEqual([]);
+    expect(scenario.runnerConstructorCalls).toBe(0);
+    expect(scenario.runnerDisconnectCalls).toBe(0);
+    expect(scenario.exitCodes).toEqual([0]);
+  });
+
+  it('reports a runner load rejection without exposing its error', async () => {
+    const scenario = new CoreChildEntryScenario();
+    scenario.start();
+    scenario.hello();
+    scenario.rejectLoad();
+    await scenario.settled();
+    expect(scenario.sent).toEqual([
+      { protocol: CORE_HOST_PROTOCOL, type: 'failed', code: 'CORE_HOST_FAILED' },
+    ]);
+    expect(JSON.stringify(scenario.sent)).not.toContain('SECRET');
+    expect(scenario.exitCodes).toEqual([1]);
+    expect(scenario.disconnectCalls).toBe(1);
+  });
+
   it('accepts an OS-assigned listen port only on start', () => {
     const scenario = new CoreChildScenario();
     new CoreChildRunner(scenario, new DeferredCoreRuntimeService()).receive(start);
@@ -287,8 +365,15 @@ describe('published Core child process', () => {
     );
     try {
       child.disconnect();
-      const result = await within(completion, 5_000);
-      await within(Promise.all([stdout.completed, stderr.completed]), 1_000);
+      const state = () =>
+        `exit=${String(child.exitCode)} signal=${String(child.signalCode)} stdoutDrained=${String(stdout.drained())} stderrDrained=${String(stderr.drained())}`;
+      const result = await within(completion, 5_000, 'early-disconnect exit', state);
+      await within(
+        Promise.all([stdout.completed, stderr.completed]),
+        1_000,
+        'early-disconnect stream drain',
+        state,
+      );
       expect(result).toEqual({ code: 0, signal: null });
       expect(stdout.failed() || stderr.failed()).toBe(false);
       expect(`${stdout.text()}${stderr.text()}`).not.toContain('ERR_IPC_DISCONNECTED');
@@ -297,7 +382,12 @@ describe('published Core child process', () => {
         if (child.exitCode === null && child.signalCode === null) {
           child.kill('SIGKILL');
         }
-        await within(completion, 1_000);
+        await within(
+          completion,
+          1_000,
+          'early-disconnect cleanup exit',
+          () => `exit=${String(child.exitCode)} signal=${String(child.signalCode)}`,
+        );
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -401,11 +491,15 @@ function captureBounded(stream: NodeJS.ReadableStream | undefined) {
   let byteCount = 0;
   let retainedBytes = 0;
   let streamFailed = false;
+  let streamDrained = stream === undefined;
   const completed = stream
     ? finished(stream).then(
-        () => undefined,
+        () => {
+          streamDrained = true;
+        },
         () => {
           streamFailed = true;
+          streamDrained = true;
         },
       )
     : Promise.resolve();
@@ -421,16 +515,22 @@ function captureBounded(stream: NodeJS.ReadableStream | undefined) {
   return {
     bytes: () => byteCount,
     completed,
+    drained: () => streamDrained,
     failed: () => streamFailed,
     text: () => Buffer.concat(chunks).subarray(0, 8192).toString('utf8'),
   };
 }
 
-function within<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
+function within<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  label = 'subprocess',
+  state: () => string = () => 'state unavailable',
+): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('subprocess did not finish')), milliseconds),
+      setTimeout(() => reject(new Error(`${label} did not finish: ${state()}`)), milliseconds),
     ),
   ]);
 }
