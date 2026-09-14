@@ -15,6 +15,7 @@ export interface ManagedProcessRequest {
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
   readonly executable: string;
+  readonly detached?: boolean;
   readonly ipc?: boolean;
   readonly stdio: Readonly<{
     stderr: ProcessStdio;
@@ -44,6 +45,8 @@ export interface OwnedProcess {
   readonly stderr?: Readable;
   readonly stdin?: Writable;
   readonly stdout?: Readable;
+  abandonUncertain?(): Promise<void>;
+  detachCommitted?(): Promise<void>;
   send?(message: ProcessMessage): Promise<void>;
   subscribe?(listener: (message: unknown) => void): () => void;
 }

@@ -190,6 +190,120 @@ describe('managed child process', () => {
     expect(process.listenerCount('SIGTERM')).toBe(parentListeners);
   });
 
+  it.each(['detachCommitted', 'abandonUncertain'] as const)(
+    '%s releases a detached child without cancellation or a signal',
+    async (transition) => {
+      const cancellation = new AbortController();
+      const handle = await scenario.start(
+        scenario.request(['resist'], {
+          cancellation: { graceMs: 20, killWaitMs: 1_000, signal: cancellation.signal },
+          detached: true,
+          ipc: true,
+          stdio: { stderr: 'ignore', stdin: 'ignore', stdout: 'ignore' },
+        }),
+      );
+      await scenario.begin(handle);
+
+      await scenario[transition](handle);
+      await scenario[transition](handle);
+      expect(await scenario.ipcIsDisconnected(handle)).toBe(true);
+      cancellation.abort();
+
+      await expect(handle.cancellationResult).resolves.toEqual({ kind: 'not-requested' });
+      await expect(handle.completion).resolves.toEqual({ exitCode: 0, signal: null });
+    },
+  );
+
+  it.each(['detachCommitted', 'abandonUncertain'] as const)(
+    '%s rejects after an explicit stop begins and preserves the original stop outcome',
+    async (transition) => {
+      const service = new ManagedProcessService();
+      const handle = await scenario.start(
+        scenario.request(['resist'], {
+          detached: true,
+          ipc: true,
+          stdio: { stderr: 'ignore', stdin: 'ignore', stdout: 'ignore' },
+        }),
+      );
+      await scenario.begin(handle);
+      const termReceived = scenario.waitForMessage(handle);
+
+      const stopping = service.stop(handle, { graceMs: 500, killWaitMs: 1_000 });
+      await termReceived;
+
+      await expect(scenario[transition](handle)).rejects.toMatchObject({
+        code: 'revo.process.invalid',
+      });
+      expect(await scenario.ipcIsDisconnected(handle)).toBe(false);
+      await expect(stopping).resolves.toBeUndefined();
+      await expect(handle.completion).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' });
+    },
+  );
+
+  it.each(['detachCommitted', 'abandonUncertain'] as const)(
+    '%s rejects after cancellation begins without replacing its cancellation result',
+    async (transition) => {
+      const cancellation = new AbortController();
+      const handle = await scenario.start(
+        scenario.request(['resist'], {
+          cancellation: { graceMs: 500, killWaitMs: 1_000, signal: cancellation.signal },
+          detached: true,
+          ipc: true,
+          stdio: { stderr: 'ignore', stdin: 'ignore', stdout: 'ignore' },
+        }),
+      );
+      await scenario.begin(handle);
+      const termReceived = scenario.waitForMessage(handle);
+
+      cancellation.abort();
+      await termReceived;
+
+      await expect(scenario[transition](handle)).rejects.toMatchObject({
+        code: 'revo.process.invalid',
+      });
+      expect(await scenario.ipcIsDisconnected(handle)).toBe(false);
+      await expect(handle.cancellationResult).resolves.toEqual({ kind: 'stopped' });
+      await expect(handle.completion).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' });
+    },
+  );
+
+  it.each(['detachCommitted', 'abandonUncertain'] as const)(
+    '%s rejects piped stdio without partially releasing the child',
+    async (transition) => {
+      const cancellation = new AbortController();
+      const handle = await scenario.start(
+        scenario.request(['resist'], {
+          cancellation: { graceMs: 20, killWaitMs: 1_000, signal: cancellation.signal },
+          detached: true,
+          ipc: true,
+        }),
+      );
+      await scenario.begin(handle);
+
+      await expect(scenario[transition](handle)).rejects.toMatchObject({
+        code: 'revo.process.invalid',
+      });
+      expect(await scenario.ipcIsDisconnected(handle)).toBe(false);
+
+      cancellation.abort();
+      await expect(handle.cancellationResult).resolves.toEqual({ kind: 'stopped' });
+      await expect(handle.completion).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' });
+    },
+  );
+
+  it.each(['detachCommitted', 'abandonUncertain'] as const)(
+    '%s lets its real parent exit while the detached child remains independently alive',
+    async (transition) => {
+      const released = await scenario.releasedParentExits(transition);
+
+      expect(released.childAlive).toBe(true);
+      expect(released.childGroupAlive).toBe(true);
+      expect(await scenario.signalWasObserved()).toBe(false);
+
+      await scenario.cleanReleasedChild(released.childPid);
+    },
+  );
+
   it('observes a redacted cancellation cleanup failure without rejecting in the background', async () => {
     const cancellation = new AbortController();
     const handle = await scenario.startWithoutExitObservation(
