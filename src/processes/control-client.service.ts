@@ -95,7 +95,7 @@ function exchangeStop(record: ControlRecord, limits: ControlLimits, completionTi
   return new Promise<[unknown, unknown]>((resolve, reject) => {
     const socket = connect(record.endpoint);
     const frames: unknown[] = [];
-    let data = Buffer.alloc(0);
+    let data: Buffer = Buffer.alloc(0);
     let settled = false;
     let timer = setTimeout(() => finish(new ControlTransportError()), limits.timeoutMs);
     const finish = (error?: Error) => {
@@ -123,32 +123,25 @@ function exchangeStop(record: ControlRecord, limits: ControlLimits, completionTi
     socket.on('data', (chunk: Buffer) => {
       data = Buffer.concat([data, chunk], data.length + chunk.length);
       for (;;) {
-        const newline = data.indexOf(10);
-        if (newline < 0) {
-          if (data.length > limits.maxFrameBytes) {
-            finish(new ControlTransportError());
-          }
+        const frame = nextStopFrame(data, limits.maxFrameBytes);
+        if (frame.kind === 'incomplete') {
           return;
         }
-        if (newline + 1 > limits.maxFrameBytes || frames.length === 2) {
+        if (frame.kind === 'invalid') {
           finish(new ControlTransportError());
           return;
         }
-        try {
-          frames.push(JSON.parse(data.subarray(0, newline).toString('utf8')));
-        } catch {
+        data = frame.rest;
+        frames.push(frame.value);
+        const outcome = stopFrameOutcome(frame.value, frames.length);
+        if (outcome === 'invalid' || outcome === 'extra') {
           finish(new ControlTransportError());
           return;
         }
-        data = data.subarray(newline + 1);
-        if (frames.length === 1) {
-          if (!isAccepted(frames[0])) {
-            finish(new ControlTransportError());
-            return;
-          }
+        if (outcome === 'accepted') {
           armCompletion();
         }
-        if (frames.length === 2) {
+        if (outcome === 'completed') {
           if (data.length !== 0) {
             finish(new ControlTransportError());
           } else {
@@ -161,6 +154,40 @@ function exchangeStop(record: ControlRecord, limits: ControlLimits, completionTi
     socket.once('end', () => frames.length === 2 || finish(new ControlTransportError()));
     socket.once('error', () => finish(new ControlTransportError()));
   });
+}
+
+type StopFrame =
+  | { readonly kind: 'incomplete' }
+  | { readonly kind: 'invalid' }
+  | { readonly kind: 'frame'; readonly value: unknown; readonly rest: Buffer };
+
+function nextStopFrame(data: Buffer, maxFrameBytes: number): StopFrame {
+  const newline = data.indexOf(10);
+  if (newline < 0) {
+    return data.length > maxFrameBytes ? { kind: 'invalid' } : { kind: 'incomplete' };
+  }
+  if (newline + 1 > maxFrameBytes) {
+    return { kind: 'invalid' };
+  }
+  try {
+    return {
+      kind: 'frame',
+      value: JSON.parse(data.subarray(0, newline).toString('utf8')),
+      rest: data.subarray(newline + 1),
+    };
+  } catch {
+    return { kind: 'invalid' };
+  }
+}
+
+function stopFrameOutcome(
+  value: unknown,
+  count: number,
+): 'accepted' | 'completed' | 'invalid' | 'extra' {
+  if (count === 1) {
+    return isAccepted(value) ? 'accepted' : 'invalid';
+  }
+  return count === 2 ? 'completed' : 'extra';
 }
 
 function requireRecord(value: unknown, limits: ControlLimits): ControlRecord {

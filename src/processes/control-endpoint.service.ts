@@ -120,9 +120,7 @@ export class ControlEndpointService {
         return Promise.resolve();
       }
       phase = 'terminal';
-      if (closePromise === undefined) {
-        closePromise = drain();
-      }
+      closePromise ??= drain();
       return closePromise;
     };
     return {
