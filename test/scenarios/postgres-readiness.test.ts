@@ -24,17 +24,21 @@ describe('embedded PostgreSQL SQL readiness', () => {
     REAL_PG_SCENARIO_TIMEOUT_MS,
   );
 
-  it('does not write to a different trust-authenticated PostgreSQL server', async () => {
-    await expect(scenario.rejectsAnotherTrustAuthenticatedCluster()).resolves.toEqual({
-      outcome: {
-        name: 'EmbeddedPostgresError',
-        message: 'Embedded PostgreSQL preparation failed',
-        hasCause: false,
-      },
-      databaseExists: false,
-      serverAlive: true,
-    });
-  });
+  it(
+    'does not write to a different trust-authenticated PostgreSQL server',
+    async () => {
+      await expect(scenario.rejectsAnotherTrustAuthenticatedCluster()).resolves.toEqual({
+        outcome: {
+          name: 'EmbeddedPostgresError',
+          message: 'Embedded PostgreSQL preparation failed',
+          hasCause: false,
+        },
+        databaseExists: false,
+        serverAlive: true,
+      });
+    },
+    REAL_PG_SCENARIO_TIMEOUT_MS,
+  );
 
   it('reports bad database authentication without leaking connection details', async () => {
     await expect(scenario.rejectsBadAuthenticationSafely()).resolves.toEqual({
