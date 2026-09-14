@@ -49,7 +49,7 @@ jobs:
           pnpm build
           pnpm exec vitest run test/scenarios/ownership.test.ts test/scenarios/managed-process.test.ts test/scenarios/process-identity.test.ts test/scenarios/control-endpoint.test.ts test/scenarios/control-discovery.test.ts test/scenarios/startup-progress.test.ts test/scenarios/postgres-provision.test.ts
           pnpm exec vitest run test/scenarios/postgres-readiness.test.ts test/scenarios/postgres-lifecycle.test.ts test/scenarios/external-postgres-client-config.test.ts test/scenarios/external-postgres-lifecycle.test.ts
-          pnpm exec vitest run test/scenarios/core-host.test.ts test/scenarios/core-host-runtime.test.ts
+          pnpm exec vitest run test/scenarios/core-host.test.ts test/scenarios/core-host-runtime.test.ts test/scenarios/core-host-process.test.ts
 
   verify:
     runs-on: ubuntu-latest
