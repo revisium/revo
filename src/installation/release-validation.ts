@@ -1,6 +1,10 @@
 import { isSemVerString, parseReleaseMetadata } from '../release-metadata.js';
 import type {
   InstallationReleaseManifest,
+  NodeArchiveArchitecture,
+  NodeArchiveFormat,
+  NodeArchivePlatform,
+  NodeArchiveReleaseArtifact,
   PackageReleaseArtifact,
   ReleaseArtifact,
 } from './metadata.types.js';
@@ -9,6 +13,8 @@ const KEYS = {
   root: ['artifacts', 'components', 'release', 'schemaVersion', 'toolchain'],
   component: ['name', 'version'],
   toolchain: ['node', 'pnpm'],
+  nodeToolchain: ['node', 'nodeArchives', 'nodeShasums', 'pnpm'],
+  nodeArchive: ['arch', 'format', 'platform', 'sha256', 'url'],
   artifact: ['sha256', 'url'],
   packageArtifact: ['integrity', 'sha256', 'url'],
   artifacts: ['package', 'packageJson', 'pnpmLock', 'pnpmWorkspace'],
@@ -19,6 +25,17 @@ const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/;
 const SRI_SHA512_PATTERN = /^sha512-[A-Za-z0-9+/]{86}==$/;
 const NPM_PACKAGE_NAME_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 const NPM_PACKAGE_NAME_MAX_LENGTH = 214;
+
+const NODE_ARCHIVE_TARGETS = [
+  ['linux', 'x64', 'tar.xz'],
+  ['linux', 'arm64', 'tar.xz'],
+  ['darwin', 'x64', 'tar.gz'],
+  ['darwin', 'arm64', 'tar.gz'],
+  ['win32', 'x64', 'zip'],
+  ['win32', 'arm64', 'zip'],
+] as const satisfies ReadonlyArray<
+  readonly [NodeArchivePlatform, NodeArchiveArchitecture, NodeArchiveFormat]
+>;
 
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -91,6 +108,66 @@ function parseArtifact(
   return { url: value.url, sha256: value.sha256 };
 }
 
+function parseNodeArchive(value: unknown): NodeArchiveReleaseArtifact {
+  const target = record(value)
+    ? NODE_ARCHIVE_TARGETS.find(
+        ([platform, arch, format]) =>
+          value.platform === platform && value.arch === arch && value.format === format,
+      )
+    : undefined;
+  if (
+    !record(value) ||
+    !exact(value, KEYS.nodeArchive) ||
+    target === undefined ||
+    typeof value.url !== 'string' ||
+    typeof value.sha256 !== 'string' ||
+    !isSha256HexString(value.sha256)
+  ) {
+    throw invalid('Node archive is invalid');
+  }
+  const [platform, arch, format] = target;
+  return {
+    platform,
+    arch,
+    format,
+    url: value.url,
+    sha256: value.sha256,
+  };
+}
+
+function parseToolchain(value: Record<string, unknown>): InstallationReleaseManifest['toolchain'] {
+  if (
+    typeof value.node !== 'string' ||
+    !isSemVerString(value.node) ||
+    typeof value.pnpm !== 'string' ||
+    !isSemVerString(value.pnpm)
+  ) {
+    throw invalid('schema or top-level fields are invalid');
+  }
+  if (exact(value, KEYS.toolchain)) {
+    return { node: value.node, pnpm: value.pnpm };
+  }
+  if (!exact(value, KEYS.nodeToolchain) || !Array.isArray(value.nodeArchives)) {
+    throw invalid('schema or top-level fields are invalid');
+  }
+  const nodeArchives = value.nodeArchives.map(parseNodeArchive);
+  const targets = nodeArchives.map(({ platform, arch, format }) => `${platform}/${arch}/${format}`);
+  const expectedTargets = NODE_ARCHIVE_TARGETS.map((target) => target.join('/'));
+  if (
+    targets.length !== expectedTargets.length ||
+    new Set(targets).size !== targets.length ||
+    !expectedTargets.every((target) => targets.includes(target))
+  ) {
+    throw invalid('Node archive set is incomplete');
+  }
+  return {
+    node: value.node,
+    pnpm: value.pnpm,
+    nodeArchives,
+    nodeShasums: parseArtifact(value.nodeShasums, false),
+  };
+}
+
 export function parseInstallationReleaseManifest(value: unknown): InstallationReleaseManifest {
   if (
     !record(value) ||
@@ -99,11 +176,6 @@ export function parseInstallationReleaseManifest(value: unknown): InstallationRe
     !record(value.components) ||
     !exact(value.components, KEYS.components) ||
     !record(value.toolchain) ||
-    !exact(value.toolchain, KEYS.toolchain) ||
-    typeof value.toolchain.node !== 'string' ||
-    !isSemVerString(value.toolchain.node) ||
-    typeof value.toolchain.pnpm !== 'string' ||
-    !isSemVerString(value.toolchain.pnpm) ||
     !record(value.artifacts) ||
     !exact(value.artifacts, KEYS.artifacts)
   ) {
@@ -112,11 +184,12 @@ export function parseInstallationReleaseManifest(value: unknown): InstallationRe
   const release = parseReleaseMetadata(value.release);
   const core = parseComponent(value.components.core);
   const admin = parseComponent(value.components.admin);
+  const toolchain = parseToolchain(value.toolchain);
   return {
     schemaVersion: value.schemaVersion,
     release,
     components: { core, admin },
-    toolchain: { node: value.toolchain.node, pnpm: value.toolchain.pnpm },
+    toolchain,
     artifacts: {
       package: parseArtifact(value.artifacts.package, true),
       packageJson: parseArtifact(value.artifacts.packageJson, false),

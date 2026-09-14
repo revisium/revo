@@ -1,5 +1,11 @@
 import type { ReleaseMetadata } from '../release-metadata.js';
-import type { InstallationReleaseManifest } from './metadata.types.js';
+import type {
+  InstallationReleaseManifest,
+  NodeArchiveArchitecture,
+  NodeArchiveFormat,
+  NodeArchivePlatform,
+  NodeReleaseToolchain,
+} from './metadata.types.js';
 import { parseInstallationReleaseManifest } from './release-validation.js';
 
 export interface InstallationReleasePolicy {
@@ -17,6 +23,13 @@ export interface InstallationReleasePolicy {
     };
     readonly manifest: (version: string) => string;
     readonly channel: (channel: ReleaseMetadata['channel']) => string;
+    readonly nodeArchive?: (
+      version: string,
+      platform: NodeArchivePlatform,
+      arch: NodeArchiveArchitecture,
+      format: NodeArchiveFormat,
+    ) => string;
+    readonly nodeShasums?: (version: string) => string;
   };
 }
 
@@ -100,5 +113,27 @@ export function validateInstallationReleaseManifest(
       throw invalid(`${kind} artifact URL does not match the release policy locator`);
     }
   }
+  if (manifest.schemaVersion === 'revo-install/v2') {
+    validateNodeToolchain(manifest.toolchain, policy);
+  }
   return manifest;
+}
+
+function validateNodeToolchain(
+  toolchain: InstallationReleaseManifest['toolchain'],
+  policy: InstallationReleasePolicy,
+): asserts toolchain is NodeReleaseToolchain {
+  const { nodeArchive, nodeShasums } = policy.locators;
+  if (!('nodeArchives' in toolchain) || nodeArchive === undefined || nodeShasums === undefined) {
+    throw invalid('Node artifact locators or descriptors are missing');
+  }
+  if (!isSafeUrlMatch(toolchain.nodeShasums.url, nodeShasums(toolchain.node))) {
+    throw invalid('Node SHASUMS URL does not match the release policy locator');
+  }
+  for (const archive of toolchain.nodeArchives) {
+    const expected = nodeArchive(toolchain.node, archive.platform, archive.arch, archive.format);
+    if (!isSafeUrlMatch(archive.url, expected)) {
+      throw invalid('Node archive URL does not match the release policy locator');
+    }
+  }
 }
