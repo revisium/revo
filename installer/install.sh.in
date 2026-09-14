@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+# revo-node-bootstrap-data-begin
+@@REVO_NODE_BOOTSTRAP_DATA@@
+# revo-node-bootstrap-data-end
+
+# revo-node-bootstrap-payload-begin
+@@REVO_NODE_BOOTSTRAP_PAYLOAD@@
+# revo-node-bootstrap-payload-end
