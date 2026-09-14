@@ -94,6 +94,17 @@ describe('server ownership', () => {
     expect(await next.request('acquire', scenario.dataDir())).toMatchObject({ kind: 'held' });
   });
 
+  it('fails a request against a killed owner promptly with its action labelled', async () => {
+    const owner = await scenario.owner();
+    await owner.kill();
+
+    const startedAt = Date.now();
+    await expect(owner.request('acquire', scenario.dataDir())).rejects.toThrow(
+      /request "acquire" did not reply: child already exited/u,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   it('does not pass ownership to an unrelated long-lived child', async () => {
     const first = await scenario.owner();
     const next = await scenario.owner();
