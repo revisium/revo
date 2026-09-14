@@ -1,7 +1,7 @@
 import type {
   PreparedEmbeddedPostgres,
   PrepareEmbeddedPostgresRequest,
-  StartedEmbeddedDatabase,
+  StartedDatabase,
   StartDatabaseRequest,
 } from '../postgres/index.js';
 import type { StartupProgressFacade, StartupProgressOptions } from '../startup-progress/index.js';
@@ -21,18 +21,28 @@ export interface OpenPublishedControlRequest {
   readonly limits?: import('./control-endpoint.types.js').ControlLimits;
   readonly onStop: () => void | Promise<void>;
   readonly startupProgress?: StartupProgressOptions;
+  readonly databaseUrl?: string;
+}
+
+interface HeldPublishedControlBase {
+  readonly kind: 'held';
+  readonly endpoint: string;
+  readonly stopResult: Promise<ControlStopResult>;
+  readonly progress?: StartupProgressFacade;
+  close(): Promise<void>;
 }
 
 export type PublishedControl =
   | { readonly kind: 'busy' }
-  | {
-      readonly kind: 'held';
-      readonly endpoint: string;
-      readonly stopResult: Promise<ControlStopResult>;
-      readonly progress?: StartupProgressFacade;
+  | (HeldPublishedControlBase & {
+      readonly databaseKind: 'embedded';
       prepareEmbeddedPostgres?(
         request: PrepareEmbeddedPostgresRequest,
       ): Promise<PreparedEmbeddedPostgres>;
-      startDatabase?(request: StartDatabaseRequest): Promise<StartedEmbeddedDatabase>;
-      close(): Promise<void>;
-    };
+      startDatabase?(request: StartDatabaseRequest): Promise<StartedDatabase>;
+    })
+  | (HeldPublishedControlBase & {
+      readonly databaseKind: 'external';
+      readonly prepareEmbeddedPostgres?: never;
+      startDatabase?(request: StartDatabaseRequest): Promise<StartedDatabase>;
+    });

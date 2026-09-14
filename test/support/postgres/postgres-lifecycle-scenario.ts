@@ -31,6 +31,9 @@ export class PostgresLifecycleScenario {
     const fixture = await this.fixture();
     const firstOwner = await this.open(fixture, FIRST_OPERATION);
     const first = await this.start(firstOwner);
+    if (first.kind !== 'embedded') {
+      throw new Error('embedded database missing');
+    }
     await this.query(fixture.dataDir, first.port, [
       'CREATE TABLE durable_value (value text NOT NULL)',
       "INSERT INTO durable_value (value) VALUES ('survives restart')",
@@ -40,6 +43,9 @@ export class PostgresLifecycleScenario {
 
     const secondOwner = await this.open(fixture, SECOND_OPERATION);
     const second = await this.start(secondOwner);
+    if (second.kind !== 'embedded') {
+      throw new Error('embedded database missing');
+    }
     const rows = await this.query(fixture.dataDir, second.port, [
       'SELECT value FROM durable_value',
     ]);
@@ -80,7 +86,12 @@ export class PostgresLifecycleScenario {
     );
     const owner = await this.open(fixture, FIRST_OPERATION, allocator, resource);
     const outcome = await this.start(owner).then(
-      (started) => ({ kind: 'ready' as const, port: started.port }),
+      (started) => {
+        if (started.kind !== 'embedded') {
+          throw new Error('embedded database missing');
+        }
+        return { kind: 'ready' as const, port: started.port };
+      },
       () => ({ kind: 'rejected' as const }),
     );
     await owner.close();
@@ -126,7 +137,12 @@ export class PostgresLifecycleScenario {
     this.allocators.push(allocator);
     const owner = await this.open(fixture, FIRST_OPERATION, allocator);
     const outcome = await this.start(owner).then(
-      (started) => ({ kind: 'ready' as const, port: started.port }),
+      (started) => {
+        if (started.kind !== 'embedded') {
+          throw new Error('embedded database missing');
+        }
+        return { kind: 'ready' as const, port: started.port };
+      },
       () => ({ kind: 'rejected' as const }),
     );
     await owner.close();

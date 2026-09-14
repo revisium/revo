@@ -29,6 +29,12 @@ stages.
 - `revo-tui` owns terminal UI behavior.
 - Dependencies flow from `revo` to released component packages; components do not import `revo`.
 
+## External PostgreSQL TLS
+
+External PostgreSQL URLs use TLS verification by default; `sslmode=disable` is the only explicit
+override. Private CA bundles and mutual TLS credentials are intentionally outside the first
+external-connection scope and will require a separately designed configuration contract.
+
 ## CLI
 
 The current commands are:

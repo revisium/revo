@@ -270,6 +270,44 @@ export class ClusterFixture {
     }
   }
 
+  connectionUrl(database = 'postgres', sslMode: 'disable' | 'verify-full' = 'disable') {
+    return `postgresql://postgres:${PASSWORD}@127.0.0.1:${this.port}/${database}?sslmode=${sslMode}`;
+  }
+
+  async createDatabase(database: string) {
+    const client = await this.client('postgres');
+    try {
+      await client.query(`CREATE DATABASE ${database}`);
+    } finally {
+      await client.end();
+    }
+  }
+
+  async activeRevoDatabases() {
+    const client = await this.client('postgres');
+    try {
+      const result = await client.query<{ datname: string }>(
+        `SELECT datname FROM pg_stat_activity
+         WHERE application_name = 'revo' AND pid <> pg_backend_pid()`,
+      );
+      return result.rows.map(({ datname }) => datname);
+    } finally {
+      await client.end();
+    }
+  }
+
+  async terminateRevoSessions() {
+    const client = await this.client('postgres');
+    try {
+      await client.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE application_name = 'revo' AND pid <> pg_backend_pid()`,
+      );
+    } finally {
+      await client.end();
+    }
+  }
+
   async queryRevo(statement: string) {
     const client = await this.client('revo');
     try {

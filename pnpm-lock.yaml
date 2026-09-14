@@ -5,6 +5,10 @@ importers:
 
   .:
     configDependencies: {}
+    dependencies:
+      pg-connection-string:
+        specifier: 2.14.0
+        version: 2.14.0
     packageManagerDependencies:
       pnpm:
         specifier: 12.4.1
@@ -181,6 +185,9 @@ importers:
       pg:
         specifier: 8.22.0
         version: 8.22.0
+      pg-connection-string:
+        specifier: 2.14.0
+        version: 2.14.0
       reflect-metadata:
         specifier: 0.2.2
         version: 0.2.2

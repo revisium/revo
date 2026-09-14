@@ -1,7 +1,7 @@
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
 
 export class BlockingJournal extends StartupProgressJournalWriter {
-  private mode: 'next' | 'postgres-completion' | undefined;
+  private mode: 'next' | 'postgres-completion' | 'external-completion' | undefined;
   private released = false;
   private releaseWrite: (() => void) | undefined;
   private notifyEntered: (() => void) | undefined;
@@ -14,6 +14,10 @@ export class BlockingJournal extends StartupProgressJournalWriter {
 
   blockPostgresCompletion() {
     this.arm('postgres-completion');
+  }
+
+  blockExternalCompletion() {
+    this.arm('external-completion');
   }
 
   release() {
@@ -29,6 +33,9 @@ export class BlockingJournal extends StartupProgressJournalWriter {
       this.mode === 'next' ||
       (this.mode === 'postgres-completion' &&
         event?.phase === 'postgres-start' &&
+        event.status === 'completed') ||
+      (this.mode === 'external-completion' &&
+        event?.phase === 'postgres-connect' &&
         event.status === 'completed');
     if (matches) {
       this.mode = undefined;
@@ -38,7 +45,7 @@ export class BlockingJournal extends StartupProgressJournalWriter {
     return super.write(...parameters);
   }
 
-  private arm(mode: 'next' | 'postgres-completion') {
+  private arm(mode: 'next' | 'postgres-completion' | 'external-completion') {
     this.mode = mode;
     this.released = false;
     this.entered = new Promise((resolve) => {

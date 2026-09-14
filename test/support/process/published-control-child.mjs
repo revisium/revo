@@ -8,9 +8,12 @@ const held = await new PublishedControlService().open({
   onStop: () => undefined,
 });
 process.send?.({ kind: held.kind });
-process.on('message', async (message) => {
+const closeAndExit = async (message) => {
   if (message === 'close' && held.kind === 'held') {
     await held.close();
   }
   process.exit(0);
+};
+process.on('message', (message) => {
+  void closeAndExit(message).then(undefined, () => process.exit(1));
 });

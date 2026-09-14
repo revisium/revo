@@ -9,7 +9,7 @@ if (mode === 'environment') {
 } else if (mode === 'exit') {
   process.exitCode = Number(value);
 } else if (mode === 'marker') {
-  await writeFile(String(value), 'spawned');
+  await writeFile(value, 'spawned');
 } else if (mode === 'term') {
   process.on('SIGTERM', () => process.exit(0));
   process.on('message', () => process.send({ state: 'ready' }));

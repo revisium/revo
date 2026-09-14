@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { Inject, Injectable } from '@nestjs/common';
 
 import { EmbeddedPostgresResourceService } from '../postgres/embedded-postgres-resource.service.js';
+import { ExternalPostgresResourceService } from '../postgres/external-postgres-resource.service.js';
 import { OwnedStartupProgress } from '../startup-progress/startup-progress-facade.js';
 import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
 import {
@@ -39,6 +40,8 @@ export class PublishedControlService {
     private readonly progressJournal = new StartupProgressJournalWriter(),
     @Inject(EmbeddedPostgresResourceService)
     private readonly postgres = new EmbeddedPostgresResourceService(),
+    @Inject(ExternalPostgresResourceService)
+    private readonly externalPostgres = new ExternalPostgresResourceService(),
   ) {}
 
   async open(request: OpenPublishedControlRequest): Promise<PublishedControl> {
@@ -65,7 +68,17 @@ export class PublishedControlService {
       const progress = request.startupProgress
         ? new OwnedStartupProgress(this.progressJournal, canonicalDataDir, request.startupProgress)
         : undefined;
-      const postgres = progress ? this.postgres.bind(canonicalDataDir, progress) : undefined;
+      let postgres:
+        | ReturnType<ExternalPostgresResourceService['bind']>
+        | ReturnType<EmbeddedPostgresResourceService['bind']>
+        | undefined;
+      if (progress) {
+        if (request.databaseUrl !== undefined) {
+          postgres = this.externalPostgres.bind(request.databaseUrl, progress);
+        } else {
+          postgres = this.postgres.bind(canonicalDataDir, progress);
+        }
+      }
       await progress?.initialize();
       const record = {
         schemaVersion: 1 as const,
@@ -101,33 +114,41 @@ export class PublishedControlService {
         }
         return finalClose;
       };
-      return {
-        kind: 'held',
+      const close = async () => {
+        const postgresClose = postgres?.close();
+        progressClose ??= progress?.close();
+        try {
+          await postgresClose;
+        } catch {
+          if (finalClose) {
+            if (finalState !== 'pending') {
+              await finalClose;
+              return;
+            }
+            throw new PublishedControlError('close');
+          }
+          void finalize().catch(() => undefined);
+          throw new PublishedControlError('close');
+        }
+        await finalize();
+      };
+      const common = {
+        kind: 'held' as const,
         endpoint: createdEndpoint.endpoint,
         stopResult: createdEndpoint.stopResult,
         ...(progress ? { progress } : {}),
-        ...(postgres
+        ...(postgres ? { startDatabase: postgres.start.bind(postgres) } : {}),
+        close,
+      };
+      if (request.databaseUrl !== undefined) {
+        return { ...common, databaseKind: 'external' };
+      }
+      return {
+        ...common,
+        databaseKind: 'embedded',
+        ...(postgres && 'prepareEmbeddedPostgres' in postgres
           ? { prepareEmbeddedPostgres: postgres.prepareEmbeddedPostgres.bind(postgres) }
           : {}),
-        ...(postgres ? { startDatabase: postgres.start.bind(postgres) } : {}),
-        close: async () => {
-          const postgresClose = postgres?.close();
-          progressClose ??= progress?.close();
-          try {
-            await postgresClose;
-          } catch {
-            if (finalClose) {
-              if (finalState !== 'pending') {
-                await finalClose;
-                return;
-              }
-              throw new PublishedControlError('close');
-            }
-            void finalize().catch(() => undefined);
-            throw new PublishedControlError('close');
-          }
-          await finalize();
-        },
       };
     } catch {
       throw new PublishedControlError(
