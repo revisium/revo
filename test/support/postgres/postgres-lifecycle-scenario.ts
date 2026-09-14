@@ -36,20 +36,38 @@ export class PostgresLifecycleScenario {
 
   async persistsAcrossOwnedRestart() {
     const fixture = await this.fixture();
-    const firstOwner = await this.open(fixture, FIRST_OPERATION);
+    const processes = new TrackedPostgresProcesses();
+    const resource = new EmbeddedPostgresResourceService(
+      new EmbeddedPostgresPreparationService(processes),
+      processes,
+    );
+    const firstOwner = await this.open(fixture, FIRST_OPERATION, undefined, resource);
     const first = await this.start(firstOwner);
     if (first.kind !== 'embedded') {
       throw new Error('embedded database missing');
     }
+    const firstCompletion = processes.completion!;
     await this.query(fixture.dataDir, first.port, [
       'CREATE TABLE durable_value (value text NOT NULL)',
       "INSERT INTO durable_value (value) VALUES ('survives restart')",
     ]);
     const coalesced = await this.start(firstOwner);
     await firstOwner.close();
+    const firstStop = await firstCompletion;
 
     const secondOwner = await this.open(fixture, SECOND_OPERATION);
-    const second = await this.start(secondOwner);
+    const second = await this.start(secondOwner).catch((error: unknown) => {
+      try {
+        console.error(
+          JSON.stringify({
+            firstStop: { exitCode: firstStop.exitCode, signal: firstStop.signal },
+          }),
+        );
+      } catch {
+        // Diagnostic reporting must not mask the original start failure.
+      }
+      throw error;
+    });
     if (second.kind !== 'embedded') {
       throw new Error('embedded database missing');
     }
