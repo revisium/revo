@@ -65,6 +65,7 @@ export class PublishedControlService {
         token,
         ...(request.limits ? { limits: request.limits } : {}),
         onStop: request.onStop,
+        ...(request.onStatus ? { onStatus: request.onStatus } : {}),
         identity: { version: request.version, channel: request.channel, canonicalDataDir, process },
       });
       endpoint = createdEndpoint;

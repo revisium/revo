@@ -26,6 +26,8 @@ import {
   ServerOwnerResource,
   ServerOwnerService,
 } from '../../../src/server/server-owner.service.js';
+import { ServerStatusService } from '../../../src/server/server-status.service.js';
+import { ServerStopService } from '../../../src/server/server-stop.service.js';
 import { ServerModule } from '../../../src/server/server.module.js';
 import {
   StartupProgressDiscoveryService,
@@ -78,7 +80,11 @@ export class ServerOwnerScenario {
       logger: false,
     });
     try {
-      return application.get(ServerOwnerService) instanceof ServerOwnerService;
+      return (
+        application.get(ServerOwnerService) instanceof ServerOwnerService &&
+        application.get(ServerStatusService) instanceof ServerStatusService &&
+        application.get(ServerStopService) instanceof ServerStopService
+      );
     } finally {
       await application.close();
     }
@@ -88,9 +94,10 @@ export class ServerOwnerScenario {
     const first = await this.open(this.nextOperation());
     await first.start(new AbortController().signal);
     await first.close();
+    const stopped = first.status();
     const second = await this.open(this.nextOperation());
     const ready = await second.start(new AbortController().signal);
-    return { ready, owners: this.owners.length };
+    return { ready, owners: this.owners.length, stopped };
   }
 
   async stopsThroughPublishedControl() {
@@ -127,13 +134,18 @@ export class ServerOwnerScenario {
     try {
       await waitBounded(journal.entered);
       closing = controlled.owner.close();
+      const statusWhileClosing = controlled.owner.status();
       await waitBounded(controlled.processes.completed);
       const contender = await new ServerOwnershipService().acquire(this.dataDir);
       const contenderKind = contender.kind;
       if (contender.kind === 'held') {
         await contender.release();
       }
-      return { contender: contenderKind, coreCompleted: controlled.processes.completionObserved };
+      return {
+        contender: contenderKind,
+        coreCompleted: controlled.processes.completionObserved,
+        statusWhileClosing,
+      };
     } finally {
       journal.release();
       await closing;
@@ -145,6 +157,7 @@ export class ServerOwnerScenario {
     const controlled = await this.controlledOwner(new OwnerJournal(), true);
     await controlled.owner.start(new AbortController().signal);
     const first = await Promise.allSettled([controlled.owner.close()]);
+    const failedStatus = controlled.owner.status();
     const outcome = await controlled.owner.outcome();
     const contender = await new ServerOwnershipService().acquire(this.dataDir);
     await controlled.owner.close();
@@ -158,6 +171,7 @@ export class ServerOwnerScenario {
       replacement: replacement.kind,
       starts: controlled.processes.startCalls,
       outcome,
+      failedStatus,
     };
   }
 

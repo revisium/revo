@@ -1,11 +1,16 @@
 import type { Stats } from 'node:fs';
-import { mkdir, open, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
 import { PosixFlockAdapter, type NativeLock } from './adapters/posix-flock.adapter.js';
-import type { HeldServerOwnership, ServerOwnership } from './ownership.types.js';
+import type {
+  HeldServerOwnership,
+  ServerOwnership,
+  ServerOwnershipInspection,
+} from './ownership.types.js';
 
 const PRIVATE_PERMISSIONS = 0o077;
 
@@ -34,6 +39,51 @@ export class ServerOwnershipService {
     }
 
     return this.lease(file, nativeLock, lockPath);
+  }
+
+  async inspect(dataDir: string): Promise<ServerOwnershipInspection> {
+    let canonicalDataDir: string;
+    try {
+      canonicalDataDir = await realpath(dataDir);
+      const metadata = await stat(canonicalDataDir);
+      this.validateOwnerAndMode(metadata, canonicalDataDir, true);
+    } catch (error) {
+      return errorCode(error) === 'ENOENT' ? { kind: 'missing' } : { kind: 'unavailable' };
+    }
+    const lockPath = path.join(canonicalDataDir, '.revo-server.lock');
+    let file: FileHandle;
+    try {
+      file = await open(lockPath, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch (error) {
+      return errorCode(error) === 'ENOENT' ? { kind: 'missing' } : { kind: 'unavailable' };
+    }
+    let result: ServerOwnershipInspection;
+    try {
+      await this.validateOwnedPrivateFile(file, lockPath);
+      const [descriptor, pathname] = await Promise.all([file.stat(), lstat(lockPath)]);
+      if (
+        !pathname.isFile() ||
+        descriptor.dev !== pathname.dev ||
+        descriptor.ino !== pathname.ino
+      ) {
+        throw new Error('Server ownership path changed during inspection');
+      }
+      const nativeLock = await this.flock.lock(file);
+      if (nativeLock === undefined) {
+        result = { kind: 'busy', lockPath };
+      } else {
+        nativeLock.unlock();
+        result = { kind: 'free', lockPath };
+      }
+    } catch {
+      result = { kind: 'unavailable' };
+    }
+    try {
+      await file.close();
+    } catch {
+      return { kind: 'unavailable' };
+    }
+    return result;
   }
 
   private async prepareDataDirectory(dataDir: string): Promise<string> {
@@ -100,3 +150,6 @@ export class ServerOwnershipService {
     }
   }
 }
+
+const errorCode = (error: unknown) =>
+  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

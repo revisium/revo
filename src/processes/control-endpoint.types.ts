@@ -16,6 +16,16 @@ export interface ControlLimits {
   readonly maxFrameBytes: number;
 }
 
+export type ControlServerStatus = {
+  readonly phase: 'starting' | 'running' | 'stopping' | 'stopped' | 'failed' | 'unknown';
+  readonly code?: string;
+  readonly operationId?: string;
+  readonly host?: string;
+  readonly port?: number;
+  readonly publicUrl?: string;
+  readonly ownership?: 'retained' | 'unconfirmed';
+};
+
 export interface ListenControlEndpointRequest {
   readonly runtimeDir: string;
   readonly instanceId: string;
@@ -23,6 +33,7 @@ export interface ListenControlEndpointRequest {
   readonly identity: Omit<ControlRecord, 'schemaVersion' | 'instanceId' | 'token' | 'endpoint'>;
   readonly limits?: ControlLimits;
   readonly onStop: () => ControlStopCompletion | void | Promise<ControlStopCompletion | void>;
+  readonly onStatus?: () => ControlServerStatus | Promise<ControlServerStatus>;
 }
 
 export type ControlStopCompletion =
@@ -36,6 +47,8 @@ export type ControlStopResponse =
       readonly ownership: 'retained' | 'unconfirmed';
       readonly error: SafeControlStopError;
     };
+
+export type ControlStatusResponse = ControlServerStatus;
 
 export type ControlStopDeliveryResult = { readonly kind: 'sent' } | { readonly kind: 'failed' };
 

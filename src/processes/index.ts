@@ -7,6 +7,7 @@ export type {
   ControlLimits,
   ControlRecord,
   ControlStopCompletion,
+  ControlStatusResponse,
   ControlStopDeliveryResult,
   ControlStopResponse,
   ControlStopResult,

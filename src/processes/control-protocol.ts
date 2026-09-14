@@ -11,7 +11,7 @@ const exact = (value: Record<string, unknown>, keys: string[]) =>
   Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 
-export type ControlAction = 'probe' | 'stop' | 'stop-and-wait';
+export type ControlAction = 'probe' | 'status' | 'stop' | 'stop-and-wait';
 export interface ControlRequest {
   readonly schemaVersion: 1;
   readonly instanceId: string;
@@ -77,7 +77,10 @@ export function parseControlRequest(value: unknown): ControlRequest | undefined 
     !HEX32.test(value.instanceId) ||
     typeof value.token !== 'string' ||
     !HEX64.test(value.token) ||
-    (value.action !== 'probe' && value.action !== 'stop' && value.action !== 'stop-and-wait')
+    (value.action !== 'probe' &&
+      value.action !== 'status' &&
+      value.action !== 'stop' &&
+      value.action !== 'stop-and-wait')
   ) {
     return undefined;
   }

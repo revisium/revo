@@ -1,4 +1,4 @@
-import { connect } from 'node:net';
+import { connect, isIP } from 'node:net';
 
 import { Injectable } from '@nestjs/common';
 
@@ -7,6 +7,7 @@ import {
   type ControlLimits,
   type ControlRecord,
   type ControlStopResponse,
+  type ControlStatusResponse,
 } from './control-endpoint.types.js';
 import { ControlTransportError, parseControlRecord, validateLimits } from './control-protocol.js';
 
@@ -40,6 +41,24 @@ export class ControlClientService {
       throw new ControlTransportError();
     }
     return { kind: 'accepted' as const };
+  }
+
+  async requestStatus(
+    recordValue: unknown,
+    limits: ControlLimits = DEFAULT_CONTROL_LIMITS,
+  ): Promise<ControlStatusResponse> {
+    const record = requireRecord(recordValue, limits);
+    const response = await exchange(record, 'status', limits);
+    if (
+      !isObject(response) ||
+      Object.keys(response).length !== 3 ||
+      response.schemaVersion !== 1 ||
+      response.ok !== true ||
+      !isObject(response.status)
+    ) {
+      throw new ControlTransportError();
+    }
+    return parseStatus(response.status);
   }
 
   async requestStopAndWait(
@@ -199,7 +218,11 @@ function requireRecord(value: unknown, limits: ControlLimits): ControlRecord {
   return record;
 }
 
-function exchange(record: ControlRecord, action: 'probe' | 'stop', limits: ControlLimits) {
+function exchange(
+  record: ControlRecord,
+  action: 'probe' | 'status' | 'stop',
+  limits: ControlLimits,
+) {
   return new Promise<unknown>((resolve, reject) => {
     const socket = connect(record.endpoint);
     let data = Buffer.alloc(0);
@@ -250,3 +273,90 @@ function exchange(record: ControlRecord, action: 'probe' | 'stop', limits: Contr
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+function parseStatus(value: Record<string, unknown>): ControlStatusResponse {
+  if (value.phase === 'unknown' && exactKeys(value, ['phase'])) {
+    return { phase: 'unknown' };
+  }
+  const operationId = value.operationId;
+  if (typeof operationId !== 'string' || !/^[0-9a-f]{32}$/u.test(operationId)) {
+    throw new ControlTransportError();
+  }
+  if (value.phase === 'running') {
+    if (!exactKeys(value, ['phase', 'operationId', 'host', 'port', 'publicUrl'])) {
+      throw new ControlTransportError();
+    }
+    const host = localHost(value.host);
+    const publicUrl = publicOrigin(value.publicUrl);
+    if (
+      !host ||
+      typeof value.port !== 'number' ||
+      !Number.isInteger(value.port) ||
+      value.port < 1 ||
+      value.port > 65_535
+    ) {
+      throw new ControlTransportError();
+    }
+    return { phase: 'running', operationId, host, port: value.port, publicUrl };
+  }
+  if (value.phase === 'failed') {
+    if (
+      !exactKeys(value, ['phase', 'operationId', 'code', 'ownership']) ||
+      typeof value.code !== 'string' ||
+      !/^[a-z0-9][a-z0-9.-]{0,127}$/u.test(value.code) ||
+      (value.ownership !== 'retained' && value.ownership !== 'unconfirmed')
+    ) {
+      throw new ControlTransportError();
+    }
+    return { phase: 'failed', operationId, code: value.code, ownership: value.ownership };
+  }
+  if (
+    (value.phase === 'starting' || value.phase === 'stopping' || value.phase === 'stopped') &&
+    exactKeys(value, ['phase', 'operationId'])
+  ) {
+    return { phase: value.phase, operationId };
+  }
+  throw new ControlTransportError();
+}
+
+const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) =>
+  Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+
+function localHost(value: unknown): string | undefined {
+  if (value === '0.0.0.0' || value === '::') {
+    return '127.0.0.1';
+  }
+  if (typeof value !== 'string' || value.length > 253 || /[/?#@[\]]/u.test(value)) {
+    return undefined;
+  }
+  if (isIP(value)) {
+    return value;
+  }
+  return value
+    .split('.')
+    .every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/u.test(label))
+    ? value
+    : undefined;
+}
+
+function publicOrigin(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 2_048) {
+    throw new ControlTransportError();
+  }
+  try {
+    const url = new URL(value);
+    if (
+      (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      url.pathname !== '/'
+    ) {
+      throw new ControlTransportError();
+    }
+    return url.origin;
+  } catch {
+    throw new ControlTransportError();
+  }
+}

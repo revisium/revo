@@ -8,6 +8,7 @@ import type { StartupProgressFacade, StartupProgressOptions } from '../startup-p
 import type {
   ControlRecord,
   ControlStopCompletion,
+  ControlServerStatus,
   ControlStopDeliveryResult,
   ControlStopResult,
 } from './control-endpoint.types.js';
@@ -25,6 +26,7 @@ export interface OpenPublishedControlRequest {
   readonly channel: string;
   readonly limits?: import('./control-endpoint.types.js').ControlLimits;
   readonly onStop: () => ControlStopCompletion | void | Promise<ControlStopCompletion | void>;
+  readonly onStatus?: () => ControlServerStatus | Promise<ControlServerStatus>;
   readonly startupProgress?: StartupProgressOptions;
   readonly databaseUrl?: string;
 }

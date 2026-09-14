@@ -18,7 +18,10 @@ import {
   type StartedDatabase,
 } from '../postgres/index.js';
 import type { PublishedControl } from '../processes/control-discovery.types.js';
-import type { ControlStopCompletion } from '../processes/control-endpoint.types.js';
+import type {
+  ControlServerStatus,
+  ControlStopCompletion,
+} from '../processes/control-endpoint.types.js';
 import {
   PublishedControlError,
   PublishedControlService,
@@ -130,6 +133,7 @@ export class ServerOwnerService {
           }
           return operation;
         },
+        onStatus: () => owner?.status() ?? { phase: 'starting', operationId: request.operationId },
       });
     } catch (error) {
       rejectOwner(new ServerOwnerError('revo.server-owner.stop'));
@@ -158,6 +162,9 @@ export class ServerOwnerResource {
   private readonly outcomeOperation: Promise<ServerOwnerOutcome>;
   private resolveOutcome: ((outcome: ServerOwnerOutcome) => void) | undefined;
   private retryableCloseFailure = false;
+  private effectiveListener: { readonly host: string; readonly port: number } | undefined;
+  private lifecyclePhase: 'starting' | 'running' | 'stopping' | 'stopped' | 'failed' = 'starting';
+  private failureOwnership: 'retained' | 'unconfirmed' = 'unconfirmed';
 
   constructor(
     private readonly request: OpenServerOwnerRequest,
@@ -181,6 +188,9 @@ export class ServerOwnerResource {
   close(): Promise<void> {
     this.controller.abort();
     if (!this.closeOperation) {
+      if (this.lifecyclePhase !== 'stopped') {
+        this.lifecyclePhase = 'stopping';
+      }
       const operation = this.performClose();
       this.closeOperation = operation;
       void operation.catch(() => {
@@ -206,6 +216,27 @@ export class ServerOwnerResource {
 
   outcome(): Promise<ServerOwnerOutcome> {
     return this.outcomeOperation;
+  }
+
+  status(): ControlServerStatus {
+    if (this.lifecyclePhase === 'running' && this.effectiveListener) {
+      return {
+        phase: 'running',
+        operationId: this.request.operationId,
+        host: this.effectiveListener.host,
+        port: this.effectiveListener.port,
+        publicUrl: this.request.configuration.publicUrl,
+      };
+    }
+    if (this.lifecyclePhase === 'failed') {
+      return {
+        phase: 'failed',
+        code: this.failureCode ?? 'revo.server-owner.stop',
+        operationId: this.request.operationId,
+        ownership: this.failureOwnership,
+      };
+    }
+    return { phase: this.lifecyclePhase, operationId: this.request.operationId };
   }
 
   private async performStart(callerSignal: AbortSignal): Promise<ServerOwnerReady> {
@@ -250,6 +281,7 @@ export class ServerOwnerResource {
           onStage: (message) => this.persistStage(message),
         },
       );
+      this.effectiveListener = { host: listening.host, port: listening.port };
       this.observeCoreCompletion();
       await this.probe(listening.host, listening.port, signal, deadline);
       this.core.assertRunning();
@@ -261,6 +293,7 @@ export class ServerOwnerResource {
       this.core.assertRunning();
       rejectUnavailable(signal, deadline);
       this.ready = true;
+      this.lifecyclePhase = 'running';
       return { kind: 'ready', url: this.request.configuration.publicUrl };
     } catch (error) {
       const primary = normalizeOwnerError(error, signal);
@@ -361,6 +394,8 @@ export class ServerOwnerResource {
         await this.core.completionState();
       } catch {
         this.retryableCloseFailure = true;
+        this.lifecyclePhase = 'failed';
+        this.failureOwnership = 'retained';
         this.resolveFailure(this.failureCode ?? 'revo.server-owner.stop', 'retained');
         throw new ServerOwnerError('revo.server-owner.stop');
       }
@@ -370,6 +405,8 @@ export class ServerOwnerResource {
     } catch (error) {
       const ownership = error instanceof PublishedControlError ? error.ownership : 'unconfirmed';
       this.retryableCloseFailure = ownership === 'retained';
+      this.lifecyclePhase = 'failed';
+      this.failureOwnership = ownership === 'retained' ? 'retained' : 'unconfirmed';
       this.resolveFailure(
         this.failureCode ?? 'revo.server-owner.stop',
         ownership === 'released' ? 'completed' : ownership,
@@ -377,8 +414,11 @@ export class ServerOwnerResource {
       throw new ServerOwnerError('revo.server-owner.stop');
     }
     if (this.failureCode) {
+      this.lifecyclePhase = 'failed';
+      this.failureOwnership = 'unconfirmed';
       this.resolveFailure(this.failureCode, 'completed');
     } else {
+      this.lifecyclePhase = 'stopped';
       this.resolveOutcome?.({ kind: 'stopped' });
       this.resolveOutcome = undefined;
     }

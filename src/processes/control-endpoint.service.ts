@@ -9,6 +9,7 @@ import {
   DEFAULT_CONTROL_LIMITS,
   type ControlLimits,
   type ControlRecord,
+  type ControlServerStatus,
   type ControlStopCompletion,
   type ControlStopDeliveryResult,
   type ControlStopResult,
@@ -56,6 +57,7 @@ export class ControlEndpointService {
         socket,
         record,
         limits,
+        request.onStatus,
         () => {
           if (phase !== 'accepting') {
             return undefined;
@@ -151,6 +153,7 @@ export class ControlEndpointService {
     socket: Socket,
     record: ControlRecord,
     limits: ControlLimits,
+    onStatus: (() => ControlServerStatus | Promise<ControlServerStatus>) | undefined,
     acceptStop: () => (() => Promise<ControlStopCompletion>) | undefined,
     releaseResponder: () => void,
     completeStop: (completion: ControlStopCompletion) => Promise<void>,
@@ -171,6 +174,11 @@ export class ControlEndpointService {
       if (request.action === 'probe') {
         const { token: _token, endpoint: _endpoint, ...facts } = record;
         await writeFrame(socket, { schemaVersion: 1, ok: true, facts }, limits, deadline);
+        return;
+      }
+      if (request.action === 'status') {
+        const status = (await onStatus?.()) ?? { phase: 'unknown' as const };
+        await writeFrame(socket, { schemaVersion: 1, ok: true, status }, limits, deadline);
         return;
       }
       const waitForCompletion = request.action === 'stop-and-wait';
