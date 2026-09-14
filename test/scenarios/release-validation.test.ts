@@ -12,6 +12,8 @@ import {
 } from '../../src/installation/release-policy.js';
 import { parseInstallationReleaseManifest } from '../../src/installation/release-validation.js';
 import {
+  futureReleaseManifestFixture,
+  futureReleasePolicyFixture,
   releaseManifestFixture,
   releasePolicyFixture,
 } from '../support/installation/release-manifest-fixture.js';
@@ -33,6 +35,30 @@ const installerAdapter = async (): Promise<InstallerAdapter> => {
 };
 
 describe('installation release contract', () => {
+  it('decodes a v2 manifest carrying the complete pinned Node archive set', () => {
+    const fixture = futureReleaseManifestFixture();
+
+    expect(parseInstallationReleaseManifest(fixture.manifest)).toEqual(fixture.manifest);
+  });
+
+  it.each(['nodeArchive', 'nodeShasums'] as const)(
+    'accepts v2 only when every %s URL matches its policy locator',
+    (locator) => {
+      const policy = futureReleasePolicyFixture({ supportedSchemaVersions: ['revo-install/v2'] });
+      const fixture = futureReleaseManifestFixture({ policy });
+      expect(validateInstallationReleaseManifest(fixture.manifest, policy)).toEqual(
+        fixture.manifest,
+      );
+      const mismatched = {
+        ...policy,
+        locators: { ...policy.locators, [locator]: () => 'https://invalid.example/archive' },
+      };
+      expect(() => validateInstallationReleaseManifest(fixture.manifest, mismatched)).toThrow(
+        /Node|node/,
+      );
+    },
+  );
+
   it.each([
     {
       release: '2.7.1',
