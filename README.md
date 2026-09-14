@@ -32,8 +32,10 @@ stages.
 ## External PostgreSQL TLS
 
 External PostgreSQL URLs use TLS verification by default; `sslmode=disable` is the only explicit
-override. Private CA bundles and mutual TLS credentials are intentionally outside the first
-external-connection scope and will require a separately designed configuration contract.
+override. Full Core startup with a TLS IP-literal host is currently blocked by a published upstream
+PostgreSQL hostname-verification defect and is not ready or supported for that scenario. Private CA
+bundles and mutual TLS credentials remain outside the first external-connection scope and require a
+separately designed configuration contract.
 
 ## CLI
 

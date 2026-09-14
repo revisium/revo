@@ -65,12 +65,16 @@ class ControlledProcesses extends ManagedProcessService {
     pendingSpawn: boolean,
     heldSend = false,
     private readonly failFirstStop = false,
+    rejectSpawn = false,
   ) {
     super();
     this.child = new ControlledProcess(heldSend);
-    this.started = pendingSpawn
-      ? new Promise((resolveStart) => (this.releaseStart = () => resolveStart(this.child)))
-      : Promise.resolve(this.child);
+    this.started = rejectSpawn
+      ? Promise.reject(new Error('fixture spawn rejection'))
+      : pendingSpawn
+        ? new Promise((resolveStart) => (this.releaseStart = () => resolveStart(this.child)))
+        : Promise.resolve(this.child);
+    void this.started.catch(() => undefined);
   }
 
   override start(_request: ManagedProcessRequest) {
@@ -131,8 +135,8 @@ export class CoreHostProcessScenario {
     return resource;
   }
 
-  controlled(pendingSpawn: boolean, heldSend = false, failFirstStop = false) {
-    const processes = new ControlledProcesses(pendingSpawn, heldSend, failFirstStop);
+  controlled(pendingSpawn: boolean, heldSend = false, failFirstStop = false, rejectSpawn = false) {
+    const processes = new ControlledProcesses(pendingSpawn, heldSend, failFirstStop, rejectSpawn);
     const resource = new CoreHostProcessService(processes).open({
       executable: process.execPath,
       entry: CHILD,

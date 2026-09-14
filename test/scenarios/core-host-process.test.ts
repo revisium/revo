@@ -77,6 +77,10 @@ describe('Core host process resource', () => {
       ),
     ).rejects.toMatchObject({ code: expect.stringContaining('revo.core-host') });
     expect(controlled.processes.startCalls).toBe(0);
+    await expect(scenario.close(controlled.resource)).resolves.toBeUndefined();
+    await expect(controlled.resource.completionState()).resolves.toEqual({
+      kind: 'not-spawned',
+    });
   });
 
   it('bounds pending-spawn abort and retains cleanup ownership', async () => {
@@ -94,6 +98,18 @@ describe('Core host process resource', () => {
     await expect(controlled.resource.settled()).resolves.toEqual({
       exitCode: null,
       signal: 'SIGTERM',
+    });
+  });
+
+  it('closes a definitively rejected spawn as not spawned', async () => {
+    const controlled = scenario.controlled(false, false, false, true);
+
+    await expect(scenario.start(controlled.resource)).rejects.toMatchObject({
+      code: expect.stringContaining('revo.core-host'),
+    });
+    await expect(scenario.close(controlled.resource)).resolves.toBeUndefined();
+    await expect(controlled.resource.completionState()).resolves.toEqual({
+      kind: 'not-spawned',
     });
   });
 

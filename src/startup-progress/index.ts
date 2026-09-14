@@ -12,4 +12,5 @@ export type {
   StartupProgressFacade,
   StartupProgressOptions,
   StartupProgressRead,
+  StartupReadyContext,
 } from './startup-progress.types.js';
