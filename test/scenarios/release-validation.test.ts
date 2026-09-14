@@ -11,6 +11,26 @@ import {
 import { releaseManifestFixture } from '../support/installation/release-manifest-fixture.js';
 
 describe('installation release contract', () => {
+  it.each([
+    {
+      release: '2.7.1',
+      versions: { core: '4.3.2', admin: '5.4.3', node: '28.1.0', pnpm: '13.0.2' },
+    },
+    {
+      release: '3.0.0',
+      versions: {
+        core: '6.0.0-beta.2',
+        admin: '7.8.9+build.4',
+        node: '30.0.0-rc.1',
+        pnpm: '14.2.1',
+      },
+    },
+  ])('preserves valid release-specific versions for release $release', ({ release, versions }) => {
+    const fixture = releaseManifestFixture('stable', release, versions);
+
+    expect(parseInstallationReleaseManifest(fixture.manifest)).toEqual(fixture.manifest);
+  });
+
   it.each(['stable', 'alpha'] as const)(
     'accepts a valid %s manifest and verifies every artifact',
     (channel) => {
