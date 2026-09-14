@@ -369,7 +369,7 @@ export class CoreHostProcessResource {
   }
 
   private wake(): void {
-    for (const wakeup of [...this.wakeups]) {
+    for (const wakeup of this.wakeups) {
       wakeup();
     }
   }
