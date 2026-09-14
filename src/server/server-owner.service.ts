@@ -14,7 +14,11 @@ import {
 import { readEmbeddedPostgresCredential } from '../postgres/embedded-postgres-preparation.service.js';
 import type { StartedDatabase } from '../postgres/index.js';
 import type { PublishedControl } from '../processes/control-discovery.types.js';
-import { PublishedControlService } from '../processes/published-control.service.js';
+import type { ControlStopCompletion } from '../processes/control-endpoint.types.js';
+import {
+  PublishedControlError,
+  PublishedControlService,
+} from '../processes/published-control.service.js';
 
 const CORE_ENTRY = fileURLToPath(new URL('../bin/revo-core-host.js', import.meta.url));
 const CLOSE_MILLISECONDS = 5_000;
@@ -53,7 +57,7 @@ export type ServerOwnerOutcome =
   | {
       readonly kind: 'failed';
       readonly code: ServerOwnerErrorCode;
-      readonly cleanup: 'completed' | 'retained';
+      readonly cleanup: 'completed' | 'retained' | 'unconfirmed';
     };
 
 type ServerOwnerErrorCode =
@@ -85,28 +89,44 @@ export class ServerOwnerService {
 
   async open(request: OpenServerOwnerRequest): Promise<OpenServerOwnerResult> {
     let owner: ServerOwnerResource | undefined;
-    let stopRequested = false;
-    const held = await this.controls.open({
-      dataDir: request.configuration.dataDir,
-      runtimeDir: request.configuration.runtimeDir,
-      version: request.configuration.version,
-      channel: request.configuration.channel,
-      ...(request.configuration.databaseUrl !== undefined
-        ? { databaseUrl: request.configuration.databaseUrl }
-        : {}),
-      startupProgress: { operationId: request.operationId, now: request.now ?? Date.now },
-      onStop: () => {
-        stopRequested = true;
-        return owner?.close();
-      },
+    let resolveOwner!: (resource: ServerOwnerResource) => void;
+    let rejectOwner!: (error: Error) => void;
+    let earlyStop: Promise<ControlStopCompletion> | undefined;
+    const ownerAssigned = new Promise<ServerOwnerResource>((resolve, reject) => {
+      resolveOwner = resolve;
+      rejectOwner = reject;
     });
+    void ownerAssigned.catch(() => undefined);
+    let held: PublishedControl;
+    try {
+      held = await this.controls.open({
+        dataDir: request.configuration.dataDir,
+        runtimeDir: request.configuration.runtimeDir,
+        version: request.configuration.version,
+        channel: request.configuration.channel,
+        ...(request.configuration.databaseUrl !== undefined
+          ? { databaseUrl: request.configuration.databaseUrl }
+          : {}),
+        startupProgress: { operationId: request.operationId, now: request.now ?? Date.now },
+        onStop: () => {
+          const operation = (async () => (owner ?? (await ownerAssigned)).stopFromControl())();
+          if (!owner) {
+            earlyStop = operation;
+          }
+          return operation;
+        },
+      });
+    } catch (error) {
+      rejectOwner(new ServerOwnerError('revo.server-owner.stop'));
+      throw error;
+    }
     if (held.kind === 'busy') {
+      rejectOwner(new ServerOwnerError('revo.server-owner.stop'));
       return held;
     }
     owner = new ServerOwnerResource(request, held, this.coreHosts);
-    if (stopRequested) {
-      await owner.close();
-    }
+    resolveOwner(owner);
+    await earlyStop;
     return owner;
   }
 }
@@ -122,6 +142,7 @@ export class ServerOwnerResource {
   private failureCode: ServerOwnerErrorCode | undefined;
   private readonly outcomeOperation: Promise<ServerOwnerOutcome>;
   private resolveOutcome: ((outcome: ServerOwnerOutcome) => void) | undefined;
+  private retryableCloseFailure = false;
 
   constructor(
     private readonly request: OpenServerOwnerRequest,
@@ -148,12 +169,24 @@ export class ServerOwnerResource {
       const operation = this.performClose();
       this.closeOperation = operation;
       void operation.catch(() => {
-        if (this.closeOperation === operation) {
+        if (this.closeOperation === operation && this.retryableCloseFailure) {
           this.closeOperation = undefined;
         }
       });
     }
     return this.closeOperation;
+  }
+
+  async stopFromControl() {
+    try {
+      await this.close();
+      return { kind: 'completed' as const };
+    } catch {
+      return {
+        kind: 'failed' as const,
+        ownership: this.retryableCloseFailure ? ('retained' as const) : ('unconfirmed' as const),
+      };
+    }
   }
 
   outcome(): Promise<ServerOwnerOutcome> {
@@ -308,14 +341,20 @@ export class ServerOwnerResource {
         await this.core.close(Date.now() + CLOSE_MILLISECONDS);
         await this.core.completionState();
       } catch {
+        this.retryableCloseFailure = true;
         this.resolveFailure(this.failureCode ?? 'revo.server-owner.stop', 'retained');
         throw new ServerOwnerError('revo.server-owner.stop');
       }
     }
     try {
       await this.held.close();
-    } catch {
-      this.resolveFailure(this.failureCode ?? 'revo.server-owner.stop', 'retained');
+    } catch (error) {
+      const ownership = error instanceof PublishedControlError ? error.ownership : 'unconfirmed';
+      this.retryableCloseFailure = ownership === 'retained';
+      this.resolveFailure(
+        this.failureCode ?? 'revo.server-owner.stop',
+        ownership === 'released' ? 'completed' : ownership,
+      );
       throw new ServerOwnerError('revo.server-owner.stop');
     }
     if (this.failureCode) {
@@ -353,7 +392,10 @@ export class ServerOwnerResource {
     );
   }
 
-  private resolveFailure(code: ServerOwnerErrorCode, cleanup: 'completed' | 'retained') {
+  private resolveFailure(
+    code: ServerOwnerErrorCode,
+    cleanup: 'completed' | 'retained' | 'unconfirmed',
+  ) {
     this.resolveOutcome?.({ kind: 'failed', code, cleanup });
     this.resolveOutcome = undefined;
   }

@@ -13,7 +13,10 @@ import type {
   ProcessCancellationResult,
   ProcessCompletion,
 } from '../../../src/processes/managed-process.types.js';
-import { PublishedControlService } from '../../../src/processes/published-control.service.js';
+import {
+  PublishedControlError,
+  PublishedControlService,
+} from '../../../src/processes/published-control.service.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
 import { BlockingJournal } from '../startup-progress/blocking-journal.js';
 
@@ -134,7 +137,7 @@ export class PostgresScenario {
       await journal.entered;
       const firstClosePending = held.close().then(
         () => 'resolved',
-        () => 'rejected',
+        (error: unknown) => closeFailure(error),
       );
       const secondClose = await Promise.race([
         held.close().then(
@@ -149,7 +152,7 @@ export class PostgresScenario {
       const beforeDrain = await this.open(fixture);
       const beforeDrainClose = await held.close().then(
         () => 'resolved',
-        () => 'rejected',
+        (error: unknown) => closeFailure(error),
       );
       journal.release();
       await pendingProgress;
@@ -162,7 +165,8 @@ export class PostgresScenario {
       if (replacement.kind !== 'held') {
         throw new Error('replacement owner missing');
       }
-      await held.close();
+      const oldClose = await held.close().then(() => 'resolved' as const);
+      const successorStillHeld = await this.open(fixture);
       const retained = await Promise.all([
         lstat(join(fixture.dataDir, 'postgres')).then(
           () => true,
@@ -183,6 +187,8 @@ export class PostgresScenario {
         beforeDrain: beforeDrain.kind,
         beforeDrainClose,
         replacement: replacement.kind,
+        oldClose,
+        successorStillHeld: successorStillHeld.kind,
         retained,
         secretByPathOnly: process.request?.args.some((value) => value.includes('--pwfile=')),
         environment: process.request?.env,
@@ -245,6 +251,12 @@ export class PostgresScenario {
       );
     });
   }
+}
+
+function closeFailure(error: unknown) {
+  return error instanceof PublishedControlError
+    ? { status: 'rejected' as const, code: error.code, ownership: error.ownership }
+    : { status: 'rejected' as const, code: 'unexpected', ownership: 'unconfirmed' as const };
 }
 
 class FailingCancellationProcess extends ManagedProcessService {

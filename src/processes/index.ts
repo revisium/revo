@@ -6,6 +6,9 @@ export { ControlTransportError } from './control-protocol.js';
 export type {
   ControlLimits,
   ControlRecord,
+  ControlStopCompletion,
+  ControlStopDeliveryResult,
+  ControlStopResponse,
   ControlStopResult,
   HeldControlEndpoint,
   ListenControlEndpointRequest,

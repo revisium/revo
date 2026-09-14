@@ -16,7 +16,10 @@ import type {
   ProcessMessage,
   StopProcessRequest,
 } from '../../../src/processes/managed-process.types.js';
-import { PublishedControlService } from '../../../src/processes/published-control.service.js';
+import {
+  PublishedControlError,
+  PublishedControlService,
+} from '../../../src/processes/published-control.service.js';
 import { ServerOwnershipService } from '../../../src/processes/server-ownership.service.js';
 import {
   ServerOwnerResource,
@@ -96,7 +99,13 @@ export class ServerOwnerScenario {
     if (discovered.kind !== 'found') {
       throw new Error('Published owner control was not found');
     }
-    await new ControlClientService().requestStop(discovered.record);
+    const completion = await new ControlClientService().requestStopAndWait(
+      discovered.record,
+      140_000,
+    );
+    if (completion.kind !== 'completed') {
+      throw new Error('Published owner control reported failed cleanup');
+    }
     const outcome = await waitBounded(owner.outcome(), 15_000);
     if (outcome.kind !== 'stopped') {
       throw new Error('Published control stop did not fully clean up the owner');
@@ -191,6 +200,42 @@ export class ServerOwnerScenario {
       await replacement.release();
     }
     return { startResult, replacement: replacement.kind, starts: controlled.processes.startCalls };
+  }
+
+  async settlesEarlyStopWhenPublicationFails() {
+    const controls = new EarlyStopFailControlService();
+    const service = new ServerOwnerService(controls, new CoreHostProcessService());
+    const opened = await service
+      .open({
+        configuration: {
+          channel: 'stable',
+          dataDir: this.dataDir,
+          host: '127.0.0.1',
+          port: 0,
+          publicUrl: 'http://127.0.0.1:3210',
+          runtimeDir: this.runtimeDir,
+          startupTimeout: 100,
+          version: '0.0.0',
+        },
+        environment: this.environment(),
+        operationId: this.nextOperation(),
+      })
+      .then(
+        () => 'opened' as const,
+        () => 'publication-failed' as const,
+      );
+    const completion = await waitBounded(controls.completion, 500).then(
+      () => 'resolved' as const,
+      (error: unknown) =>
+        error instanceof Error
+          ? {
+              name: error.name,
+              message: error.message,
+              code: String('code' in error && error.code),
+            }
+          : { name: 'unknown', message: 'unknown', code: 'false' },
+    );
+    return { opened, completion };
   }
 
   async cleansLeaseWhenDatabaseStartFails() {
@@ -448,9 +493,11 @@ class RealLeaseControlService extends PublishedControlService {
     super(undefined, undefined, undefined, undefined, journal);
   }
 
-  override async open(...parameters: Parameters<PublishedControlService['open']>) {
+  override async open(
+    ...parameters: Parameters<PublishedControlService['open']>
+  ): Promise<Awaited<ReturnType<PublishedControlService['open']>>> {
     if (this.stopBeforeOwnerAssignment) {
-      await parameters[0].onStop();
+      void parameters[0].onStop();
     }
     const held = await super.open(...parameters);
     if (held.kind === 'busy') {
@@ -465,11 +512,22 @@ class RealLeaseControlService extends PublishedControlService {
       close: async () => {
         this.closeAttempts += 1;
         if (this.failFirstClose && this.closeAttempts === 1) {
-          throw new Error('Controlled held close failure');
+          throw new PublishedControlError('close', [], 'retained');
         }
         await held.close();
       },
     };
+  }
+}
+
+class EarlyStopFailControlService extends PublishedControlService {
+  completion: Promise<unknown> = Promise.resolve(undefined);
+
+  override async open(
+    ...parameters: Parameters<PublishedControlService['open']>
+  ): Promise<Awaited<ReturnType<PublishedControlService['open']>>> {
+    this.completion = Promise.resolve(parameters[0].onStop());
+    throw new PublishedControlError('startup');
   }
 }
 

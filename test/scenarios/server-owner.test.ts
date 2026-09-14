@@ -128,6 +128,16 @@ describe('Server owner composition', () => {
       starts: 0,
     });
   });
+  it('settles an early accepted stop when control publication fails', async () => {
+    await expect(scenario.settlesEarlyStopWhenPublicationFails()).resolves.toEqual({
+      opened: 'publication-failed',
+      completion: {
+        name: 'ServerOwnerError',
+        message: 'Server owner operation failed.',
+        code: 'revo.server-owner.stop',
+      },
+    });
+  });
 
   it('releases the real held lease when database startup fails before Core opens', async () => {
     await expect(scenario.cleansLeaseWhenDatabaseStartFails()).resolves.toEqual({

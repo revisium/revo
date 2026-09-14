@@ -34,14 +34,24 @@ describe('embedded PostgreSQL provision', () => {
 
   it('cancels and drains owned initialization before releasing ownership', async () => {
     await expect(scenario.closeCancelsOwnedInitialization()).resolves.toEqual({
-      firstClose: 'rejected',
+      firstClose: {
+        status: 'rejected',
+        code: 'PUBLISHED_CONTROL_ERROR',
+        ownership: 'retained',
+      },
       secondClose: 'rejected',
       outcome: 'rejected',
       coalesced: true,
       busy: 'busy',
       beforeDrain: 'busy',
-      beforeDrainClose: 'rejected',
+      beforeDrainClose: {
+        status: 'rejected',
+        code: 'PUBLISHED_CONTROL_ERROR',
+        ownership: 'retained',
+      },
       replacement: 'held',
+      oldClose: 'resolved',
+      successorStillHeld: 'busy',
       retained: [true, true],
       secretByPathOnly: true,
       environment: { LC_ALL: 'C' },

@@ -63,14 +63,19 @@ describe('embedded PostgreSQL owned lifecycle', () => {
     await expect(
       scenario.retainsOwnershipAfterStopFailureUntilTheOwnedServerActuallyExits(),
     ).resolves.toEqual({
-      closeOutcome: 'rejected',
-      sameOutcome: 'rejected',
+      closeOutcome: {
+        kind: 'failed',
+        ownership: 'retained',
+        error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+      },
+      repeatedClose: 'rejected',
       busy: 'busy',
       beforeJournalDrain: 'busy',
       reopened: 'held',
+      endpointRetry: 'rejected',
       completion: { exitCode: 0, signal: null },
     });
-  }, 10_000);
+  }, 45_000);
 
   it('cancels an actually spawned owned server before readiness completes', async () => {
     await expect(
