@@ -78,8 +78,8 @@ class AttemptOperation {
   private readonly result: Promise<StartedServer>;
   private resolveResult!: (result: StartedServer) => void;
   private rejectResult!: (error: ServerLaunchError) => void;
-  private readonly timer: NodeJS.Timeout;
-  private readonly unsubscribe: () => void;
+  private timer!: NodeJS.Timeout;
+  private unsubscribe!: () => void;
 
   constructor(
     private readonly process: ServerLaunchProcessPort,
@@ -90,19 +90,19 @@ class AttemptOperation {
       this.resolveResult = resolve;
       this.rejectResult = reject;
     });
-    this.unsubscribe = process.subscribe((message) => this.receive(message));
-    options.signal.addEventListener('abort', this.aborted, { once: true });
-    this.timer = setTimeout(this.expired, Math.max(0, options.deadline - Date.now()));
-    void process.completion.then(
-      () => this.processExited(),
-      () => this.processExited(),
-    );
-    if (options.signal.aborted) {
-      this.aborted();
-    }
   }
 
   start(): Promise<StartedServer> {
+    this.unsubscribe = this.process.subscribe((message) => this.receive(message));
+    this.options.signal.addEventListener('abort', this.aborted, { once: true });
+    this.timer = setTimeout(this.expired, Math.max(0, this.options.deadline - Date.now()));
+    void this.process.completion.then(
+      () => this.processExited(),
+      () => this.processExited(),
+    );
+    if (this.options.signal.aborted) {
+      this.aborted();
+    }
     return this.result;
   }
 
