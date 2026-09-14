@@ -11,6 +11,7 @@ import {
 } from '../../src/core-host/core-child-protocol.js';
 import { CoreChildRunner } from '../../src/core-host/core-child-runner.js';
 import { ManagedProcessService } from '../../src/processes/managed-process.service.js';
+import type { ManagedProcessRequest } from '../../src/processes/managed-process.types.js';
 import {
   CoreChildEntryScenario,
   CoreChildScenario,
@@ -299,12 +300,23 @@ describe('Core child runtime', () => {
 
 describe('published Core child process', () => {
   it('migrates new and existing databases, serves GraphQL, and closes its listener', async () => {
+    const deadline = Date.now() + 45_000;
     const cluster = await ClusterFixture.start('scram');
-    const root = await mkdtemp('/tmp/revo-core-host-');
-    let first: Awaited<ReturnType<typeof startActualCore>> | undefined;
-    let existing: Awaited<ReturnType<typeof startActualCore>> | undefined;
+    const root = await mkdtemp('/tmp/revo-core-host-').catch(async (primary: unknown) => {
+      await cluster.close().catch((error: unknown) => {
+        throw new Error(
+          `scenario cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: primary },
+        );
+      });
+      throw primary;
+    });
+    const ownedCores: (() => Promise<void>)[] = [];
+    const startCore = (label: string) =>
+      startActualCore(cluster.connectionUrl(), root, label, deadline, ownedCores);
+    let primary: unknown;
     try {
-      first = await startActualCore(cluster.connectionUrl(), root);
+      const first = await startCore('new database');
       expect(first.stages).toEqual([
         'application-database-migrations:started',
         'application-database-migrations:completed',
@@ -315,24 +327,49 @@ describe('published Core child process', () => {
         'api-readiness:started',
         'api-readiness:completed',
       ]);
-      await expect(graphql(first.url)).resolves.toEqual({ data: { __typename: 'Query' } });
-      await expect(
-        fetch(`${first.url}/dialogues`, { headers: { accept: 'text/html' } }),
-      ).resolves.toMatchObject({ status: 200 });
-      await expect(fetch(`${first.url}/assets/index-CMjyOelg.js`)).resolves.toMatchObject({
-        status: 200,
+      await expect(graphql(first.url, deadline, 'new database')).resolves.toEqual({
+        data: { __typename: 'Query' },
       });
+      await expect(
+        boundedFetch(`${first.url}/dialogues`, deadline, 'new database admin', {
+          headers: { accept: 'text/html' },
+        }),
+      ).resolves.toMatchObject({ status: 200 });
+      await expect(
+        boundedFetch(`${first.url}/assets/index-CMjyOelg.js`, deadline, 'new database assets'),
+      ).resolves.toMatchObject({ status: 200 });
       await first.stop();
-      await expect(fetch(`${first.url}/graphql`)).rejects.toBeInstanceOf(TypeError);
+      await expect(
+        boundedFetch(`${first.url}/graphql`, deadline, 'new database post-shutdown'),
+      ).rejects.toBeInstanceOf(TypeError);
 
-      existing = await startActualCore(cluster.connectionUrl(), root);
-      await expect(graphql(existing.url)).resolves.toEqual({ data: { __typename: 'Query' } });
+      const existing = await startCore('existing database');
+      await expect(graphql(existing.url, deadline, 'existing database')).resolves.toEqual({
+        data: { __typename: 'Query' },
+      });
       await existing.stop();
-    } finally {
-      await existing?.cleanup();
-      await first?.cleanup();
-      await cluster.close();
-      await rm(root, { recursive: true, force: true });
+    } catch (error) {
+      primary = error;
+    }
+    const failures: string[] = [];
+    const record = async (operation: Promise<void>) => {
+      try {
+        await operation;
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    };
+    await Promise.all(ownedCores.reverse().map((terminate) => record(terminate())));
+    const confirmedCoreTermination = failures.length === 0;
+    await record(cluster.close());
+    if (confirmedCoreTermination) {
+      await record(rm(root, { recursive: true, force: true }));
+    }
+    if (failures.length > 0) {
+      throw new Error(`scenario cleanup failed: ${failures.join('; ')}`, { cause: primary });
+    }
+    if (primary !== undefined) {
+      throw primary;
     }
   }, 60_000);
 
@@ -435,58 +472,106 @@ describe('published Core child process', () => {
   }, 10_000);
 });
 
-async function startActualCore(databaseUrl: string, root: string) {
+async function startActualCore(
+  databaseUrl: string,
+  root: string,
+  label: string,
+  deadline: number,
+  ownedCores: (() => Promise<void>)[],
+) {
   const processes = new ManagedProcessService();
-  const child = await startCoreChild(processes, root);
+  const controller = new AbortController();
+  const remaining = Math.max(0, deadline - Date.now());
+  const timer = setTimeout(() => controller.abort(), remaining);
+  if (remaining === 0) {
+    controller.abort();
+  }
+  const child = await startCoreChild(
+    processes,
+    root,
+    {},
+    {
+      signal: controller.signal,
+      graceMs: 500,
+      killWaitMs: 2_000,
+    },
+  )
+    .finally(() => clearTimeout(timer))
+    .catch(() => {
+      throw new Error(`${label} spawn failed`);
+    });
+  let completed: Awaited<typeof child.completion> | undefined;
+  void child.completion.then((completion) => {
+    completed = completion;
+  });
+  ownedCores.push(async () => {
+    await processes.stop(child, { graceMs: 500, killWaitMs: 2_000 }).catch(() => undefined);
+    await within(child.completion, 3_000, `${label} termination`, state);
+  });
   child.stdout?.resume();
   child.stderr?.resume();
   const messages: unknown[] = [];
   child.subscribe?.((message) => messages.push(message));
-  const cleanup = async () => {
-    await processes.stop(child, { graceMs: 500, killWaitMs: 2_000 }).catch(() => undefined);
-    await within(child.completion, 3_000);
+  const state = () =>
+    `${label} stages=${stageIds(messages).join(',')} exitCode=${String(completed?.exitCode)} signal=${String(completed?.signal)}`;
+  const send = (message: object, phase: string) => {
+    const operation = child.send?.(message);
+    if (!operation) {
+      return Promise.reject(new Error(`${label} ${phase} send unavailable: ${state()}`));
+    }
+    return withinDeadline(
+      Promise.race([
+        operation.catch(() => {
+          throw new Error(`${label} ${phase} send failed: ${state()}`);
+        }),
+        child.completion.then(() => {
+          throw new Error(`${label} exited during ${phase} send: ${state()}`);
+        }),
+      ]),
+      deadline,
+      `${label} ${phase} send`,
+      state,
+    );
   };
-  try {
-    await child.send?.({ protocol: CORE_HOST_PROTOCOL, type: 'hello' });
-    await waitFor(messages, 'booted');
-    await child.send?.({
+  await send({ protocol: CORE_HOST_PROTOCOL, type: 'hello' }, 'hello');
+  await waitFor(messages, 'booted', deadline, () => completed, label);
+  await send(
+    {
       ...start,
       databaseUrl,
       temporaryWorkingDirectoryRoot: join(root, 'work'),
       agentWorkspaceDirectory: join(root, 'sessions'),
-    });
-    const listening = await waitFor(messages, 'listening');
-    if (listening.type !== 'listening') {
-      throw new Error('Core child did not listen');
-    }
-    return {
-      url: listening.url,
-      stages: messages.flatMap((message) =>
-        typeof message === 'object' &&
-        message !== null &&
-        'type' in message &&
-        message.type === 'stage'
-          ? [
-              `${String('stage' in message && message.stage)}:${String('status' in message && message.status)}`,
-            ]
-          : [],
-      ),
-      stop: async () => {
-        await child.send?.({ protocol: CORE_HOST_PROTOCOL, type: 'shutdown' });
-        expect(await within(child.completion, 3_000)).toEqual({ exitCode: 0, signal: null });
-      },
-      cleanup,
-    };
-  } catch (error) {
-    await cleanup();
-    throw error;
+    },
+    'start',
+  );
+  const listening = await waitFor(messages, 'listening', deadline, () => completed, label);
+  if (listening.type !== 'listening') {
+    throw new Error(`${label} did not listen: ${state()}`);
   }
+  return {
+    url: listening.url,
+    stages: stageIds(messages),
+    stop: async () => {
+      await send({ protocol: CORE_HOST_PROTOCOL, type: 'shutdown' }, 'shutdown');
+      expect(
+        await withinDeadline(child.completion, deadline, `${label} shutdown exit`, state),
+      ).toEqual({ exitCode: 0, signal: null });
+    },
+  };
 }
+
+const stageIds = (messages: readonly unknown[]) =>
+  messages
+    .map(parseCoreHostMessage)
+    .flatMap((message) =>
+      message?.type === 'stage' ? [`${message.stage}:${message.status}`] : [],
+    );
 
 async function startCoreChild(
   processes: ManagedProcessService,
   root: string,
   extraEnvironment: Readonly<Record<string, string>> = {},
+  cancellation?: ManagedProcessRequest['cancellation'],
 ) {
   const home = join(root, 'home');
   await mkdir(home, { recursive: true, mode: 0o700 });
@@ -495,6 +580,7 @@ async function startCoreChild(
     args: [join(process.cwd(), 'dist/bin/revo-core-host.js')],
     cwd: process.cwd(),
     env: { ...childEnvironment(home), ...extraEnvironment },
+    ...(cancellation === undefined ? {} : { cancellation }),
     ipc: true,
     stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
   });
@@ -507,6 +593,7 @@ async function waitFor(
   completion: () =>
     | { readonly exitCode: number | null; readonly signal: string | null }
     | undefined = () => undefined,
+  label = 'Core child',
 ) {
   const message = messages.map(parseCoreHostMessage).find((candidate) => candidate?.type === type);
   if (message) {
@@ -515,22 +602,43 @@ async function waitFor(
   const observedCompletion = completion();
   if (observedCompletion) {
     throw new Error(
-      `Core child exited before sending ${type}: exitCode=${String(observedCompletion.exitCode)} signal=${String(observedCompletion.signal)}`,
+      `${label} exited before ${type}: stages=${stageIds(messages).join(',')} exitCode=${String(observedCompletion.exitCode)} signal=${String(observedCompletion.signal)}`,
     );
   }
   if (Date.now() >= deadline) {
-    throw new Error(`Core child did not send ${type}`);
+    throw new Error(`${label} did not send ${type}: stages=${stageIds(messages).join(',')}`);
   }
   await new Promise((resolve) => setTimeout(resolve, 10));
-  return waitFor(messages, type, deadline, completion);
+  return waitFor(messages, type, deadline, completion, label);
 }
 
-const graphql = (url: string) =>
-  fetch(`${url}/graphql`, {
+const graphql = (url: string, deadline: number, label: string) =>
+  boundedFetch(`${url}/graphql`, deadline, `${label} GraphQL`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ query: '{ __typename }' }),
-  }).then((response) => response.json());
+  }).then(({ body }) => JSON.parse(body));
+
+async function boundedFetch(url: string, deadline: number, label: string, init: RequestInit = {}) {
+  const controller = new AbortController();
+  const deadlineError = new Error(`${label} deadline expired`);
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw deadlineError;
+  }
+  const timer = setTimeout(() => controller.abort(deadlineError), remaining);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    return { status: response.status, body: await response.text() };
+  } catch (error) {
+    if (controller.signal.reason === deadlineError) {
+      throw deadlineError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function until(predicate: () => boolean, deadline = Date.now() + 250): Promise<void> {
   if (predicate()) {
@@ -584,20 +692,27 @@ function within<T>(
   label = 'subprocess',
   state: () => string = () => 'state unavailable',
 ): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
     promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} did not finish: ${state()}`)), milliseconds),
-    ),
-  ]);
+    new Promise<never>((_, reject) => {
+      const expire = () => reject(new Error(`${label} did not finish: ${state()}`));
+      timer = setTimeout(expire, milliseconds);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
-function withinDeadline<T>(promise: Promise<T>, deadline: number): Promise<T> {
+function withinDeadline<T>(
+  promise: Promise<T>,
+  deadline: number,
+  label = 'subprocess',
+  state: () => string = () => 'state unavailable',
+): Promise<T> {
   const remaining = deadline - Date.now();
   if (remaining <= 0) {
-    return Promise.reject(new Error('subprocess deadline expired'));
+    return Promise.reject(new Error(`${label} did not finish: ${state()}`));
   }
-  return within(promise, remaining);
+  return within(promise, remaining, label, state);
 }
 
 function childEnvironment(home: string) {
