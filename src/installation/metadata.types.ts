@@ -31,14 +31,12 @@ export interface LegacyReleaseToolchain {
   readonly pnpm: string;
 }
 
-export interface InstallationReleaseManifest {
-  readonly schemaVersion: string;
+interface InstallationReleaseManifestFields {
   readonly release: ReleaseMetadata;
   readonly components: {
     readonly core: { readonly name: string; readonly version: string };
     readonly admin: { readonly name: string; readonly version: string };
   };
-  readonly toolchain: LegacyReleaseToolchain | NodeReleaseToolchain;
   readonly artifacts: {
     readonly package: PackageReleaseArtifact;
     readonly packageJson: ReleaseArtifact;
@@ -46,3 +44,29 @@ export interface InstallationReleaseManifest {
     readonly pnpmWorkspace: ReleaseArtifact;
   };
 }
+
+export interface LegacyInstallationReleaseManifest extends InstallationReleaseManifestFields {
+  readonly schemaVersion: 'revo-install/v1';
+  readonly toolchain: LegacyReleaseToolchain;
+}
+
+export interface NodeInstallationReleaseManifest extends InstallationReleaseManifestFields {
+  readonly schemaVersion: 'revo-install/v2';
+  readonly toolchain: NodeReleaseToolchain;
+}
+
+declare const unknownInstallationSchemaVersion: unique symbol;
+
+export type UnknownInstallationSchemaVersion = string & {
+  readonly [unknownInstallationSchemaVersion]: true;
+};
+
+export interface UnknownInstallationReleaseManifest extends InstallationReleaseManifestFields {
+  readonly schemaVersion: UnknownInstallationSchemaVersion;
+  readonly toolchain: LegacyReleaseToolchain;
+}
+
+export type InstallationReleaseManifest =
+  | LegacyInstallationReleaseManifest
+  | NodeInstallationReleaseManifest
+  | UnknownInstallationReleaseManifest;

@@ -36,8 +36,10 @@ export interface FutureReleasePolicy extends InstallationReleasePolicy {
   };
 }
 
-export interface FutureReleaseManifestFixtureOptions
-  extends Omit<ReleaseManifestFixtureOptions, 'policy'> {
+export interface FutureReleaseManifestFixtureOptions extends Omit<
+  ReleaseManifestFixtureOptions,
+  'policy'
+> {
   readonly policy?: FutureReleasePolicy;
 }
 

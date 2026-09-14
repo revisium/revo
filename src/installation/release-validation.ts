@@ -1,12 +1,15 @@
 import { isSemVerString, parseReleaseMetadata } from '../release-metadata.js';
 import type {
   InstallationReleaseManifest,
+  LegacyReleaseToolchain,
   NodeArchiveArchitecture,
   NodeArchiveFormat,
   NodeArchivePlatform,
   NodeArchiveReleaseArtifact,
+  NodeReleaseToolchain,
   PackageReleaseArtifact,
   ReleaseArtifact,
+  UnknownInstallationSchemaVersion,
 } from './metadata.types.js';
 
 const KEYS = {
@@ -47,6 +50,12 @@ const exact = (value: Record<string, unknown>, keys: readonly string[]): boolean
 
 const invalid = (reason: string): Error =>
   new Error(`Invalid Revo installation release manifest: ${reason}`);
+
+function isUnknownInstallationSchemaVersion(
+  value: unknown,
+): value is UnknownInstallationSchemaVersion {
+  return typeof value === 'string' && value !== 'revo-install/v1' && value !== 'revo-install/v2';
+}
 
 function isSha256HexString(value: string): boolean {
   return SHA256_HEX_PATTERN.test(value);
@@ -135,7 +144,10 @@ function parseNodeArchive(value: unknown): NodeArchiveReleaseArtifact {
   };
 }
 
-function parseToolchain(value: Record<string, unknown>): InstallationReleaseManifest['toolchain'] {
+function parseToolchainVersion(value: Record<string, unknown>): {
+  node: string;
+  pnpm: string;
+} {
   if (
     typeof value.node !== 'string' ||
     !isSemVerString(value.node) ||
@@ -144,9 +156,19 @@ function parseToolchain(value: Record<string, unknown>): InstallationReleaseMani
   ) {
     throw invalid('schema or top-level fields are invalid');
   }
-  if (exact(value, KEYS.toolchain)) {
-    return { node: value.node, pnpm: value.pnpm };
+  return { node: value.node, pnpm: value.pnpm };
+}
+
+function parseLegacyToolchain(value: Record<string, unknown>): LegacyReleaseToolchain {
+  const version = parseToolchainVersion(value);
+  if (!exact(value, KEYS.toolchain)) {
+    throw invalid('schema or top-level fields are invalid');
   }
+  return version;
+}
+
+function parseNodeToolchain(value: Record<string, unknown>): NodeReleaseToolchain {
+  const version = parseToolchainVersion(value);
   if (!exact(value, KEYS.nodeToolchain) || !Array.isArray(value.nodeArchives)) {
     throw invalid('schema or top-level fields are invalid');
   }
@@ -161,8 +183,7 @@ function parseToolchain(value: Record<string, unknown>): InstallationReleaseMani
     throw invalid('Node archive set is incomplete');
   }
   return {
-    node: value.node,
-    pnpm: value.pnpm,
+    ...version,
     nodeArchives,
     nodeShasums: parseArtifact(value.nodeShasums, false),
   };
@@ -184,12 +205,9 @@ export function parseInstallationReleaseManifest(value: unknown): InstallationRe
   const release = parseReleaseMetadata(value.release);
   const core = parseComponent(value.components.core);
   const admin = parseComponent(value.components.admin);
-  const toolchain = parseToolchain(value.toolchain);
-  return {
-    schemaVersion: value.schemaVersion,
+  const fields = {
     release,
     components: { core, admin },
-    toolchain,
     artifacts: {
       package: parseArtifact(value.artifacts.package, true),
       packageJson: parseArtifact(value.artifacts.packageJson, false),
@@ -197,4 +215,26 @@ export function parseInstallationReleaseManifest(value: unknown): InstallationRe
       pnpmWorkspace: parseArtifact(value.artifacts.pnpmWorkspace, false),
     },
   };
+  if (value.schemaVersion === 'revo-install/v2') {
+    return {
+      ...fields,
+      schemaVersion: value.schemaVersion,
+      toolchain: parseNodeToolchain(value.toolchain),
+    };
+  }
+  if (value.schemaVersion === 'revo-install/v1') {
+    return {
+      ...fields,
+      schemaVersion: value.schemaVersion,
+      toolchain: parseLegacyToolchain(value.toolchain),
+    };
+  }
+  if (isUnknownInstallationSchemaVersion(value.schemaVersion)) {
+    return {
+      ...fields,
+      schemaVersion: value.schemaVersion,
+      toolchain: parseLegacyToolchain(value.toolchain),
+    };
+  }
+  throw invalid('schema or top-level fields are invalid');
 }

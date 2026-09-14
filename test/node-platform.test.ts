@@ -1,3 +1,5 @@
+import { basename } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -42,10 +44,13 @@ describe('Node platform bootstrap contract', () => {
     ['duplicate', (archives: readonly NodeArchiveFixture[]) => [...archives, archives[0]]],
     [
       'extra',
-      (archives: readonly NodeArchiveFixture[]) => [
-        ...archives,
-        { ...archives[0]!, arch: 'ppc64' },
-      ],
+      (archives: readonly NodeArchiveFixture[]) => {
+        const firstArchive = archives[0];
+        if (firstArchive === undefined) {
+          throw new Error('The Node archive fixture must not be empty.');
+        }
+        return [...archives, { ...firstArchive, arch: 'ppc64' }];
+      },
     ],
   ])('rejects a %s archive set', async (_name, mutate) => {
     const api = await nodePlatform();
@@ -55,7 +60,9 @@ describe('Node platform bootstrap contract', () => {
       toolchain: { ...fixture.manifest.toolchain, nodeArchives: mutate(archives) },
     };
 
-    expect(() => api.selectNodeArchive(manifest, { platform: 'linux', arch: 'x64' })).toThrow();
+    expect(() => api.selectNodeArchive(manifest, { platform: 'linux', arch: 'x64' })).toThrow(
+      /Node|node|archive/,
+    );
   });
 
   it.each([
@@ -75,7 +82,9 @@ describe('Node platform bootstrap contract', () => {
       toolchain: { ...fixture.manifest.toolchain, nodeArchives },
     };
 
-    expect(() => api.selectNodeArchive(manifest, { platform: 'linux', arch: 'x64' })).toThrow();
+    expect(() => api.selectNodeArchive(manifest, { platform: 'linux', arch: 'x64' })).toThrow(
+      /Node|node|archive/,
+    );
   });
 
   it.each([
@@ -85,14 +94,18 @@ describe('Node platform bootstrap contract', () => {
     const api = await nodePlatform();
     const { fixture } = nodeBootstrapScenario();
 
-    expect(() => api.selectNodeArchive(fixture.manifest, { platform, arch })).toThrow(/unsupported/i);
+    expect(() => api.selectNodeArchive(fixture.manifest, { platform, arch })).toThrow(
+      /unsupported/i,
+    );
   });
 
   it('keeps an alternate Node version flowing through archive selection', async () => {
     const api = await nodePlatform();
     const { fixture, bootstrap } = nodeBootstrapScenario('27.3.1');
 
-    expect(api.selectNodeArchive(fixture.manifest, { platform: 'linux', arch: 'x64' })).toMatchObject({
+    expect(
+      api.selectNodeArchive(fixture.manifest, { platform: 'linux', arch: 'x64' }),
+    ).toMatchObject({
       url: expect.stringContaining('/v27.3.1/node-v27.3.1-linux-x64.tar.xz'),
     });
     expect(bootstrap.snapshotSha256).not.toBe(
@@ -108,9 +121,7 @@ describe('Node platform bootstrap contract', () => {
 
     expect(officialNodeShasumsSnapshotSha256()).toBe(bootstrap.snapshotSha256);
     expect(
-      archives.every(
-        ({ url, sha256 }) => official.get(new URL(url).pathname.split('/').at(-1)!) === sha256,
-      ),
+      archives.every(({ url, sha256 }) => official.get(basename(new URL(url).pathname)) === sha256),
     ).toBe(true);
     expect(() => api.assertBootstrapMatchesManifest(fixture.manifest, bootstrap)).not.toThrow();
   });
@@ -150,6 +161,8 @@ describe('Node platform bootstrap contract', () => {
     const api = await nodePlatform();
     const { fixture, bootstrap } = nodeBootstrapScenario();
 
-    expect(() => api.assertBootstrapMatchesManifest(fixture.manifest, mutate(bootstrap))).toThrow();
+    expect(() => api.assertBootstrapMatchesManifest(fixture.manifest, mutate(bootstrap))).toThrow(
+      /Node|node|bootstrap|archive/,
+    );
   });
 });
