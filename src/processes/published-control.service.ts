@@ -99,6 +99,10 @@ export class PublishedControlService {
       let finalClose: Promise<void> | undefined;
       let progressClose: Promise<void> | undefined;
       let finalState: 'pending' | 'released' | 'failed' = 'pending';
+      let resolveOwnershipReleased!: () => void;
+      const ownershipReleased = new Promise<void>((resolve) => {
+        resolveOwnershipReleased = resolve;
+      });
       const isReleased = () => finalState === 'released';
       const finalize = () => {
         progressClose ??= progress?.close();
@@ -106,7 +110,14 @@ export class PublishedControlService {
           finalClose = (async () => {
             await postgres?.settled();
             await progressClose;
-            await this.closeOwned(createdEndpoint, canonicalDataDir, instanceId, token, lease);
+            await this.closeOwned(
+              createdEndpoint,
+              canonicalDataDir,
+              instanceId,
+              token,
+              lease,
+              resolveOwnershipReleased,
+            );
           })();
           void finalClose.then(
             () => {
@@ -155,6 +166,7 @@ export class PublishedControlService {
         ...(progress ? { progress } : {}),
         ...(postgres ? { startDatabase: postgres.start.bind(postgres) } : {}),
         close,
+        ownershipReleased: () => ownershipReleased,
       };
       if (request.databaseUrl !== undefined) {
         return { ...common, databaseKind: 'external' };
@@ -180,6 +192,7 @@ export class PublishedControlService {
     instanceId: string,
     token: string,
     lease: Extract<Awaited<ReturnType<ServerOwnershipService['acquire']>>, { kind: 'held' }>,
+    resolveOwnershipReleased: () => void,
   ): Promise<void> {
     const failures: ('endpoint' | 'metadata' | 'ownership')[] = [];
     try {
@@ -203,6 +216,7 @@ export class PublishedControlService {
     }
     try {
       await lease.release();
+      resolveOwnershipReleased();
     } catch {
       failures.push('ownership');
     }

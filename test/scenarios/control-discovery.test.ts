@@ -63,6 +63,7 @@ describe('owned control publication and discovery', () => {
     await expect(scenario.invalidFifoCloseStillReleasesOwnership()).resolves.toEqual({
       invalid: 'invalid',
       close: 'rejected',
+      ownershipReleased: true,
       replacement: 'held',
     });
   });

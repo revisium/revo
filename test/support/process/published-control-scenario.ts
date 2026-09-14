@@ -137,8 +137,14 @@ export class PublishedControlScenario {
     );
     const invalid = await new ControlDiscoveryService().read(fixture.dataDir);
     const closed = await Promise.allSettled([held.close()]);
+    await held.ownershipReleased();
     const replacement = await this.open(fixture);
-    return { invalid: invalid.kind, close: closed[0]?.status, replacement: replacement.kind };
+    return {
+      invalid: invalid.kind,
+      close: closed[0]?.status,
+      ownershipReleased: true,
+      replacement: replacement.kind,
+    };
   }
 
   async rejectsOversizedPublicationAndReportsCleanupFailure() {
