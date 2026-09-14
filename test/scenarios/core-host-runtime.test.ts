@@ -315,7 +315,7 @@ describe('published Core child process', () => {
   it('bounds and redacts a real subprocess startup failure', async () => {
     const root = await mkdtemp('/tmp/revo-core-host-failure-');
     const processes = new ManagedProcessService();
-    const child = await startCoreChild(processes, root);
+    const child = await startCoreChild(processes, root, { CHECKPOINT_DISABLE: '1' });
     const stdout = captureBounded(child.stdout);
     const stderr = captureBounded(child.stderr);
     const messages: unknown[] = [];
@@ -340,12 +340,11 @@ describe('published Core child process', () => {
       expect(stderr.bytes()).toBeLessThanOrEqual(8192);
       expect(stdout.failed() || stderr.failed()).toBe(false);
     } finally {
-      try {
-        await processes.stop(child, { graceMs: 500, killWaitMs: 2_000 }).catch(() => undefined);
-        await within(child.completion, 3_000);
-      } finally {
-        await rm(root, { recursive: true, force: true });
-      }
+      const cleanupDeadline = Date.now() + 6_000;
+      await processes.stop(child, { graceMs: 500, killWaitMs: 2_000 });
+      await withinDeadline(child.completion, cleanupDeadline);
+      await withinDeadline(Promise.all([stdout.completed, stderr.completed]), cleanupDeadline);
+      await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
 
@@ -443,14 +442,18 @@ async function startActualCore(databaseUrl: string, root: string) {
   }
 }
 
-async function startCoreChild(processes: ManagedProcessService, root: string) {
+async function startCoreChild(
+  processes: ManagedProcessService,
+  root: string,
+  extraEnvironment: Readonly<Record<string, string>> = {},
+) {
   const home = join(root, 'home');
   await mkdir(home, { recursive: true, mode: 0o700 });
   return processes.start({
     executable: process.execPath,
     args: [join(process.cwd(), 'dist/bin/revo-core-host.js')],
     cwd: process.cwd(),
-    env: childEnvironment(home),
+    env: { ...childEnvironment(home), ...extraEnvironment },
     ipc: true,
     stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
   });
