@@ -39,6 +39,7 @@
   "dependencies": {
     "@nestjs/common": "11.1.28",
     "@nestjs/core": "11.1.28",
+    "@revisium/revo-core": "0.0.0",
     "koffi": "3.2.1",
     "nest-commander": "3.21.0",
     "pg": "8.22.0",
