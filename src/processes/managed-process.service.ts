@@ -254,7 +254,16 @@ class ManagedOwnedProcess implements OwnedProcess {
   }
 
   stop(request: StopProcessRequest): Promise<void> {
-    this.stopOperation ??= this.performStop(request);
+    if (!this.stopOperation) {
+      let tracked: Promise<void>;
+      tracked = this.performStop(request).catch((error: unknown) => {
+        if (this.stopOperation === tracked) {
+          this.stopOperation = undefined;
+        }
+        throw error;
+      });
+      this.stopOperation = tracked;
+    }
     return this.stopOperation;
   }
 

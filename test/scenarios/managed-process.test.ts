@@ -139,6 +139,9 @@ describe('managed child process', () => {
       new ManagedProcessService().stop(handle, { graceMs: 500, killWaitMs: 500 }),
     ).rejects.toMatchObject({ code: 'revo.process.stop-timeout' });
     await expect(handle.completion).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' });
+    await expect(
+      new ManagedProcessService().stop(handle, { graceMs: 1, killWaitMs: 1 }),
+    ).resolves.toBeUndefined();
   });
 
   it('coalesces concurrent and repeated stop operations', async () => {
