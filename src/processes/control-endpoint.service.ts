@@ -109,23 +109,27 @@ export class ControlEndpointService {
     });
     await openServer(server, record.endpoint);
     let closePromise: Promise<void> | undefined;
+    const close = (): Promise<void> => {
+      closeRequested = true;
+      if (phase === 'stopping') {
+        for (const socket of sockets) {
+          if (socket !== responder) {
+            socket.destroy();
+          }
+        }
+        return Promise.resolve();
+      }
+      phase = 'terminal';
+      if (closePromise === undefined) {
+        closePromise = drain();
+      }
+      return closePromise;
+    };
     return {
       endpoint: record.endpoint,
       stopResult: stop.promise,
       stopDelivery: delivery.promise,
-      close: () => {
-        closeRequested = true;
-        if (phase === 'stopping') {
-          for (const socket of sockets) {
-            if (socket !== responder) {
-              socket.destroy();
-            }
-          }
-          return Promise.resolve();
-        }
-        phase = 'terminal';
-        return (closePromise ??= drain());
-      },
+      close,
     };
   }
 

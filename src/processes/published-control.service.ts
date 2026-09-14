@@ -18,11 +18,13 @@ import { ControlEndpointService } from './control-endpoint.service.js';
 import { ProcessIdentityService } from './process-identity.service.js';
 import { ServerOwnershipService } from './server-ownership.service.js';
 
+type PublishedControlCleanupFailure = 'endpoint' | 'metadata' | 'ownership';
+
 export class PublishedControlError extends Error {
   readonly code = 'PUBLISHED_CONTROL_ERROR';
   constructor(
     readonly phase: 'startup' | 'close',
-    readonly cleanupFailures: readonly ('endpoint' | 'metadata' | 'ownership')[] = [],
+    readonly cleanupFailures: readonly PublishedControlCleanupFailure[] = [],
     readonly ownership: 'retained' | 'released' | 'unconfirmed' = 'unconfirmed',
   ) {
     super('Published control lifecycle failed');

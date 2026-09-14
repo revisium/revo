@@ -55,29 +55,33 @@ export class ControlClientService {
     if (!isAccepted(accepted) || !isObject(completed) || completed.completed !== true) {
       throw new ControlTransportError();
     }
-    if (
-      Object.keys(completed).length === 3 &&
-      completed.schemaVersion === 1 &&
-      completed.ok === true
-    ) {
-      return { kind: 'completed' };
-    }
-    if (
-      Object.keys(completed).length === 6 &&
-      completed.schemaVersion === 1 &&
-      completed.ok === false &&
-      completed.code === 'CONTROL_STOP_FAILED' &&
-      completed.message === 'Control stop callback failed' &&
-      (completed.ownership === 'retained' || completed.ownership === 'unconfirmed')
-    ) {
-      return {
-        kind: 'failed',
-        ownership: completed.ownership,
-        error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
-      };
+    const completion = parseStopCompletion(completed);
+    if (completion) {
+      return completion;
     }
     throw new ControlTransportError();
   }
+}
+
+function parseStopCompletion(value: Record<string, unknown>): ControlStopResponse | undefined {
+  if (Object.keys(value).length === 3 && value.schemaVersion === 1 && value.ok === true) {
+    return { kind: 'completed' };
+  }
+  if (
+    Object.keys(value).length === 6 &&
+    value.schemaVersion === 1 &&
+    value.ok === false &&
+    value.code === 'CONTROL_STOP_FAILED' &&
+    value.message === 'Control stop callback failed' &&
+    (value.ownership === 'retained' || value.ownership === 'unconfirmed')
+  ) {
+    return {
+      kind: 'failed',
+      ownership: value.ownership,
+      error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+    };
+  }
+  return undefined;
 }
 
 const isAccepted = (response: unknown) =>
