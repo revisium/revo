@@ -386,15 +386,12 @@ describe('published Core child process', () => {
     });
     child.subscribe?.((message) => messages.push(message));
     try {
-      const bootDeadline = Date.now() + 10_000;
+      const startupFailureDeadline = Date.now() + 25_000;
       await withinDeadline(
         child.send?.({ protocol: CORE_HOST_PROTOCOL, type: 'hello' }) ??
           Promise.reject(new Error('Core child IPC unavailable')),
-        bootDeadline,
+        startupFailureDeadline,
       );
-      await waitFor(messages, 'booted', bootDeadline, () => observedCompletion);
-
-      const failureDeadline = Date.now() + 15_000;
       await withinDeadline(
         child.send?.({
           ...start,
@@ -402,11 +399,17 @@ describe('published Core child process', () => {
           temporaryWorkingDirectoryRoot: join(root, 'work'),
           agentWorkspaceDirectory: join(root, 'sessions'),
         }) ?? Promise.reject(new Error('Core child IPC unavailable')),
-        failureDeadline,
+        startupFailureDeadline,
       );
-      await waitFor(messages, 'failed', failureDeadline, () => observedCompletion);
-      const completion = await withinDeadline(child.completion, failureDeadline);
-      await withinDeadline(Promise.all([stdout.completed, stderr.completed]), failureDeadline);
+      await waitFor(messages, 'booted', startupFailureDeadline, () => observedCompletion);
+      await waitFor(messages, 'failed', startupFailureDeadline, () => observedCompletion);
+      const types = messages.map(parseCoreHostMessage).map((message) => message?.type);
+      expect(types.indexOf('booted')).toBeLessThan(types.indexOf('failed'));
+      const completion = await withinDeadline(child.completion, startupFailureDeadline);
+      await withinDeadline(
+        Promise.all([stdout.completed, stderr.completed]),
+        startupFailureDeadline,
+      );
       expect(completion.exitCode).toBe(1);
       expect(completion.signal).toBeNull();
       expect(JSON.stringify(messages)).not.toContain('SECRET-marker');
