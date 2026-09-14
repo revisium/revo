@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { finished } from 'node:stream/promises';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   CORE_HOST_PROTOCOL,
@@ -277,6 +277,24 @@ describe('Core child runtime', () => {
     expect(scenario.finishCalls).toBe(1);
     expect(scenario.sent.some((message) => message.type === 'listening')).toBe(false);
   });
+
+  it('closes the runtime before readiness when the Admin bundle is unavailable', async () => {
+    vi.doMock('@revisium/revo-admin/runtime', () => ({
+      getRevoAdminClientDirectory: () => '/tmp/revo-admin-missing-bundle',
+    }));
+    try {
+      const service = new DeferredCoreRuntimeService();
+      const runtime = service.resolveFactory();
+      await expect(
+        service.start(start, new AbortController().signal, () => undefined),
+      ).rejects.toThrow('Revo Admin client assets are unavailable');
+      expect(runtime.closeCalls).toBe(1);
+      expect(runtime.prepareCalls).toBe(0);
+      expect(runtime.listenCalls).toBe(0);
+    } finally {
+      vi.doUnmock('@revisium/revo-admin/runtime');
+    }
+  });
 });
 
 describe('published Core child process', () => {
@@ -298,6 +316,12 @@ describe('published Core child process', () => {
         'api-readiness:completed',
       ]);
       await expect(graphql(first.url)).resolves.toEqual({ data: { __typename: 'Query' } });
+      await expect(
+        fetch(`${first.url}/dialogues`, { headers: { accept: 'text/html' } }),
+      ).resolves.toMatchObject({ status: 200 });
+      await expect(fetch(`${first.url}/assets/index-CMjyOelg.js`)).resolves.toMatchObject({
+        status: 200,
+      });
       await first.stop();
       await expect(fetch(`${first.url}/graphql`)).rejects.toBeInstanceOf(TypeError);
 
