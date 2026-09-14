@@ -64,13 +64,13 @@ export type CoreHostMessage =
   | CoreHostListeningMessage
   | CoreHostFailedMessage;
 
-const stages: readonly unknown[] = [
+const stages = new Set<unknown>([
   'application-database-migrations',
   'dbos-system-migrations',
   'application-bootstrap',
   'api-readiness',
-];
-const types: readonly string[] = [
+]);
+const types = new Set<string>([
   'hello',
   'booted',
   'start',
@@ -78,7 +78,7 @@ const types: readonly string[] = [
   'stage',
   'listening',
   'failed',
-];
+]);
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 const hasOnly = (value: Record<string, unknown>, keys: readonly string[]) =>
@@ -105,7 +105,7 @@ export const parseCoreHostMessage = (value: unknown): CoreHostMessage | undefine
   if (!isRecord(value) || value.protocol !== CORE_HOST_PROTOCOL || typeof value.type !== 'string') {
     return undefined;
   }
-  if (!types.includes(value.type)) {
+  if (!types.has(value.type)) {
     return undefined;
   }
   switch (value.type) {
@@ -181,7 +181,7 @@ function parseStart(value: Record<string, unknown>): CoreHostStartMessage | unde
 }
 
 function isStage(value: unknown): value is CoreHostLifecycleStage {
-  return stages.includes(value);
+  return stages.has(value);
 }
 
 function parseStage(value: Record<string, unknown>): CoreHostStageMessage | undefined {
