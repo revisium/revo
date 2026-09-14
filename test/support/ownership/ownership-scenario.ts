@@ -22,6 +22,7 @@ import { ProcessesModule } from '../../../src/processes/processes.module.js';
 import { ServerOwnershipService } from '../../../src/processes/server-ownership.service.js';
 
 const DRIVER = resolve(dirname(fileURLToPath(import.meta.url)), 'owner-process.mjs');
+const REPLY_TIMEOUT_MS = 3_000;
 
 type Reply = Readonly<Record<string, boolean | number | string | undefined>>;
 
@@ -67,18 +68,34 @@ function bindingFor(call: (descriptor: number, operation: number) => number): Fl
 }
 
 export class OwnerProcess {
+  private failPending: ((error: Error) => void) | undefined;
+
   private constructor(private readonly child: ChildProcess) {}
 
-  static async start(): Promise<OwnerProcess> {
-    const child = fork(DRIVER, [], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-    const owner = new OwnerProcess(child);
-    await owner.nextReply();
-    return owner;
+  static fork(): OwnerProcess {
+    return new OwnerProcess(fork(DRIVER, [], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));
+  }
+
+  booted(): Promise<Reply> {
+    return this.nextReply('boot');
   }
 
   request(action: string, dataDir?: string): Promise<Reply> {
-    const reply = this.nextReply();
-    this.child.send({ action, dataDir });
+    const reply = this.nextReply(`request "${action}"`);
+    const capturedFailPending = this.failPending;
+    if (capturedFailPending === undefined) {
+      return reply;
+    }
+    try {
+      this.child.send({ action, dataDir }, (error) => {
+        if (error !== null) {
+          capturedFailPending(error);
+        }
+      });
+    } catch (thrown) {
+      const error = thrown instanceof Error ? thrown : new Error(String(thrown));
+      capturedFailPending(error);
+    }
     return reply;
   }
 
@@ -91,17 +108,51 @@ export class OwnerProcess {
     await exited;
   }
 
-  private nextReply(): Promise<Reply> {
-    return new Promise((resolveReply, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Ownership process timed out.')), 3_000);
-      this.child.once('message', (message: Reply) => {
-        clearTimeout(timeout);
-        if (message.error !== undefined) {
-          reject(new Error(String(message.error)));
+  private nextReply(label: string): Promise<Reply> {
+    return new Promise((resolveReply, rejectReply) => {
+      let timeout: NodeJS.Timeout | undefined;
+      let settled = false;
+      let detach = (): void => undefined;
+      const settle = (outcome: Error | Reply): void => {
+        if (settled) {
           return;
         }
-        resolveReply(message);
-      });
+        settled = true;
+        clearTimeout(timeout);
+        this.failPending = undefined;
+        detach();
+        if (outcome instanceof Error) {
+          rejectReply(outcome);
+        } else {
+          resolveReply(outcome);
+        }
+      };
+      const fail = (reason: string): void =>
+        settle(new Error(`Ownership process ${label} did not reply: ${reason}.`));
+      const onMessage = (message: Reply): void =>
+        settle(message.error === undefined ? message : new Error(String(message.error)));
+      const onError = (error: Error): void => fail(`child error: ${error.message}`);
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void =>
+        fail(`child exited before replying (code ${code}, signal ${signal})`);
+      detach = (): void => {
+        this.child.off('message', onMessage);
+        this.child.off('error', onError);
+        this.child.off('exit', onExit);
+      };
+
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        fail(`child already exited (code ${this.child.exitCode}, signal ${this.child.signalCode})`);
+        return;
+      }
+      if (!this.child.connected) {
+        fail('child channel is already disconnected');
+        return;
+      }
+      timeout = setTimeout(() => fail(`no reply within ${REPLY_TIMEOUT_MS}ms`), REPLY_TIMEOUT_MS);
+      this.failPending = (error) => fail(`send failed: ${error.message}`);
+      this.child.on('message', onMessage);
+      this.child.on('error', onError);
+      this.child.on('exit', onExit);
     });
   }
 }
@@ -131,8 +182,9 @@ export class OwnershipScenario {
   }
 
   async owner(): Promise<OwnerProcess> {
-    const owner = await OwnerProcess.start();
+    const owner = OwnerProcess.fork();
     this.children.push(owner);
+    await owner.booted();
     return owner;
   }
 
