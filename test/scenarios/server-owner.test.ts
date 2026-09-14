@@ -60,6 +60,7 @@ describe('Server owner composition', () => {
       await expect(scenario.restartsExistingData()).resolves.toMatchObject({
         ready: { kind: 'ready' },
         owners: 2,
+        stopped: { phase: 'stopped' },
       });
     },
     REAL_OWNER_RESTART_TIMEOUT_MS,
@@ -80,6 +81,10 @@ describe('Server owner composition', () => {
     await expect(scenario.holdsLeaseUntilBlockedJournalDrains()).resolves.toEqual({
       contender: 'busy',
       coreCompleted: true,
+      statusWhileClosing: {
+        phase: 'stopping',
+        operationId: '00000000000000000000000000000001',
+      },
     });
   });
 
@@ -93,6 +98,12 @@ describe('Server owner composition', () => {
         kind: 'failed',
         code: 'revo.server-owner.stop',
         cleanup: 'retained',
+      },
+      failedStatus: {
+        phase: 'failed',
+        code: 'revo.server-owner.stop',
+        operationId: '00000000000000000000000000000001',
+        ownership: 'retained',
       },
     });
   });

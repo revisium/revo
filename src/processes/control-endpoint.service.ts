@@ -9,6 +9,7 @@ import {
   DEFAULT_CONTROL_LIMITS,
   type ControlLimits,
   type ControlRecord,
+  type ControlServerStatus,
   type ControlStopCompletion,
   type ControlStopDeliveryResult,
   type ControlStopResult,
@@ -22,6 +23,15 @@ import {
   validEndpointPath,
   validateLimits,
 } from './control-protocol.js';
+
+interface ServeOptions {
+  readonly limits: ControlLimits;
+  readonly onStatus: (() => ControlServerStatus | Promise<ControlServerStatus>) | undefined;
+  readonly acceptStop: () => (() => Promise<ControlStopCompletion>) | undefined;
+  readonly releaseResponder: () => void;
+  readonly completeStop: (completion: ControlStopCompletion) => Promise<void>;
+  readonly observeStop: (completion: ControlStopCompletion, sent: boolean) => void;
+}
 
 @Injectable()
 export class ControlEndpointService {
@@ -52,11 +62,10 @@ export class ControlEndpointService {
       }
       sockets.add(socket);
       socket.once('close', () => sockets.delete(socket));
-      void this.serve(
-        socket,
-        record,
+      void this.serve(socket, record, {
         limits,
-        () => {
+        onStatus: request.onStatus,
+        acceptStop: () => {
           if (phase !== 'accepting') {
             return undefined;
           }
@@ -78,10 +87,10 @@ export class ControlEndpointService {
             return completion;
           };
         },
-        () => {
+        releaseResponder: () => {
           responder = undefined;
         },
-        async (completion) => {
+        completeStop: async (completion) => {
           responder = undefined;
           if (
             completion.kind === 'failed' &&
@@ -94,7 +103,7 @@ export class ControlEndpointService {
           phase = 'terminal';
           await drain();
         },
-        (completion, sent) => {
+        observeStop: (completion, sent) => {
           delivery.resolve({ kind: sent ? 'sent' : 'failed' });
           stop.resolve(
             completion.kind === 'completed'
@@ -105,7 +114,7 @@ export class ControlEndpointService {
                 },
           );
         },
-      );
+      });
     });
     await openServer(server, record.endpoint);
     let closePromise: Promise<void> | undefined;
@@ -147,34 +156,33 @@ export class ControlEndpointService {
     return record;
   }
 
-  private async serve(
-    socket: Socket,
-    record: ControlRecord,
-    limits: ControlLimits,
-    acceptStop: () => (() => Promise<ControlStopCompletion>) | undefined,
-    releaseResponder: () => void,
-    completeStop: (completion: ControlStopCompletion) => Promise<void>,
-    observeStop: (completion: ControlStopCompletion, sent: boolean) => void,
-  ): Promise<void> {
-    const deadline = Date.now() + limits.timeoutMs;
+  private async serve(socket: Socket, record: ControlRecord, options: ServeOptions): Promise<void> {
+    const deadline = Date.now() + options.limits.timeoutMs;
     try {
-      const request = parseControlRequest(JSON.parse(await readFrame(socket, limits, deadline)));
+      const request = parseControlRequest(
+        JSON.parse(await readFrame(socket, options.limits, deadline)),
+      );
       if (!request || !authorized(request.instanceId, request.token, record)) {
         await writeFrame(
           socket,
           { schemaVersion: 1, ok: false, code: 'unauthorized' },
-          limits,
+          options.limits,
           deadline,
         );
         return;
       }
       if (request.action === 'probe') {
         const { token: _token, endpoint: _endpoint, ...facts } = record;
-        await writeFrame(socket, { schemaVersion: 1, ok: true, facts }, limits, deadline);
+        await writeFrame(socket, { schemaVersion: 1, ok: true, facts }, options.limits, deadline);
+        return;
+      }
+      if (request.action === 'status') {
+        const status = (await options.onStatus?.()) ?? { phase: 'unknown' as const };
+        await writeFrame(socket, { schemaVersion: 1, ok: true, status }, options.limits, deadline);
         return;
       }
       const waitForCompletion = request.action === 'stop-and-wait';
-      const runStop = acceptStop();
+      const runStop = options.acceptStop();
       if (!runStop) {
         socket.destroy();
         return;
@@ -184,7 +192,7 @@ export class ControlEndpointService {
         await writeFrame(
           socket,
           { schemaVersion: 1, ok: true, accepted: true },
-          limits,
+          options.limits,
           deadline,
           !waitForCompletion,
         );
@@ -193,14 +201,14 @@ export class ControlEndpointService {
         // Acceptance delivery is not a cancellation boundary for cleanup.
       }
       if (!waitForCompletion) {
-        releaseResponder();
+        options.releaseResponder();
       }
       const completion = await runStop();
       if (!waitForCompletion) {
         try {
-          await completeStop(completion);
+          await options.completeStop(completion);
         } finally {
-          observeStop(completion, acceptedSent);
+          options.observeStop(completion, acceptedSent);
         }
         return;
       }
@@ -217,17 +225,17 @@ export class ControlEndpointService {
             };
       let sent = false;
       try {
-        await writeFrame(socket, response, limits, Date.now() + limits.timeoutMs);
+        await writeFrame(socket, response, options.limits, Date.now() + options.limits.timeoutMs);
         sent = true;
       } catch {
         socket.destroy();
       } finally {
         try {
-          await completeStop(completion);
+          await options.completeStop(completion);
         } catch {
           sent = false;
         }
-        observeStop(completion, sent);
+        options.observeStop(completion, sent);
       }
     } catch {
       socket.destroy();
