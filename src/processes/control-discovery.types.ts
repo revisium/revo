@@ -5,7 +5,12 @@ import type {
   StartDatabaseRequest,
 } from '../postgres/index.js';
 import type { StartupProgressFacade, StartupProgressOptions } from '../startup-progress/index.js';
-import type { ControlRecord, ControlStopResult } from './control-endpoint.types.js';
+import type {
+  ControlRecord,
+  ControlStopCompletion,
+  ControlStopDeliveryResult,
+  ControlStopResult,
+} from './control-endpoint.types.js';
 
 export type ControlDiscovery =
   | { readonly kind: 'found'; readonly record: ControlRecord }
@@ -19,7 +24,7 @@ export interface OpenPublishedControlRequest {
   readonly version: string;
   readonly channel: string;
   readonly limits?: import('./control-endpoint.types.js').ControlLimits;
-  readonly onStop: () => void | Promise<void>;
+  readonly onStop: () => ControlStopCompletion | void | Promise<ControlStopCompletion | void>;
   readonly startupProgress?: StartupProgressOptions;
   readonly databaseUrl?: string;
 }
@@ -29,6 +34,7 @@ interface HeldPublishedControlBase {
   readonly canonicalDataDir: string;
   readonly endpoint: string;
   readonly stopResult: Promise<ControlStopResult>;
+  readonly stopDelivery: Promise<ControlStopDeliveryResult>;
   readonly progress?: StartupProgressFacade;
   close(): Promise<void>;
 }

@@ -9,6 +9,8 @@ import {
   DEFAULT_CONTROL_LIMITS,
   type ControlLimits,
   type ControlRecord,
+  type ControlStopCompletion,
+  type ControlStopDeliveryResult,
   type ControlStopResult,
   type HeldControlEndpoint,
   type ListenControlEndpointRequest,
@@ -31,39 +33,101 @@ export class ControlEndpointService {
     const server = createServer();
     const sockets = new Set<Socket>();
     const stop = stopOutcome();
+    const delivery = deferred<ControlStopDeliveryResult>();
+    let phase: 'accepting' | 'stopping' | 'terminal' = 'accepting';
     let stopAccepted = false;
+    let responder: Socket | undefined;
+    let closeRequested = false;
+    let drainPromise: Promise<void> | undefined;
+    const drain = () =>
+      (drainPromise ??= closeEndpoint(server, sockets, responder).then(() => {
+        if (!stopAccepted) {
+          stop.resolve({ kind: 'not-requested' });
+        }
+      }));
     server.on('connection', (socket) => {
+      if (phase !== 'accepting') {
+        socket.destroy();
+        return;
+      }
       sockets.add(socket);
       socket.once('close', () => sockets.delete(socket));
-      void this.serve(socket, record, limits, () => {
-        if (stopAccepted) {
-          return undefined;
-        }
-        stopAccepted = true;
-        return async () => {
-          try {
-            await request.onStop();
-            stop.resolve({ kind: 'completed' });
-          } catch {
-            stop.resolve({
-              kind: 'failed',
-              error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
-            });
+      void this.serve(
+        socket,
+        record,
+        limits,
+        () => {
+          if (phase !== 'accepting') {
+            return undefined;
           }
-        };
-      });
+          phase = 'stopping';
+          stopAccepted = true;
+          responder = socket;
+          for (const other of sockets) {
+            if (other !== responder) {
+              other.destroy();
+            }
+          }
+          return async (): Promise<ControlStopCompletion> => {
+            let completion: ControlStopCompletion;
+            try {
+              completion = (await request.onStop()) ?? { kind: 'completed' };
+            } catch {
+              completion = { kind: 'failed', ownership: 'unconfirmed' };
+            }
+            return completion;
+          };
+        },
+        () => {
+          responder = undefined;
+        },
+        async (completion) => {
+          responder = undefined;
+          if (
+            completion.kind === 'failed' &&
+            completion.ownership === 'retained' &&
+            !closeRequested
+          ) {
+            phase = 'accepting';
+            return;
+          }
+          phase = 'terminal';
+          await drain();
+        },
+        (completion, sent) => {
+          delivery.resolve({ kind: sent ? 'sent' : 'failed' });
+          stop.resolve(
+            completion.kind === 'completed'
+              ? { kind: 'completed' }
+              : {
+                  kind: 'failed',
+                  error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+                },
+          );
+        },
+      );
     });
     await openServer(server, record.endpoint);
     let closePromise: Promise<void> | undefined;
+    const close = (): Promise<void> => {
+      closeRequested = true;
+      if (phase === 'stopping') {
+        for (const socket of sockets) {
+          if (socket !== responder) {
+            socket.destroy();
+          }
+        }
+        return Promise.resolve();
+      }
+      phase = 'terminal';
+      closePromise ??= drain();
+      return closePromise;
+    };
     return {
       endpoint: record.endpoint,
       stopResult: stop.promise,
-      close: () =>
-        (closePromise ??= closeEndpoint(server, sockets).then(() => {
-          if (!stopAccepted) {
-            stop.resolve({ kind: 'not-requested' });
-          }
-        })),
+      stopDelivery: delivery.promise,
+      close,
     };
   }
 
@@ -87,7 +151,10 @@ export class ControlEndpointService {
     socket: Socket,
     record: ControlRecord,
     limits: ControlLimits,
-    acceptStop: () => (() => Promise<void>) | undefined,
+    acceptStop: () => (() => Promise<ControlStopCompletion>) | undefined,
+    releaseResponder: () => void,
+    completeStop: (completion: ControlStopCompletion) => Promise<void>,
+    observeStop: (completion: ControlStopCompletion, sent: boolean) => void,
   ): Promise<void> {
     const deadline = Date.now() + limits.timeoutMs;
     try {
@@ -106,11 +173,61 @@ export class ControlEndpointService {
         await writeFrame(socket, { schemaVersion: 1, ok: true, facts }, limits, deadline);
         return;
       }
+      const waitForCompletion = request.action === 'stop-and-wait';
       const runStop = acceptStop();
+      if (!runStop) {
+        socket.destroy();
+        return;
+      }
+      let acceptedSent = false;
       try {
-        await writeFrame(socket, { schemaVersion: 1, ok: true, accepted: true }, limits, deadline);
+        await writeFrame(
+          socket,
+          { schemaVersion: 1, ok: true, accepted: true },
+          limits,
+          deadline,
+          !waitForCompletion,
+        );
+        acceptedSent = true;
+      } catch {
+        // Acceptance delivery is not a cancellation boundary for cleanup.
+      }
+      if (!waitForCompletion) {
+        releaseResponder();
+      }
+      const completion = await runStop();
+      if (!waitForCompletion) {
+        try {
+          await completeStop(completion);
+        } finally {
+          observeStop(completion, acceptedSent);
+        }
+        return;
+      }
+      const response =
+        completion.kind === 'completed'
+          ? { schemaVersion: 1, ok: true, completed: true }
+          : {
+              schemaVersion: 1,
+              ok: false,
+              completed: true,
+              code: 'CONTROL_STOP_FAILED',
+              message: 'Control stop callback failed',
+              ownership: completion.ownership,
+            };
+      let sent = false;
+      try {
+        await writeFrame(socket, response, limits, Date.now() + limits.timeoutMs);
+        sent = true;
+      } catch {
+        socket.destroy();
       } finally {
-        await runStop?.();
+        try {
+          await completeStop(completion);
+        } catch {
+          sent = false;
+        }
+        observeStop(completion, sent);
       }
     } catch {
       socket.destroy();
@@ -203,28 +320,42 @@ function writeFrame(
   value: unknown,
   limits: ControlLimits,
   deadline: number,
+  end = true,
 ): Promise<void> {
   const frame = `${JSON.stringify(value)}\n`;
   if (Buffer.byteLength(frame) > limits.maxFrameBytes) {
     return Promise.reject(new ControlTransportError());
   }
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = () => {
+    const finish = (error?: Error | null) => {
       if (settled) {
         return;
       }
       settled = true;
       clearTimeout(timer);
-      resolve();
+      if (error) {
+        reject(new ControlTransportError());
+      } else {
+        resolve();
+      }
     };
     const timer = setTimeout(() => {
       socket.destroy();
-      finish();
+      finish(new ControlTransportError());
     }, remaining(deadline));
     socket.once('error', finish);
-    socket.once('close', () => socket.off('error', finish));
-    socket.end(frame, finish);
+    socket.once('close', () => {
+      socket.off('error', finish);
+      if (!socket.writableFinished) {
+        finish(new ControlTransportError());
+      }
+    });
+    if (end) {
+      socket.end(frame, finish);
+    } else {
+      socket.write(frame, (error) => finish(error ?? undefined));
+    }
   });
 }
 
@@ -238,11 +369,19 @@ function openServer(server: Server, endpoint: string): Promise<void> {
   });
 }
 
-async function closeEndpoint(server: Server, sockets: Set<Socket>): Promise<void> {
+async function closeEndpoint(
+  server: Server,
+  sockets: Set<Socket>,
+  preserved?: Socket,
+): Promise<void> {
   for (const socket of sockets) {
-    socket.destroy();
+    if (socket !== preserved) {
+      socket.destroy();
+    }
   }
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+  preserved?.destroy();
+  await closed;
 }
 
 const remaining = (deadline: number) => Math.max(1, deadline - Date.now());
@@ -250,6 +389,11 @@ const remaining = (deadline: number) => Math.max(1, deadline - Date.now());
 function stopOutcome() {
   let resolve!: (value: ControlStopResult) => void;
   const promise = new Promise<ControlStopResult>((settle) => (resolve = settle));
+  return { promise, resolve };
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => (resolve = settle));
   return { promise, resolve };
 }
 const errorCode = (error: unknown) =>

@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 
 import { EmbeddedPostgresPreparationService } from '../../../src/postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresResourceService } from '../../../src/postgres/embedded-postgres-resource.service.js';
+import { EmbeddedPostgresError } from '../../../src/postgres/embedded-postgres.types.js';
 import { ManagedProcessError } from '../../../src/processes/managed-process-error.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type {
@@ -13,7 +14,10 @@ import type {
   ProcessCancellationResult,
   ProcessCompletion,
 } from '../../../src/processes/managed-process.types.js';
-import { PublishedControlService } from '../../../src/processes/published-control.service.js';
+import {
+  PublishedControlError,
+  PublishedControlService,
+} from '../../../src/processes/published-control.service.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
 import { BlockingJournal } from '../startup-progress/blocking-journal.js';
 
@@ -134,7 +138,7 @@ export class PostgresScenario {
       await journal.entered;
       const firstClosePending = held.close().then(
         () => 'resolved',
-        () => 'rejected',
+        (error: unknown) => closeFailure(error),
       );
       const secondClose = await Promise.race([
         held.close().then(
@@ -149,7 +153,7 @@ export class PostgresScenario {
       const beforeDrain = await this.open(fixture);
       const beforeDrainClose = await held.close().then(
         () => 'resolved',
-        () => 'rejected',
+        (error: unknown) => closeFailure(error),
       );
       journal.release();
       await pendingProgress;
@@ -162,7 +166,8 @@ export class PostgresScenario {
       if (replacement.kind !== 'held') {
         throw new Error('replacement owner missing');
       }
-      await held.close();
+      const oldClose = await held.close().then(() => 'resolved' as const);
+      const successorStillHeld = await this.open(fixture);
       const retained = await Promise.all([
         lstat(join(fixture.dataDir, 'postgres')).then(
           () => true,
@@ -183,6 +188,8 @@ export class PostgresScenario {
         beforeDrain: beforeDrain.kind,
         beforeDrainClose,
         replacement: replacement.kind,
+        oldClose,
+        successorStillHeld: successorStillHeld.kind,
         retained,
         secretByPathOnly: process.request?.args.some((value) => value.includes('--pwfile=')),
         environment: process.request?.env,
@@ -190,6 +197,36 @@ export class PostgresScenario {
     } finally {
       journal.release();
       await process.exit().catch(() => undefined);
+      await held.close().catch(() => undefined);
+    }
+  }
+
+  async preservesObservedInitializationExitWhenProgressFailureRewraps() {
+    const fixture = await this.fixture();
+    const held = await this.open(
+      fixture,
+      new EmbeddedPostgresPreparationService(new ImmediateFailedProcess()),
+      new FailedProgressJournal(),
+    );
+    if (held.kind !== 'held' || !held.prepareEmbeddedPostgres) {
+      throw new Error('owner missing');
+    }
+    try {
+      return await held
+        .prepareEmbeddedPostgres({ signal: new AbortController().signal, timeoutMs: 1000 })
+        .then(
+          () => ({ kind: 'resolved' as const }),
+          (error: unknown) =>
+            error instanceof EmbeddedPostgresError
+              ? {
+                  kind: 'rejected' as const,
+                  reason: error.reason,
+                  progressFailure: error.progressFailure,
+                  observedCompletion: error.observedCompletion,
+                }
+              : { kind: 'unexpected' as const },
+        );
+    } finally {
       await held.close().catch(() => undefined);
     }
   }
@@ -247,6 +284,12 @@ export class PostgresScenario {
   }
 }
 
+function closeFailure(error: unknown) {
+  return error instanceof PublishedControlError
+    ? { status: 'rejected' as const, code: error.code, ownership: error.ownership }
+    : { status: 'rejected' as const, code: 'unexpected', ownership: 'unconfirmed' as const };
+}
+
 class FailingCancellationProcess extends ManagedProcessService {
   request: ManagedProcessRequest | undefined;
   private owned: OwnedProcess | undefined;
@@ -288,5 +331,20 @@ class FailingCancellationProcess extends ManagedProcessService {
       throw new Error('process not started');
     }
     await this.stop(this.owned, { graceMs: 0, killWaitMs: 5000 });
+  }
+}
+
+class ImmediateFailedProcess extends ManagedProcessService {
+  override async start(): Promise<OwnedProcess> {
+    return { completion: Promise.resolve({ exitCode: 7, signal: null }) };
+  }
+}
+
+class FailedProgressJournal extends StartupProgressJournalWriter {
+  override async write(...parameters: Parameters<StartupProgressJournalWriter['write']>) {
+    if (parameters[2].at(-1)?.status === 'failed') {
+      throw new Error('secret progress write failure');
+    }
+    return super.write(...parameters);
   }
 }

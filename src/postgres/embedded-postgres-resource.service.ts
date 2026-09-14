@@ -141,8 +141,14 @@ export class OwnedEmbeddedPostgresResource {
       );
       await this.progress.complete('postgres-start');
       rejectCancellation(controller.signal);
-      if (this.closing || !this.serverCompletion || this.server !== ready.child || ready.exited()) {
-        throw new EmbeddedPostgresError('process');
+      const observedCompletion = ready.exited();
+      if (
+        this.closing ||
+        !this.serverCompletion ||
+        this.server !== ready.child ||
+        observedCompletion
+      ) {
+        throw new EmbeddedPostgresError('process', false, observedCompletion);
       }
       this.started = Object.freeze({
         kind: 'embedded',
@@ -158,7 +164,7 @@ export class OwnedEmbeddedPostgresResource {
           code: `POSTGRES_${failure.reason.toUpperCase()}`,
         });
       } catch {
-        throw new EmbeddedPostgresError(failure.reason, true);
+        throw new EmbeddedPostgresError(failure.reason, true, failure.observedCompletion);
       }
       throw failure;
     } finally {
@@ -227,16 +233,16 @@ export class OwnedEmbeddedPostgresResource {
           deadline,
           () => attempt.exited,
         ).then(() => 'ready' as const),
-        attempt.child.completion.then(() => 'exited' as const),
+        attempt.child.completion.then((completion) => ({ kind: 'exited' as const, completion })),
       ]);
-      if (outcome === 'exited') {
-        throw new EmbeddedPostgresError('process');
+      if (outcome !== 'ready') {
+        throw new EmbeddedPostgresError('process', false, outcome.completion);
       }
       return {
         kind: 'ready',
         port: reservation.port,
         child: attempt.child,
-        exited: () => attempt.exited !== undefined,
+        exited: () => attempt.exited,
       };
     } catch (error) {
       attemptController.abort();
@@ -352,14 +358,15 @@ export class OwnedEmbeddedPostgresResource {
     startupNonce: string,
     signal: AbortSignal,
     deadline: number,
-    exited: () => unknown,
+    exited: () => ProcessCompletion | undefined,
   ): Promise<void> {
     rejectCancellation(signal);
     if (Date.now() >= deadline) {
       throw new EmbeddedPostgresError('cancelled');
     }
-    if (exited()) {
-      throw new EmbeddedPostgresError('process');
+    const observedCompletion = exited();
+    if (observedCompletion) {
+      throw new EmbeddedPostgresError('process', false, observedCompletion);
     }
     try {
       await this.readiness.initialize({
@@ -417,7 +424,7 @@ interface ReadyAttempt {
   readonly kind: 'ready';
   readonly port: number;
   readonly child: OwnedProcess;
-  readonly exited: () => boolean;
+  readonly exited: () => ProcessCompletion | undefined;
 }
 
 interface TrackedAttempt {

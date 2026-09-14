@@ -22,8 +22,22 @@ export interface ListenControlEndpointRequest {
   readonly token: string;
   readonly identity: Omit<ControlRecord, 'schemaVersion' | 'instanceId' | 'token' | 'endpoint'>;
   readonly limits?: ControlLimits;
-  readonly onStop: () => void | Promise<void>;
+  readonly onStop: () => ControlStopCompletion | void | Promise<ControlStopCompletion | void>;
 }
+
+export type ControlStopCompletion =
+  | { readonly kind: 'completed' }
+  | { readonly kind: 'failed'; readonly ownership: 'retained' | 'unconfirmed' };
+
+export type ControlStopResponse =
+  | { readonly kind: 'completed' }
+  | {
+      readonly kind: 'failed';
+      readonly ownership: 'retained' | 'unconfirmed';
+      readonly error: SafeControlStopError;
+    };
+
+export type ControlStopDeliveryResult = { readonly kind: 'sent' } | { readonly kind: 'failed' };
 
 export type ControlStopResult =
   | { readonly kind: 'not-requested' }
@@ -38,6 +52,7 @@ export interface SafeControlStopError {
 export interface HeldControlEndpoint {
   readonly endpoint: string;
   readonly stopResult: Promise<ControlStopResult>;
+  readonly stopDelivery: Promise<ControlStopDeliveryResult>;
   close(): Promise<void>;
 }
 

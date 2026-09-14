@@ -18,11 +18,14 @@ import { ControlEndpointService } from './control-endpoint.service.js';
 import { ProcessIdentityService } from './process-identity.service.js';
 import { ServerOwnershipService } from './server-ownership.service.js';
 
+type PublishedControlCleanupFailure = 'endpoint' | 'metadata' | 'ownership';
+
 export class PublishedControlError extends Error {
   readonly code = 'PUBLISHED_CONTROL_ERROR';
   constructor(
     readonly phase: 'startup' | 'close',
-    readonly cleanupFailures: readonly ('endpoint' | 'metadata' | 'ownership')[] = [],
+    readonly cleanupFailures: readonly PublishedControlCleanupFailure[] = [],
+    readonly ownership: 'retained' | 'released' | 'unconfirmed' = 'unconfirmed',
   ) {
     super('Published control lifecycle failed');
     this.name = 'PublishedControlError';
@@ -94,7 +97,8 @@ export class PublishedControlService {
       await publishRecord(temporaryPath, join(canonicalDataDir, CONTROL_FILE), record);
       let finalClose: Promise<void> | undefined;
       let progressClose: Promise<void> | undefined;
-      let finalState: 'pending' | 'success' | 'failure' = 'pending';
+      let finalState: 'pending' | 'released' | 'failed' = 'pending';
+      const isReleased = () => finalState === 'released';
       const finalize = () => {
         progressClose ??= progress?.close();
         if (!finalClose) {
@@ -105,30 +109,39 @@ export class PublishedControlService {
           })();
           void finalClose.then(
             () => {
-              finalState = 'success';
+              finalState = 'released';
             },
             () => {
-              finalState = 'failure';
+              finalState = 'failed';
             },
           );
         }
         return finalClose;
       };
       const close = async () => {
+        if (isReleased()) {
+          await finalClose;
+          return;
+        }
         const postgresClose = postgres?.close();
         progressClose ??= progress?.close();
+        let postgresFailed = false;
         try {
           await postgresClose;
         } catch {
-          if (finalClose) {
-            if (finalState !== 'pending') {
-              await finalClose;
-              return;
-            }
-            throw new PublishedControlError('close');
+          postgresFailed = true;
+        }
+        if (postgresFailed) {
+          if (!finalClose) {
+            void finalize().catch(() => undefined);
           }
-          void finalize().catch(() => undefined);
-          throw new PublishedControlError('close');
+          if (isReleased()) {
+            throw new PublishedControlError('close', [], 'released');
+          }
+          if (finalState === 'failed') {
+            await finalClose;
+          }
+          throw new PublishedControlError('close', [], 'retained');
         }
         await finalize();
       };
@@ -137,6 +150,7 @@ export class PublishedControlService {
         canonicalDataDir,
         endpoint: createdEndpoint.endpoint,
         stopResult: createdEndpoint.stopResult,
+        stopDelivery: createdEndpoint.stopDelivery,
         ...(progress ? { progress } : {}),
         ...(postgres ? { startDatabase: postgres.start.bind(postgres) } : {}),
         close,
@@ -166,11 +180,11 @@ export class PublishedControlService {
     token: string,
     lease: Extract<Awaited<ReturnType<ServerOwnershipService['acquire']>>, { kind: 'held' }>,
   ): Promise<void> {
-    let failed = false;
+    const failures: ('endpoint' | 'metadata' | 'ownership')[] = [];
     try {
       await endpoint.close();
     } catch {
-      failed = true;
+      failures.push('endpoint');
     }
     try {
       const discovered = await this.discovery.read(canonicalDataDir);
@@ -181,18 +195,22 @@ export class PublishedControlService {
       ) {
         await unlink(join(canonicalDataDir, CONTROL_FILE));
       } else if (discovered.kind === 'invalid' || discovered.kind === 'unavailable') {
-        failed = true;
+        failures.push('metadata');
       }
     } catch {
-      failed = true;
+      failures.push('metadata');
     }
     try {
       await lease.release();
     } catch {
-      failed = true;
+      failures.push('ownership');
     }
-    if (failed) {
-      throw new PublishedControlError('close');
+    if (failures.length > 0) {
+      throw new PublishedControlError(
+        'close',
+        failures,
+        failures.includes('ownership') ? 'unconfirmed' : 'released',
+      );
     }
   }
 }

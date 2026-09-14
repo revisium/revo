@@ -6,14 +6,21 @@ import { Client } from 'pg';
 
 import { EmbeddedPostgresPreparationService } from '../../../src/postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresResourceService } from '../../../src/postgres/embedded-postgres-resource.service.js';
+import { EmbeddedPostgresError } from '../../../src/postgres/embedded-postgres.types.js';
 import {
   LoopbackPortAllocator,
   type ReservedLoopbackPort,
 } from '../../../src/postgres/loopback-port-allocator.js';
+import { ControlClientService } from '../../../src/processes/control-client.service.js';
+import { ControlDiscoveryService } from '../../../src/processes/control-discovery.service.js';
 import type { PublishedControl } from '../../../src/processes/control-discovery.types.js';
+import type { ControlStopCompletion } from '../../../src/processes/control-endpoint.types.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type { ManagedProcessRequest } from '../../../src/processes/managed-process.types.js';
-import { PublishedControlService } from '../../../src/processes/published-control.service.js';
+import {
+  PublishedControlError,
+  PublishedControlService,
+} from '../../../src/processes/published-control.service.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
 import { BlockingJournal } from '../startup-progress/blocking-journal.js';
 import { ClusterFixture } from './postgres-readiness-scenario.js';
@@ -162,7 +169,7 @@ export class PostgresLifecycleScenario {
       new EmbeddedPostgresPreparationService(processes),
       processes,
     );
-    const owner = await this.open(fixture, FIRST_OPERATION, undefined, resource, journal);
+    const owner = await this.open(fixture, FIRST_OPERATION, undefined, resource, journal, true);
     try {
       await this.start(owner);
       if (!owner.progress) {
@@ -175,32 +182,46 @@ export class PostgresLifecycleScenario {
         () => 'rejected' as const,
       );
       await waitForGate(journal.entered, progressOutcome);
-      const firstClose = owner.close().then(
-        () => 'resolved',
-        () => 'rejected',
+      const discovered = await new ControlDiscoveryService().read(fixture.dataDir);
+      if (discovered.kind !== 'found') {
+        throw new Error('control missing');
+      }
+      const closeOutcome = await new ControlClientService().requestStopAndWait(
+        discovered.record,
+        2_000,
+        { timeoutMs: 500, maxFrameBytes: 16_384 },
       );
-      const repeatedClose = owner.close().then(
-        () => 'resolved',
-        () => 'rejected',
-      );
-      const closeOutcome = await firstClose;
-      const sameOutcome = await repeatedClose;
       const busy = await this.openResult(fixture, SECOND_OPERATION);
+      const repeatedCloseOperation = owner.close().then(
+        () => 'resolved' as const,
+        () => 'rejected' as const,
+      );
+      await waitForGate(
+        repeatedCloseOperation.then(() => undefined),
+        new Promise<never>(() => undefined),
+        2_000,
+      );
+      const repeatedClose = await repeatedCloseOperation;
       await processes.release();
       const beforeJournalDrain = await this.openResult(fixture, SECOND_OPERATION);
       journal.release();
       await pendingProgress;
       const reopened = await this.acquireEventually(fixture, SECOND_OPERATION, Date.now() + 2000);
+      const endpointRetry = await new ControlClientService().requestStop(discovered.record).then(
+        () => 'accepted' as const,
+        () => 'rejected' as const,
+      );
       if (reopened?.kind === 'held') {
         this.owners.push(reopened);
         await reopened.close();
       }
       return {
         closeOutcome,
-        sameOutcome,
+        repeatedClose,
         busy: busy.kind,
         beforeJournalDrain: beforeJournalDrain.kind,
         reopened: reopened?.kind,
+        endpointRetry,
         completion: await processes.completion,
       };
     } finally {
@@ -222,7 +243,7 @@ export class PostgresLifecycleScenario {
       const controller = new AbortController();
       const starting = owner
         .startDatabase?.({ signal: controller.signal, timeoutMs: 30_000 })
-        .then(toOutcome, toRejectedOutcome);
+        .then(toOutcome, toDiagnosticRejectedOutcome);
       if (!starting) {
         throw new Error('database owner missing');
       }
@@ -277,7 +298,7 @@ export class PostgresLifecycleScenario {
     const owner = await this.open(fixture, FIRST_OPERATION, undefined, resource, journal);
     journal.blockPostgresCompletion();
     try {
-      const starting = this.start(owner).then(toOutcome, toRejectedOutcome);
+      const starting = this.start(owner).then(toOutcome, toDiagnosticRejectedOutcome);
       await waitForGate(journal.entered, starting);
       const closing = closeWhileBlocked
         ? owner.close().then(toOutcome, toRejectedOutcome)
@@ -360,13 +381,15 @@ export class PostgresLifecycleScenario {
     allocator?: LoopbackPortAllocator,
     suppliedResource?: EmbeddedPostgresResourceService,
     journal?: StartupProgressJournalWriter,
+    stopOwner = false,
   ) {
     const resource =
       suppliedResource ??
       (allocator
         ? new EmbeddedPostgresResourceService(undefined, undefined, allocator)
         : undefined);
-    const owner = await new PublishedControlService(
+    let owner: PublishedControl | undefined;
+    owner = await new PublishedControlService(
       undefined,
       undefined,
       undefined,
@@ -377,7 +400,23 @@ export class PostgresLifecycleScenario {
       ...fixture,
       version: '1.0.0',
       channel: 'stable',
-      onStop: () => undefined,
+      onStop: async (): Promise<ControlStopCompletion | undefined> => {
+        if (!stopOwner || owner?.kind !== 'held') {
+          return undefined;
+        }
+        try {
+          await owner.close();
+          return { kind: 'completed' as const };
+        } catch (error) {
+          return {
+            kind: 'failed' as const,
+            ownership:
+              error instanceof PublishedControlError && error.ownership === 'retained'
+                ? ('retained' as const)
+                : ('unconfirmed' as const),
+          };
+        }
+      },
       startupProgress: { operationId, now: () => performance.now() },
     });
     this.owners.push(owner);
@@ -604,11 +643,24 @@ const readListener = (port: number | undefined) =>
 
 const toOutcome = () => 'resolved' as const;
 const toRejectedOutcome = () => 'rejected' as const;
-const waitForGate = async (gate: Promise<void>, outcome: Promise<unknown>): Promise<void> => {
+const toDiagnosticRejectedOutcome = (error: unknown) =>
+  error instanceof EmbeddedPostgresError
+    ? {
+        kind: 'rejected' as const,
+        reason: error.reason,
+        progressFailure: error.progressFailure,
+        observedCompletion: error.observedCompletion,
+      }
+    : { kind: 'rejected' as const };
+const waitForGate = async (
+  gate: Promise<void>,
+  outcome: Promise<unknown>,
+  timeoutMs = 5_000,
+): Promise<void> => {
   const reached = await Promise.race([
     gate.then(() => 'gate' as const),
     outcome?.then(() => 'outcome' as const),
-    new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 5000)),
+    new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), timeoutMs)),
   ]);
   if (reached !== 'gate') {
     throw new Error(`fixture gate was not reached: ${reached}`);

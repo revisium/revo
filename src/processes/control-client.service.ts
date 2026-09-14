@@ -6,6 +6,7 @@ import {
   DEFAULT_CONTROL_LIMITS,
   type ControlLimits,
   type ControlRecord,
+  type ControlStopResponse,
 } from './control-endpoint.types.js';
 import { ControlTransportError, parseControlRecord, validateLimits } from './control-protocol.js';
 
@@ -40,6 +41,153 @@ export class ControlClientService {
     }
     return { kind: 'accepted' as const };
   }
+
+  async requestStopAndWait(
+    recordValue: unknown,
+    completionTimeoutMs: number,
+    limits: ControlLimits = DEFAULT_CONTROL_LIMITS,
+  ): Promise<ControlStopResponse> {
+    const record = requireRecord(recordValue, limits);
+    if (!Number.isSafeInteger(completionTimeoutMs) || completionTimeoutMs < 1) {
+      throw new ControlTransportError('Invalid stop completion timeout');
+    }
+    const [accepted, completed] = await exchangeStop(record, limits, completionTimeoutMs);
+    if (!isAccepted(accepted) || !isObject(completed) || completed.completed !== true) {
+      throw new ControlTransportError();
+    }
+    const completion = parseStopCompletion(completed);
+    if (completion) {
+      return completion;
+    }
+    throw new ControlTransportError();
+  }
+}
+
+function parseStopCompletion(value: Record<string, unknown>): ControlStopResponse | undefined {
+  if (Object.keys(value).length === 3 && value.schemaVersion === 1 && value.ok === true) {
+    return { kind: 'completed' };
+  }
+  if (
+    Object.keys(value).length === 6 &&
+    value.schemaVersion === 1 &&
+    value.ok === false &&
+    value.code === 'CONTROL_STOP_FAILED' &&
+    value.message === 'Control stop callback failed' &&
+    (value.ownership === 'retained' || value.ownership === 'unconfirmed')
+  ) {
+    return {
+      kind: 'failed',
+      ownership: value.ownership,
+      error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+    };
+  }
+  return undefined;
+}
+
+const isAccepted = (response: unknown) =>
+  isObject(response) &&
+  Object.keys(response).length === 3 &&
+  response.schemaVersion === 1 &&
+  response.ok === true &&
+  response.accepted === true;
+
+function exchangeStop(record: ControlRecord, limits: ControlLimits, completionTimeoutMs: number) {
+  return new Promise<[unknown, unknown]>((resolve, reject) => {
+    const socket = connect(record.endpoint);
+    const frames: unknown[] = [];
+    let data: Buffer = Buffer.alloc(0);
+    let settled = false;
+    let timer = setTimeout(() => finish(new ControlTransportError()), limits.timeoutMs);
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error) {
+        reject(new ControlTransportError());
+      } else {
+        resolve([frames[0], frames[1]]);
+      }
+    };
+    const armCompletion = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => finish(new ControlTransportError()), completionTimeoutMs);
+    };
+    socket.once('connect', () => {
+      socket.write(
+        `${JSON.stringify({ schemaVersion: 1, instanceId: record.instanceId, token: record.token, action: 'stop-and-wait' })}\n`,
+      );
+    });
+    socket.on('data', (chunk: Buffer) => {
+      data = Buffer.concat([data, chunk], data.length + chunk.length);
+      for (;;) {
+        const frame = nextStopFrame(data, limits.maxFrameBytes);
+        if (frame.kind === 'incomplete') {
+          return;
+        }
+        if (frame.kind === 'invalid') {
+          finish(new ControlTransportError());
+          return;
+        }
+        data = frame.rest;
+        frames.push(frame.value);
+        const outcome = stopFrameOutcome(frame.value, frames.length);
+        if (outcome === 'invalid' || outcome === 'extra') {
+          finish(new ControlTransportError());
+          return;
+        }
+        if (outcome === 'accepted') {
+          armCompletion();
+        }
+        if (outcome === 'completed') {
+          if (data.length !== 0) {
+            finish(new ControlTransportError());
+          } else {
+            finish();
+          }
+          return;
+        }
+      }
+    });
+    socket.once('end', () => frames.length === 2 || finish(new ControlTransportError()));
+    socket.once('error', () => finish(new ControlTransportError()));
+  });
+}
+
+type StopFrame =
+  | { readonly kind: 'incomplete' }
+  | { readonly kind: 'invalid' }
+  | { readonly kind: 'frame'; readonly value: unknown; readonly rest: Buffer };
+
+function nextStopFrame(data: Buffer, maxFrameBytes: number): StopFrame {
+  const newline = data.indexOf(10);
+  if (newline < 0) {
+    return data.length > maxFrameBytes ? { kind: 'invalid' } : { kind: 'incomplete' };
+  }
+  if (newline + 1 > maxFrameBytes) {
+    return { kind: 'invalid' };
+  }
+  try {
+    return {
+      kind: 'frame',
+      value: JSON.parse(data.subarray(0, newline).toString('utf8')),
+      rest: data.subarray(newline + 1),
+    };
+  } catch {
+    return { kind: 'invalid' };
+  }
+}
+
+function stopFrameOutcome(
+  value: unknown,
+  count: number,
+): 'accepted' | 'completed' | 'invalid' | 'extra' {
+  if (count === 1) {
+    return isAccepted(value) ? 'accepted' : 'invalid';
+  }
+  return count === 2 ? 'completed' : 'extra';
 }
 
 function requireRecord(value: unknown, limits: ControlLimits): ControlRecord {

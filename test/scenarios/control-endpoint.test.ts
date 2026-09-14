@@ -12,9 +12,48 @@ describe('authenticated private control transport', () => {
   it('probes exact host facts and coalesces concurrent stop requests', async () => {
     await expect(scenario.probesAndStopsOnce()).resolves.toEqual({
       probe: { kind: 'confirmed' },
-      accepted: [{ kind: 'accepted' }, { kind: 'accepted' }],
+      accepted: [{ kind: 'accepted' }],
       stops: 1,
       stopResult: { kind: 'completed' },
+    });
+  });
+  it('holds the stop responder through cleanup and rejects new admission', async () => {
+    await expect(scenario.waitsForCleanupAndRejectsAdmission()).resolves.toEqual({
+      beforeCleanup: false,
+      admission: 'rejected',
+      completion: { kind: 'completed' },
+    });
+  });
+  it('rearms only after proven retention and treats unconfirmed cleanup as terminal', async () => {
+    await expect(scenario.rearmsOnlyWhenRetentionIsProven()).resolves.toEqual({
+      first: {
+        kind: 'failed',
+        ownership: 'retained',
+        error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+      },
+      second: { kind: 'completed' },
+      failed: {
+        kind: 'failed',
+        ownership: 'unconfirmed',
+        error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+      },
+      retry: 'rejected',
+    });
+  });
+  it('parses accepted and completed frames delivered in one chunk', async () => {
+    await expect(scenario.acceptsCoalescedStopFrames()).resolves.toEqual({
+      legacy: { kind: 'accepted' },
+      strict: { kind: 'completed' },
+    });
+  });
+  it('does not infer success when the completion reply is lost', async () => {
+    await expect(scenario.doesNotInferCompletionFromReplyLoss()).resolves.toBe('unconfirmed');
+  });
+  it('observes final reply failure after successful cleanup without rearming', async () => {
+    await expect(scenario.observesFailedFinalReplyAfterCleanup()).resolves.toEqual({
+      cleanup: { kind: 'completed' },
+      delivery: { kind: 'failed' },
+      cleaned: true,
     });
   });
   it('rejects wrong tokens and instance identities', async () => {

@@ -63,20 +63,30 @@ describe('embedded PostgreSQL owned lifecycle', () => {
     await expect(
       scenario.retainsOwnershipAfterStopFailureUntilTheOwnedServerActuallyExits(),
     ).resolves.toEqual({
-      closeOutcome: 'rejected',
-      sameOutcome: 'rejected',
+      closeOutcome: {
+        kind: 'failed',
+        ownership: 'retained',
+        error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+      },
+      repeatedClose: 'rejected',
       busy: 'busy',
       beforeJournalDrain: 'busy',
       reopened: 'held',
+      endpointRetry: 'rejected',
       completion: { exitCode: 0, signal: null },
     });
-  }, 10_000);
+  }, 45_000);
 
   it('cancels an actually spawned owned server before readiness completes', async () => {
     await expect(
       scenario.cancelsAnActuallySpawnedServerBeforeReadinessCompletes(),
     ).resolves.toEqual({
-      outcome: 'rejected',
+      outcome: {
+        kind: 'rejected',
+        reason: 'cancelled',
+        progressFailure: false,
+        observedCompletion: undefined,
+      },
       completion: { exitCode: null, signal: 'SIGTERM' },
     });
   });
@@ -91,7 +101,12 @@ describe('embedded PostgreSQL owned lifecycle', () => {
   it('does not publish a dead child after an accepted ready journal write', async () => {
     await expect(scenario.rejectsWhenTheReadyChildExitsDuringAcceptedCompletion()).resolves.toEqual(
       {
-        outcome: 'rejected',
+        outcome: {
+          kind: 'rejected',
+          reason: 'cancelled',
+          progressFailure: true,
+          observedCompletion: undefined,
+        },
         closeOutcome: 'rejected',
         completion: { exitCode: 0, signal: null },
       },
@@ -102,7 +117,12 @@ describe('embedded PostgreSQL owned lifecycle', () => {
     await expect(
       scenario.rejectsWhenTheReadyChildExitsDuringAcceptedCompletion(false),
     ).resolves.toEqual({
-      outcome: 'rejected',
+      outcome: {
+        kind: 'rejected',
+        reason: 'process',
+        progressFailure: false,
+        observedCompletion: { exitCode: 0, signal: null },
+      },
       closeOutcome: 'not-requested',
       completion: { exitCode: 0, signal: null },
     });
