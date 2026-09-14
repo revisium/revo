@@ -68,11 +68,17 @@ export class PublishedControlService {
       const progress = request.startupProgress
         ? new OwnedStartupProgress(this.progressJournal, canonicalDataDir, request.startupProgress)
         : undefined;
-      const postgres = progress
-        ? request.databaseUrl !== undefined
-          ? this.externalPostgres.bind(request.databaseUrl, progress)
-          : this.postgres.bind(canonicalDataDir, progress)
-        : undefined;
+      let postgres:
+        | ReturnType<ExternalPostgresResourceService['bind']>
+        | ReturnType<EmbeddedPostgresResourceService['bind']>
+        | undefined;
+      if (progress) {
+        if (request.databaseUrl !== undefined) {
+          postgres = this.externalPostgres.bind(request.databaseUrl, progress);
+        } else {
+          postgres = this.postgres.bind(canonicalDataDir, progress);
+        }
+      }
       await progress?.initialize();
       const record = {
         schemaVersion: 1 as const,

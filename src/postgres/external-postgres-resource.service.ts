@@ -109,12 +109,14 @@ export class OwnedExternalPostgresResource {
       this.rejectClosing(request.signal);
       return Object.freeze({ kind: 'external' });
     } catch (error) {
-      const failure =
-        error instanceof ExternalPostgresError
-          ? error
-          : new ExternalPostgresError(
-              this.closing || request.signal.aborted ? 'cancelled' : 'connection',
-            );
+      let failure: ExternalPostgresError;
+      if (error instanceof ExternalPostgresError) {
+        failure = error;
+      } else if (this.closing || request.signal.aborted) {
+        failure = new ExternalPostgresError('cancelled');
+      } else {
+        failure = new ExternalPostgresError('connection');
+      }
       await this.progress
         .fail('postgres-connect', { code: `POSTGRES_EXTERNAL_${failure.reason.toUpperCase()}` })
         .catch(() => undefined);
