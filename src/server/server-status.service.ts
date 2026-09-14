@@ -2,7 +2,11 @@ import { Inject, Injectable } from '@nestjs/common';
 
 import { ControlClientService } from '../processes/control-client.service.js';
 import { ControlDiscoveryService } from '../processes/control-discovery.service.js';
-import type { ControlLimits, ControlServerStatus } from '../processes/control-endpoint.types.js';
+import type {
+  ControlLimits,
+  ControlRecord,
+  ControlServerStatus,
+} from '../processes/control-endpoint.types.js';
 import { DEFAULT_CONTROL_LIMITS } from '../processes/control-endpoint.types.js';
 import { ServerOwnershipService } from '../processes/server-ownership.service.js';
 
@@ -61,17 +65,25 @@ export class ServerStatusService {
     } catch {
       return { kind: 'unknown' };
     }
-    if (status.phase !== 'running') {
-      if (status.phase === 'stopped') {
-        return { kind: 'stopped' };
-      }
-      if (status.phase === 'starting' || status.phase === 'stopping' || status.phase === 'failed') {
-        return { kind: status.phase, status };
-      }
+    const phase = classifyStatus(status);
+    if (phase) {
+      return phase;
+    }
+    if (!(await this.probeLive(status, first.record, dataDir, bounded, deadline))) {
       return { kind: 'unknown' };
     }
+    return { kind: 'running', status };
+  }
+
+  private async probeLive(
+    status: ControlServerStatus,
+    record: ControlRecord,
+    dataDir: string,
+    limits: ControlLimits,
+    deadline: number,
+  ): Promise<boolean> {
     if (!validListener(status)) {
-      return { kind: 'unknown' };
+      return false;
     }
     try {
       remaining(deadline);
@@ -87,32 +99,36 @@ export class ServerStatusService {
       );
       remaining(deadline);
       if (!response.ok) {
-        return { kind: 'unknown' };
+        return false;
       }
-      const value: unknown = JSON.parse(await readBounded(response, bounded.maxFrameBytes));
+      const value: unknown = JSON.parse(await readBounded(response, limits.maxFrameBytes));
       remaining(deadline);
       if (!isReadyGraphql(value)) {
-        return { kind: 'unknown' };
+        return false;
       }
-      const confirmed = await this.controls.requestStatus(
-        first.record,
-        withRemaining(bounded, deadline),
-      );
+      const confirmed = await this.controls.requestStatus(record, withRemaining(limits, deadline));
       remaining(deadline);
       const current = await this.discovery.read(dataDir);
       remaining(deadline);
-      if (
-        confirmed.phase !== 'running' ||
-        current.kind !== 'found' ||
-        current.record.instanceId !== first.record.instanceId
-      ) {
-        return { kind: 'unknown' };
-      }
+      return (
+        confirmed.phase === 'running' &&
+        current.kind === 'found' &&
+        current.record.instanceId === record.instanceId
+      );
     } catch {
-      return { kind: 'unknown' };
+      return false;
     }
-    return { kind: 'running', status };
   }
+}
+
+function classifyStatus(status: ControlServerStatus): ServerStatus | undefined {
+  if (status.phase === 'stopped') {
+    return { kind: 'stopped' };
+  }
+  if (status.phase === 'starting' || status.phase === 'stopping' || status.phase === 'failed') {
+    return { kind: status.phase, status };
+  }
+  return status.phase === 'running' ? undefined : { kind: 'unknown' };
 }
 
 function validListener(status: ControlServerStatus): status is ControlServerStatus & {

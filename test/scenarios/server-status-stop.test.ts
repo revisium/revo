@@ -1,16 +1,18 @@
-import { chmod, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { ControlClientService } from '../../src/processes/control-client.service.js';
 import { ControlEndpointService } from '../../src/processes/control-endpoint.service.js';
 import type {
   ControlRecord,
   ControlServerStatus,
   HeldControlEndpoint,
 } from '../../src/processes/control-endpoint.types.js';
+import { ControlTransportError } from '../../src/processes/control-protocol.js';
 import { ProcessIdentityService } from '../../src/processes/process-identity.service.js';
 import { ServerOwnershipService } from '../../src/processes/server-ownership.service.js';
 import { ServerStatusService } from '../../src/server/server-status.service.js';
@@ -101,6 +103,70 @@ describe('server status and stop services', () => {
   });
 
   it.each([
+    [{ phase: 'starting', operationId: 'abcdefabcdefabcdefabcdefabcdefab' }, 'starting'],
+    [{ phase: 'stopping', operationId: 'abcdefabcdefabcdefabcdefabcdefab' }, 'stopping'],
+    [{ phase: 'stopped', operationId: 'abcdefabcdefabcdefabcdefabcdefab' }, 'stopped'],
+    [{ phase: 'unknown' }, 'unknown'],
+    [
+      {
+        phase: 'failed',
+        operationId: 'abcdefabcdefabcdefabcdefabcdefab',
+        code: 'revo.server-owner.stop',
+        ownership: 'retained',
+      },
+      'failed',
+    ],
+  ] as const)('reports authenticated %s status as %s', async (status, kind) => {
+    const fixture = await controlFixture(status);
+    await expect(new ServerStatusService().read(fixture.dataDir, limits)).resolves.toEqual(
+      kind === 'stopped' || kind === 'unknown' ? { kind } : { kind, status },
+    );
+    await fixture.close();
+  });
+
+  it.each([
+    [{ phase: 'starting', operationId: 'wrong' }],
+    [{ phase: 'restarting', operationId: 'abcdefabcdefabcdefabcdefabcdefab' }],
+    [
+      {
+        phase: 'failed',
+        operationId: 'abcdefabcdefabcdefabcdefabcdefab',
+        code: 'revo.server-owner.stop',
+        ownership: 'retained',
+        extra: true,
+      },
+    ],
+    [
+      {
+        phase: 'running',
+        operationId: 'abcdefabcdefabcdefabcdefabcdefab',
+        host: '127.0.0.1',
+        port: 0,
+        publicUrl: 'http://public.invalid',
+      },
+    ],
+    [
+      {
+        phase: 'running',
+        operationId: 'abcdefabcdefabcdefabcdefabcdefab',
+        host: 'localhost',
+        port: 3210,
+        publicUrl: 'http://user:secret@public.invalid/?token=secret',
+      },
+    ],
+  ] as const)('returns unknown for malformed or unsafe authenticated status %#', async (status) => {
+    // @ts-expect-error The authenticated peer deliberately violates the status wire contract.
+    const fixture = await controlFixture(status);
+    await expect(new ControlClientService().requestStatus(fixture.record, limits)).rejects.toThrow(
+      ControlTransportError,
+    );
+    await expect(new ServerStatusService().read(fixture.dataDir, limits)).resolves.toEqual({
+      kind: 'unknown',
+    });
+    await fixture.close();
+  });
+
+  it.each([
     '{"data":{"__typename":"Mutation"}}',
     '{"data":{"__typename":"Query"},"errors":[]}',
     '{"data":{"__typename":"Query"}}' + ' '.repeat(limits.maxFrameBytes),
@@ -174,13 +240,14 @@ async function controlFixture(
   const dataDir = join(root, 'd');
   const runtimeDir = join(root, 'r');
   await Promise.all([mkdirPrivate(dataDir), mkdirPrivate(runtimeDir)]);
+  const canonicalDataDir = await realpath(dataDir);
   const process = await new ProcessIdentityService().capture(globalThis.process.pid);
   const endpoint = await new ControlEndpointService().listen({
     runtimeDir,
     instanceId: '0123456789abcdef0123456789abcdef',
     token: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
     limits,
-    identity: { version: '0.0.0', channel: 'stable', canonicalDataDir: dataDir, process },
+    identity: { version: '0.0.0', channel: 'stable', canonicalDataDir, process },
     onStatus: () => status,
     onStop: () => completion,
   });
@@ -192,7 +259,7 @@ async function controlFixture(
     endpoint: endpoint.endpoint,
     version: '0.0.0',
     channel: 'stable',
-    canonicalDataDir: dataDir,
+    canonicalDataDir,
     process,
   };
   await writeFile(join(dataDir, '.revo-control.json'), `${JSON.stringify(record)}\n`, {
@@ -200,6 +267,7 @@ async function controlFixture(
   });
   return {
     dataDir,
+    record,
     close: () => endpoint.close(),
     replaceStatus: (next: ControlServerStatus) => {
       status = next;

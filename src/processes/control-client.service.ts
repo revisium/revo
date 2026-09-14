@@ -7,7 +7,7 @@ import {
   type ControlLimits,
   type ControlRecord,
   type ControlStopResponse,
-  type ControlStatusResponse,
+  type ControlServerStatus,
 } from './control-endpoint.types.js';
 import { ControlTransportError, parseControlRecord, validateLimits } from './control-protocol.js';
 
@@ -46,7 +46,7 @@ export class ControlClientService {
   async requestStatus(
     recordValue: unknown,
     limits: ControlLimits = DEFAULT_CONTROL_LIMITS,
-  ): Promise<ControlStatusResponse> {
+  ): Promise<ControlServerStatus> {
     const record = requireRecord(recordValue, limits);
     const response = await exchange(record, 'status', limits);
     if (
@@ -274,7 +274,7 @@ function exchange(
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-function parseStatus(value: Record<string, unknown>): ControlStatusResponse {
+function parseStatus(value: Record<string, unknown>): ControlServerStatus {
   if (value.phase === 'unknown' && exactKeys(value, ['phase'])) {
     return { phase: 'unknown' };
   }

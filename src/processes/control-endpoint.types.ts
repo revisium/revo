@@ -48,8 +48,6 @@ export type ControlStopResponse =
       readonly error: SafeControlStopError;
     };
 
-export type ControlStatusResponse = ControlServerStatus;
-
 export type ControlStopDeliveryResult = { readonly kind: 'sent' } | { readonly kind: 'failed' };
 
 export type ControlStopResult =
