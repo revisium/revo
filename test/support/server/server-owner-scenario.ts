@@ -34,6 +34,7 @@ export class ServerOwnerScenario {
   private root = '';
   private dataDir = '';
   private runtimeDir = '';
+  private separateRuntimeRoot: string | undefined;
   private readonly owners: ServerOwnerResource[] = [];
   private readonly servers: Server[] = [];
   private readonly journals: OwnerJournal[] = [];
@@ -42,7 +43,10 @@ export class ServerOwnerScenario {
   async setup() {
     this.root = await mkdtemp(join(tmpdir(), 'revo-server-owner-'));
     this.dataDir = join(this.root, 'data');
-    this.runtimeDir = join(this.root, 'run');
+    if (process.platform === 'darwin') {
+      this.separateRuntimeRoot = await mkdtemp('/tmp/so-');
+    }
+    this.runtimeDir = this.separateRuntimeRoot ?? join(this.root, 'run');
     await Promise.all([
       mkdir(this.dataDir, { mode: 0o700 }),
       mkdir(join(this.root, 'home'), { mode: 0o700 }),
@@ -280,7 +284,12 @@ export class ServerOwnerScenario {
       result.status === 'rejected' ? [result.reason] : [],
     );
     if (failures.length === 0) {
-      await rm(this.root, { recursive: true, force: true });
+      await Promise.all([
+        rm(this.root, { recursive: true, force: true }),
+        ...(this.separateRuntimeRoot
+          ? [rm(this.separateRuntimeRoot, { recursive: true, force: true })]
+          : []),
+      ]);
     }
     if (failures.length > 0) {
       throw new AggregateError(failures, 'Server owner cleanup failed');
