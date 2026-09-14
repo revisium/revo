@@ -121,7 +121,7 @@ export function futureReleasePolicyFixture(
     locators: {
       ...policy.locators,
       nodeArchive: (version, platform, arch, format) =>
-        `${nodeRoot(version)}/node-v${version}-${platform}-${arch}.${format}`,
+        `${nodeRoot(version)}/node-v${version}-${platform === 'win32' ? 'win' : platform}-${arch}.${format}`,
       nodeShasums: (version) => `${nodeRoot(version)}/SHASUMS256.txt`,
     },
   };

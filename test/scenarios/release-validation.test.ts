@@ -78,6 +78,27 @@ describe('installation release contract', () => {
   );
 
   it.each([
+    ['archive URL', 'https://nodejs.org/dist/v26.8.2/node-v26.8.2-linux-arm64.tar.xz'],
+    ['canonical URL', 'https://nodejs.org/dist/v26.8.2/node-v26.8.2-linux-x64.tar.xz?mirror=1'],
+  ])('rejects a mismatched Node %s through release policy', (_name, url) => {
+    const policy = futureReleasePolicyFixture({
+      supportedSchemaVersions: ['revo-install/v2'],
+    });
+    const fixture = futureReleaseManifestFixture({ policy });
+    const nodeArchives = fixture.manifest.toolchain.nodeArchives.map((archive, index) =>
+      index === 0 ? { ...archive, url } : archive,
+    );
+    const manifest = {
+      ...fixture.manifest,
+      toolchain: { ...fixture.manifest.toolchain, nodeArchives },
+    };
+
+    expect(() => validateInstallationReleaseManifest(manifest, fixture.policy)).toThrow(
+      /Node|node/,
+    );
+  });
+
+  it.each([
     {
       release: '2.7.1',
       versions: { core: '4.3.2', admin: '5.4.3', node: '28.1.0', pnpm: '13.0.2' },

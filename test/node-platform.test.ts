@@ -66,28 +66,6 @@ describe('Node platform bootstrap contract', () => {
   });
 
   it.each([
-    ['archive URL', { url: 'https://nodejs.org/dist/v26.8.2/node-v26.8.2-linux-arm64.tar.xz' }],
-    [
-      'canonical URL',
-      { url: 'https://nodejs.org/dist/v26.8.2/node-v26.8.2-linux-x64.tar.xz?mirror=1' },
-    ],
-  ])('rejects a mismatched %s', async (_name, change) => {
-    const api = await nodePlatform();
-    const { fixture, archives } = nodeBootstrapScenario();
-    const nodeArchives = archives.map((archive, index) =>
-      index === 0 ? { ...archive, ...change } : archive,
-    );
-    const manifest = {
-      ...fixture.manifest,
-      toolchain: { ...fixture.manifest.toolchain, nodeArchives },
-    };
-
-    expect(() => api.selectNodeArchive(manifest, { platform: 'linux', arch: 'x64' })).toThrow(
-      /Node|node|archive/,
-    );
-  });
-
-  it.each([
     ['freebsd', 'x64'],
     ['linux', 'ppc64'],
   ])('rejects unsupported target %s %s', async (platform, arch) => {
