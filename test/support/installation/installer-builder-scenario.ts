@@ -1,6 +1,7 @@
 import {
   futureReleaseManifestFixture,
   futureReleasePolicyFixture,
+  pnpmReleaseManifestFixture,
   type FutureReleaseManifestFixture,
   type NodeArchiveFixture,
 } from './release-manifest-fixture.js';
@@ -44,7 +45,9 @@ export const bootstrapPolicy = {
   ],
 } as const;
 export interface InstallerBuilderInput {
-  readonly manifest: FutureReleaseManifestFixture['manifest'];
+  readonly manifest:
+    | FutureReleaseManifestFixture['manifest']
+    | ReturnType<typeof pnpmReleaseManifestFixture>['manifest'];
   readonly policy: ReturnType<typeof futureReleasePolicyFixture>;
   readonly bootstrapPolicy: typeof bootstrapPolicy;
   readonly template: string;
@@ -80,6 +83,24 @@ export const installerBuilderScenario = (
     payload: installerPayload,
   };
 };
+
+export const pnpmInstallerBuilderScenario = (
+  versions = {
+    core: '4.3.2',
+    admin: '5.4.3',
+    node: '28.1.0',
+    pnpm: '13.0.2',
+  },
+): InstallerBuilderInput => {
+  const fixture = pnpmReleaseManifestFixture({ version: '2.7.1', versions });
+  return {
+    manifest: fixture.manifest,
+    policy: fixture.policy,
+    bootstrapPolicy,
+    template: installerTemplate,
+    payload: installerPayload,
+  };
+};
 const literalBlock = (installer: string, name: 'data' | 'payload'): string => {
   const delimiter = name === 'data' ? INSTALLER_DATA_DELIMITER : INSTALLER_PAYLOAD_DELIMITER;
   const start = `<<'${delimiter}'\n`;
@@ -97,16 +118,30 @@ export const embeddedPayload = (installer: string): string => literalBlock(insta
 export const withArchives = (
   input: InstallerBuilderInput,
   mutate: (archives: readonly NodeArchiveFixture[]) => readonly NodeArchiveFixture[],
-): InstallerBuilderInput => ({
-  ...input,
-  manifest: {
-    ...input.manifest,
-    toolchain: {
-      ...input.manifest.toolchain,
-      nodeArchives: mutate(input.manifest.toolchain.nodeArchives),
+): InstallerBuilderInput => {
+  if (input.manifest.schemaVersion === 'revo-install/v3') {
+    return {
+      ...input,
+      manifest: {
+        ...input.manifest,
+        toolchain: {
+          ...input.manifest.toolchain,
+          nodeArchives: mutate(input.manifest.toolchain.nodeArchives),
+        },
+      },
+    };
+  }
+  return {
+    ...input,
+    manifest: {
+      ...input.manifest,
+      toolchain: {
+        ...input.manifest.toolchain,
+        nodeArchives: mutate(input.manifest.toolchain.nodeArchives),
+      },
     },
-  },
-});
+  };
+};
 export const archiveAt = (
   archives: readonly NodeArchiveFixture[],
   index: number,
@@ -130,4 +165,18 @@ export const expectedBootstrap = (input: InstallerBuilderInput): EmbeddedBootstr
   archives: [...input.manifest.toolchain.nodeArchives].sort((left, right) =>
     `${left.platform}/${left.arch}`.localeCompare(`${right.platform}/${right.arch}`),
   ),
+});
+
+export const expectedPnpmBootstrap = (input: InstallerBuilderInput) => ({
+  ...expectedBootstrap(input),
+  channel: input.manifest.release.channel,
+  pnpmVersion: input.manifest.toolchain.pnpm,
+  pnpmArchives: (() => {
+    if (!('pnpmArchives' in input.manifest.toolchain)) {
+      throw new Error('fixture omitted pnpm archives');
+    }
+    return [...input.manifest.toolchain.pnpmArchives].sort((left, right) =>
+      `${left.platform}/${left.arch}`.localeCompare(`${right.platform}/${right.arch}`),
+    );
+  })(),
 });

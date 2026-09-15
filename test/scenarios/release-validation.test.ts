@@ -16,6 +16,7 @@ import {
   futureReleasePolicyFixture,
   releaseManifestFixture,
   releasePolicyFixture,
+  pnpmReleaseManifestFixture,
 } from '../support/installation/release-manifest-fixture.js';
 
 const ORIGIN = 'https://revo.revisium.io';
@@ -35,6 +36,71 @@ const installerAdapter = async (): Promise<InstallerAdapter> => {
 };
 
 describe('installation release contract', () => {
+  it('decodes and validates v3 with six trusted pnpm archives', () => {
+    const fixture = pnpmReleaseManifestFixture();
+    expect(parseInstallationReleaseManifest(fixture.manifest)).toEqual(fixture.manifest);
+    expect(validateInstallationReleaseManifest(fixture.manifest, fixture.policy)).toEqual(
+      fixture.manifest,
+    );
+    expect(fixture.manifest.toolchain.pnpmArchives).toHaveLength(6);
+  });
+
+  it('keeps pnpm metadata release-specific without leaking fixture pins', () => {
+    const fixture = pnpmReleaseManifestFixture({
+      versions: {
+        core: '4.3.2',
+        admin: '5.4.3',
+        node: '28.1.0',
+        pnpm: '13.0.2',
+      },
+    });
+    expect(fixture.manifest.toolchain.pnpmArchives).toHaveLength(6);
+    expect(fixture.manifest.toolchain.pnpmArchives[0]?.url).toContain('/v13.0.2/');
+    expect(fixture.manifest.toolchain.pnpmArchives.map(({ sha256 }) => sha256)).not.toContain(
+      '432fd151c10477630cf5c9f41209c2a7b75ac6dce7b2533a459519daf8954c52',
+    );
+    expect(validateInstallationReleaseManifest(fixture.manifest, fixture.policy)).toEqual(
+      fixture.manifest,
+    );
+  });
+
+  it.each([
+    ['unknown target', { platform: 'freebsd' }],
+    ['wrong format', { format: 'tar.xz' }],
+    ['invalid hash', { sha256: 'not-a-sha256' }],
+  ])('rejects malformed v3 pnpm archive: %s', (_name, change) => {
+    const fixture = pnpmReleaseManifestFixture();
+    const pnpmArchives = fixture.manifest.toolchain.pnpmArchives.map((archive, index) =>
+      index === 0 ? { ...archive, ...change } : archive,
+    );
+    expect(() =>
+      parseInstallationReleaseManifest({
+        ...fixture.manifest,
+        toolchain: { ...fixture.manifest.toolchain, pnpmArchives },
+      }),
+    ).toThrow(/pnpm|archive|schema|hash/iu);
+  });
+
+  it.each([
+    'https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-x64.tar.gz?x=1',
+    'https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-x64.zip',
+    'https://foreign.example/pnpm-linux-x64.tar.gz',
+  ])('rejects a noncanonical v3 pnpm URL: %s', (url) => {
+    const fixture = pnpmReleaseManifestFixture();
+    const pnpmArchives = fixture.manifest.toolchain.pnpmArchives.map((archive, index) =>
+      index === 0 ? { ...archive, url } : archive,
+    );
+    expect(() =>
+      validateInstallationReleaseManifest(
+        {
+          ...fixture.manifest,
+          toolchain: { ...fixture.manifest.toolchain, pnpmArchives },
+        },
+        fixture.policy,
+      ),
+    ).toThrow(/pnpm/iu);
+  });
+
   it('decodes a v2 manifest carrying the complete pinned Node archive set', () => {
     const fixture = futureReleaseManifestFixture();
 

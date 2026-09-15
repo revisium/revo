@@ -7,6 +7,11 @@ import type {
   NodeArchivePlatform,
   NodeArchiveReleaseArtifact,
   NodeReleaseToolchain,
+  PnpmArchiveArchitecture,
+  PnpmArchiveFormat,
+  PnpmArchivePlatform,
+  PnpmArchiveReleaseArtifact,
+  PnpmReleaseToolchain,
   PackageReleaseArtifact,
   ReleaseArtifact,
   UnknownInstallationSchemaVersion,
@@ -18,6 +23,8 @@ const KEYS = {
   toolchain: ['node', 'pnpm'],
   nodeToolchain: ['node', 'nodeArchives', 'nodeShasums', 'pnpm'],
   nodeArchive: ['arch', 'format', 'platform', 'sha256', 'url'],
+  pnpmToolchain: ['node', 'nodeArchives', 'nodeShasums', 'pnpm', 'pnpmArchives'],
+  pnpmArchive: ['arch', 'format', 'platform', 'sha256', 'url'],
   artifact: ['sha256', 'url'],
   packageArtifact: ['integrity', 'sha256', 'url'],
   artifacts: ['package', 'packageJson', 'pnpmLock', 'pnpmWorkspace'],
@@ -38,6 +45,17 @@ const NODE_ARCHIVE_TARGETS = [
   ['win32', 'arm64', 'zip'],
 ] as const satisfies ReadonlyArray<
   readonly [NodeArchivePlatform, NodeArchiveArchitecture, NodeArchiveFormat]
+>;
+
+const PNPM_ARCHIVE_TARGETS = [
+  ['darwin', 'arm64', 'tar.gz'],
+  ['darwin', 'x64', 'tar.gz'],
+  ['linux', 'arm64', 'tar.gz'],
+  ['linux', 'x64', 'tar.gz'],
+  ['win32', 'arm64', 'zip'],
+  ['win32', 'x64', 'zip'],
+] as const satisfies ReadonlyArray<
+  readonly [PnpmArchivePlatform, PnpmArchiveArchitecture, PnpmArchiveFormat]
 >;
 
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -144,6 +162,27 @@ function parseNodeArchive(value: unknown): NodeArchiveReleaseArtifact {
   };
 }
 
+function parsePnpmArchive(value: unknown): PnpmArchiveReleaseArtifact {
+  const target = record(value)
+    ? PNPM_ARCHIVE_TARGETS.find(
+        ([platform, arch, format]) =>
+          value.platform === platform && value.arch === arch && value.format === format,
+      )
+    : undefined;
+  if (
+    !record(value) ||
+    !exact(value, KEYS.pnpmArchive) ||
+    target === undefined ||
+    typeof value.url !== 'string' ||
+    typeof value.sha256 !== 'string' ||
+    !isSha256HexString(value.sha256)
+  ) {
+    throw invalid('pnpm archive is invalid');
+  }
+  const [platform, arch, format] = target;
+  return { platform, arch, format, url: value.url, sha256: value.sha256 };
+}
+
 function parseToolchainVersion(value: Record<string, unknown>): {
   node: string;
   pnpm: string;
@@ -189,6 +228,45 @@ function parseNodeToolchain(value: Record<string, unknown>): NodeReleaseToolchai
   };
 }
 
+function parsePnpmToolchain(value: Record<string, unknown>): PnpmReleaseToolchain {
+  const version = parseToolchainVersion(value);
+  if (
+    !exact(value, KEYS.pnpmToolchain) ||
+    !Array.isArray(value.nodeArchives) ||
+    !Array.isArray(value.pnpmArchives)
+  ) {
+    throw invalid('schema or top-level fields are invalid');
+  }
+  const nodeArchives = value.nodeArchives.map(parseNodeArchive);
+  const nodeTargets = nodeArchives.map(
+    ({ platform, arch, format }) => `${platform}/${arch}/${format}`,
+  );
+  const expectedNodeTargets = NODE_ARCHIVE_TARGETS.map((target) => target.join('/'));
+  if (
+    nodeTargets.length !== expectedNodeTargets.length ||
+    new Set(nodeTargets).size !== nodeTargets.length ||
+    !expectedNodeTargets.every((target) => nodeTargets.includes(target))
+  ) {
+    throw invalid('Node archive set is incomplete');
+  }
+  const pnpmArchives = value.pnpmArchives.map(parsePnpmArchive);
+  const targets = pnpmArchives.map(({ platform, arch, format }) => `${platform}/${arch}/${format}`);
+  const expectedTargets = PNPM_ARCHIVE_TARGETS.map((target) => target.join('/'));
+  if (
+    targets.length !== expectedTargets.length ||
+    new Set(targets).size !== targets.length ||
+    !expectedTargets.every((target) => targets.includes(target))
+  ) {
+    throw invalid('pnpm archive set is incomplete');
+  }
+  return {
+    ...version,
+    nodeArchives,
+    nodeShasums: parseArtifact(value.nodeShasums, false),
+    pnpmArchives,
+  };
+}
+
 export function parseInstallationReleaseManifest(value: unknown): InstallationReleaseManifest {
   if (
     !record(value) ||
@@ -215,6 +293,13 @@ export function parseInstallationReleaseManifest(value: unknown): InstallationRe
       pnpmWorkspace: parseArtifact(value.artifacts.pnpmWorkspace, false),
     },
   };
+  if (value.schemaVersion === 'revo-install/v3') {
+    return {
+      ...fields,
+      schemaVersion: value.schemaVersion,
+      toolchain: parsePnpmToolchain(value.toolchain),
+    };
+  }
   if (value.schemaVersion === 'revo-install/v2') {
     return {
       ...fields,

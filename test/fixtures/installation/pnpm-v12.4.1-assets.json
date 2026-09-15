@@ -1,0 +1,42 @@
+{
+  "source": "pnpm GitHub release v12.4.1; SHA-256 values are release metadata fixture data",
+  "version": "12.4.1",
+  "archives": [
+    {
+      "platform": "darwin",
+      "arch": "arm64",
+      "format": "tar.gz",
+      "sha256": "432fd151c10477630cf5c9f41209c2a7b75ac6dce7b2533a459519daf8954c52"
+    },
+    {
+      "platform": "darwin",
+      "arch": "x64",
+      "format": "tar.gz",
+      "sha256": "98921409db2f510ccc4eb521f9bfec51e3f1e809fd66717a062962f3b2a4cdea"
+    },
+    {
+      "platform": "linux",
+      "arch": "arm64",
+      "format": "tar.gz",
+      "sha256": "14f7a3e67d658d4ca8002c2aa0567f27dc5fe056a9f29f98ba7d2bfd6c81591b"
+    },
+    {
+      "platform": "linux",
+      "arch": "x64",
+      "format": "tar.gz",
+      "sha256": "66e9886299085dade56e203ae0e3586f35787f8801a68d33ec07ac17b0de2001"
+    },
+    {
+      "platform": "win32",
+      "arch": "arm64",
+      "format": "zip",
+      "sha256": "6536c3c8647648005a347c3480040b9fb67763f07fbca43df0738a95c1a41188"
+    },
+    {
+      "platform": "win32",
+      "arch": "x64",
+      "format": "zip",
+      "sha256": "356092adbd4f69670945ed24c7fca994ba4dd9fbaf23b028bb9708afd7bc676e"
+    }
+  ]
+}

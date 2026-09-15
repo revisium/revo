@@ -11,7 +11,9 @@ import {
   embeddedBootstrap,
   embeddedPayload,
   expectedBootstrap,
+  expectedPnpmBootstrap,
   installerBuilderScenario,
+  pnpmInstallerBuilderScenario,
   withArchives,
 } from './support/installation/installer-builder-scenario.js';
 import {
@@ -40,6 +42,15 @@ const builderUrl = new URL('../installer/build-installer.mjs', import.meta.url).
 const { buildInstaller } = await vi.importActual<InstallerBuilder>(builderUrl);
 const build = (input: unknown = installerBuilderScenario()): string => buildInstaller(input);
 describe('programmatic installer builder', () => {
+  it('embeds the v3 channel, exact pnpm version, and all trusted pnpm descriptors', () => {
+    const input = pnpmInstallerBuilderScenario();
+    const actual = record(embeddedBootstrap(build(input)));
+    expect(actual).toEqual(expectedPnpmBootstrap(input));
+    expect(actual.channel).toBe(input.manifest.release.channel);
+    expect(actual.pnpmVersion).toBe(input.manifest.toolchain.pnpm);
+    expect(records(actual.pnpmArchives)).toHaveLength(6);
+  });
+
   it('composes a deterministic installer from explicit template and payload inputs', () => {
     const input = installerBuilderScenario();
     const first = build(input);
