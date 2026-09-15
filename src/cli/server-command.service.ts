@@ -55,7 +55,15 @@ export class ServerCommandService {
   ) {}
 
   async start(flags: Readonly<ConfigurationFlags>): Promise<void> {
-    const outcome = await this.launch(this.input(flags));
+    const outcome = await this.ensureRunning(flags);
+    this.presentStartOutcome(outcome);
+  }
+
+  async ensureRunning(flags: Readonly<ConfigurationFlags>): Promise<ServerLaunchResult> {
+    return this.launch(this.input(flags));
+  }
+
+  private presentStartOutcome(outcome: ServerLaunchResult): void {
     if (outcome.kind === 'started') {
       this.output.write(`Server started at ${outcome.url}.`);
     } else if (outcome.kind === 'running') {

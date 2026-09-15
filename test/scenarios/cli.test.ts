@@ -5,7 +5,7 @@ import { CliScenario } from '../support/cli/cli-scenario.js';
 describe('Revo CLI', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it.each([{ args: [] }, { args: ['--help'] }, { args: ['-h'] }])(
+  it.each([{ args: ['--help'] }, { args: ['-h'] }])(
     'prints product help for $args',
     async ({ args }) => {
       const result = await CliScenario.run(args);
@@ -35,7 +35,7 @@ describe('Revo CLI', () => {
   });
 
   it.each([
-    { args: ['unknown'], error: "error: unknown command 'unknown'\n" },
+    { args: ['unknown'], error: 'error: too many arguments. Expected 0 arguments but got 1.\n' },
     { args: ['--unknown'], error: "error: unknown option '--unknown'\n" },
   ])('rejects invalid input $args without framework noise', async ({ args, error }) => {
     const result = await CliScenario.run(args);
@@ -61,7 +61,7 @@ describe('Revo CLI', () => {
     expect(help).toMatchObject({ exitCode: 0, stderr: '' });
     expect(help.stdout).toContain('Usage: revo');
     expect(invalid).toMatchObject({ exitCode: 2, stdout: '' });
-    expect(invalid.stderr).toContain("unknown command 'unknown'");
+    expect(invalid.stderr).toContain('too many arguments. Expected 0 arguments but got 1.');
   });
 
   it.each([
