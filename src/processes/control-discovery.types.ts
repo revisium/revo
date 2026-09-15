@@ -4,6 +4,7 @@ import type {
   StartedDatabase,
   StartDatabaseRequest,
 } from '../postgres/index.js';
+import type { ServerLifecycleSink } from '../server-logs/server-lifecycle.types.js';
 import type { StartupProgressFacade, StartupProgressOptions } from '../startup-progress/index.js';
 import type {
   ControlRecord,
@@ -21,6 +22,7 @@ export type ControlDiscovery =
 
 export interface OpenPublishedControlRequest {
   readonly dataDir: string;
+  readonly logDir: string;
   readonly runtimeDir: string;
   readonly version: string;
   readonly channel: string;
@@ -38,6 +40,7 @@ interface HeldPublishedControlBase {
   readonly stopResult: Promise<ControlStopResult>;
   readonly stopDelivery: Promise<ControlStopDeliveryResult>;
   readonly progress?: StartupProgressFacade;
+  readonly lifecycle?: ServerLifecycleSink;
   close(): Promise<void>;
   ownershipReleased(): Promise<void>;
 }

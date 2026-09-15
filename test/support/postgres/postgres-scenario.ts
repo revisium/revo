@@ -244,11 +244,11 @@ export class PostgresScenario {
     const runtimeDir = join(root, 'run');
     await Promise.all([mkdir(dataDir, { mode: 0o700 }), mkdir(runtimeDir, { mode: 0o700 })]);
     await Promise.all([chmod(dataDir, 0o700), chmod(runtimeDir, 0o700)]);
-    return { dataDir, runtimeDir };
+    return { dataDir, logDir: join(root, 'logs'), runtimeDir };
   }
 
   private open(
-    fixture: { dataDir: string; runtimeDir: string },
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
     postgres?: EmbeddedPostgresPreparationService,
     journal?: StartupProgressJournalWriter,
   ) {
@@ -270,7 +270,7 @@ export class PostgresScenario {
   }
 
   private acquireEventually(
-    fixture: { dataDir: string; runtimeDir: string },
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
     deadline = Date.now() + 1000,
   ): ReturnType<PostgresScenario['open']> {
     return this.open(fixture).then((candidate) => {

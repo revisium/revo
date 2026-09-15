@@ -231,6 +231,7 @@ describe('server launcher composition', () => {
             dataDir: resolved.layout.dataDir,
             ...(databaseUrl === undefined ? {} : { databaseUrl }),
             host: '0.0.0.0',
+            logDir: resolved.logDir,
             port: 3210,
             publicUrl: 'https://revo.example',
             runtimeDir: resolved.layout.runtimeDir,

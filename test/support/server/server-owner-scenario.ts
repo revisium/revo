@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +22,8 @@ import {
   PublishedControlService,
 } from '../../../src/processes/published-control.service.js';
 import { ServerOwnershipService } from '../../../src/processes/server-ownership.service.js';
+import { parseLifecycleDocument } from '../../../src/server-logs/document.js';
+import { serverLifecyclePath } from '../../../src/server-logs/store.service.js';
 import {
   ServerOwnerResource,
   ServerOwnerService,
@@ -47,7 +49,7 @@ export class ServerOwnerScenario {
   private operation = 0;
 
   async setup() {
-    this.root = await mkdtemp(join(tmpdir(), 'revo-server-owner-'));
+    this.root = await mkdtemp(join(await realpath(tmpdir()), 'revo-server-owner-'));
     this.dataDir = join(this.root, 'data');
     if (process.platform === 'darwin') {
       this.separateRuntimeRoot = await mkdtemp('/tmp/so-');
@@ -88,6 +90,28 @@ export class ServerOwnerScenario {
     } finally {
       await application.close();
     }
+  }
+
+  async recordsLifecycle() {
+    const controlled = await this.controlledOwner(new OwnerJournal(), false);
+    await controlled.owner.start(new AbortController().signal);
+    await controlled.owner.close();
+    const serialized = await readFile(
+      serverLifecyclePath({
+        logDir: join(this.root, 'logs'),
+        canonicalDataDir: this.dataDir,
+        channel: 'stable',
+      }),
+      'utf8',
+    );
+    if (serialized.includes('postgresql:') || serialized.includes('fixture')) {
+      throw new Error('Lifecycle document exposed a connection detail');
+    }
+    const document = parseLifecycleDocument(serialized);
+    if (!document) {
+      throw new Error('Lifecycle document was not readable');
+    }
+    return document.events.map((event) => `${event.phase}:${event.state}:${event.code}`);
   }
 
   async restartsExistingData() {
@@ -236,6 +260,7 @@ export class ServerOwnerScenario {
         configuration: {
           channel: 'stable',
           dataDir: this.dataDir,
+          logDir: join(this.root, 'logs'),
           host: '127.0.0.1',
           port: 0,
           publicUrl: 'http://127.0.0.1:3210',
@@ -406,6 +431,7 @@ export class ServerOwnerScenario {
       configuration: {
         channel: 'stable',
         dataDir: this.dataDir,
+        logDir: join(this.root, 'logs'),
         host: '127.0.0.1',
         port: 0,
         publicUrl: 'http://127.0.0.1:3210',
@@ -470,6 +496,7 @@ export class ServerOwnerScenario {
       configuration: {
         channel: 'stable',
         dataDir: this.dataDir,
+        logDir: join(this.root, 'logs'),
         databaseUrl: 'postgresql://postgres:fixture@127.0.0.1:5432/revo?sslmode=disable',
         host: '127.0.0.1',
         port: 0,

@@ -22,6 +22,19 @@ describe('Server owner composition', () => {
     await expect(scenario.resolvesServerOwnerThroughNest()).resolves.toBe(true);
   });
 
+  it('records owner lifecycle events in order without exposing connection details', async () => {
+    await expect(scenario.recordsLifecycle()).resolves.toEqual([
+      'server:starting:SERVER_STARTING',
+      'postgres:starting:DATABASE_STARTING',
+      'postgres:ready:DATABASE_READY',
+      'application-database-migrations:started:CORE_STAGE_STARTED',
+      'application-database-migrations:completed:CORE_STAGE_COMPLETED',
+      'server:ready:SERVER_READY',
+      'shutdown:stopping:SERVER_STOPPING',
+      'shutdown:stopped:SERVER_RESOURCES_STOPPED',
+    ]);
+  });
+
   it(
     'starts real embedded PostgreSQL and Core before publishing readiness',
     async () => {

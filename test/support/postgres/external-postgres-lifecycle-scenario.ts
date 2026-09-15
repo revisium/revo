@@ -350,7 +350,11 @@ export class ExternalPostgresLifecycleScenario {
   private async fixture() {
     const root = await mkdtemp('/tmp/external-pg-');
     this.roots.push(root);
-    const fixture = { dataDir: join(root, 'data'), runtimeDir: join(root, 'runtime') };
+    const fixture = {
+      dataDir: join(root, 'data'),
+      logDir: join(root, 'logs'),
+      runtimeDir: join(root, 'runtime'),
+    };
     await Promise.all([
       mkdir(fixture.dataDir, { mode: 0o700 }),
       mkdir(fixture.runtimeDir, { mode: 0o700 }),
@@ -367,7 +371,7 @@ export class ExternalPostgresLifecycleScenario {
   }
 
   private async openAt(
-    fixture: { dataDir: string; runtimeDir: string },
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
     databaseUrl: string,
     embedded = new EmbeddedPostgresResourceService(),
     journal?: StartupProgressJournalWriter,
@@ -396,7 +400,7 @@ export class ExternalPostgresLifecycleScenario {
     return owner;
   }
 
-  private openResult(fixture: { dataDir: string; runtimeDir: string }) {
+  private openResult(fixture: { dataDir: string; logDir: string; runtimeDir: string }) {
     return new PublishedControlService().open({
       ...fixture,
       databaseUrl: 'postgres://db.example?sslmode=disable',
@@ -408,7 +412,7 @@ export class ExternalPostgresLifecycleScenario {
   }
 
   private async acquireEventually(
-    fixture: { dataDir: string; runtimeDir: string },
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
     deadline: number,
   ): Promise<PublishedControl> {
     const owner = await this.openResult(fixture);
