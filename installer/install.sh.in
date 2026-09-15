@@ -1,10 +1,124 @@
 #!/bin/sh
 set -eu
+umask 077
 
-# revo-node-bootstrap-data-begin
+revo_root=${REVO_INSTALL_ROOT:-"${HOME}/.local/share/revo"}
+revo_system=$(uname -s)
+revo_machine=$(uname -m)
+case "$revo_system/$revo_machine" in
+  Darwin/arm64) revo_identity=darwin/arm64/tar.gz ;;
+  Darwin/x86_64) revo_identity=darwin/x64/tar.gz ;;
+  Linux/aarch64) revo_identity=linux/arm64/tar.xz ;;
+  Linux/x86_64) revo_identity=linux/x64/tar.xz ;;
+  *) exit 1 ;;
+esac
+case "$revo_identity" in
+@@REVO_POSIX_BOOTSTRAP_TABLE@@
+  *) exit 1 ;;
+esac
+
+revo_target=$revo_platform-$revo_arch
+revo_parent=$revo_root/$revo_version
+revo_final=$revo_parent/$revo_target
+revo_run_bounded() (
+  revo_limit=$1
+  shift
+  "$@" </dev/null &
+  revo_pid=$!
+  (
+    revo_sleep=
+    trap '[ -z "$revo_sleep" ] || kill "$revo_sleep" 2>/dev/null || :; [ -z "$revo_sleep" ] || wait "$revo_sleep" 2>/dev/null || :; exit 0' HUP INT TERM
+    sleep "$revo_limit" &
+    revo_sleep=$!
+    wait "$revo_sleep" || exit 0
+    kill -TERM "$revo_pid" 2>/dev/null || exit 0
+    sleep "$revo_grace" &
+    revo_sleep=$!
+    wait "$revo_sleep" || exit 0
+    kill -KILL "$revo_pid" 2>/dev/null || :
+  ) &
+  revo_watchdog=$!
+  set +e
+  wait "$revo_pid"
+  revo_status=$?
+  set -e
+  kill "$revo_watchdog" 2>/dev/null || :
+  wait "$revo_watchdog" 2>/dev/null || :
+  exit "$revo_status"
+)
+
+if [ -e "$revo_final" ] || [ -L "$revo_final" ]; then
+  [ -d "$revo_final" ] && [ ! -L "$revo_final" ] || exit 1
+  [ -f "$revo_final/install-receipt.json" ] && [ ! -L "$revo_final/install-receipt.json" ] || exit 1
+  [ "$(LC_ALL=C ls -ld "$revo_final/install-receipt.json" | cut -c 1-10)" = '-rw-------' ] || exit 1
+  [ "$(cat "$revo_final/install-receipt.json")" = "$revo_expected_receipt" ] || exit 1
+  revo_found=$(revo_run_bounded "$revo_probe_timeout" "$revo_final/bin/node" --version) || exit 1
+  [ "$revo_found" = "v$revo_version" ] || exit 1
+  trap - EXIT HUP INT TERM
+  exit 0
+fi
+
+mkdir -p -m 700 "$revo_parent"
+revo_stage=$(mktemp -d "$revo_parent/$revo_target.stage.XXXXXX")
+chmod 700 "$revo_stage"
+revo_archive=$revo_stage/node-archive
+revo_data_file=$revo_stage/bootstrap.json
+revo_payload_file=$revo_stage/payload.mjs
+revo_probe_file=$revo_stage/node-version
+revo_receipt=$revo_stage/install-receipt.json
+revo_cleanup() {
+  rm -rf "$revo_stage"
+}
+revo_external_interrupt() {
+  trap - EXIT HUP INT TERM
+  exit 1
+}
+trap revo_cleanup EXIT
+trap revo_external_interrupt HUP INT TERM
+revo_run_staged_bounded() {
+  trap - EXIT HUP INT TERM
+  set +e
+  revo_run_bounded "$@"
+  revo_status=$?
+  set -e
+  trap revo_cleanup EXIT
+  trap revo_external_interrupt HUP INT TERM
+  return "$revo_status"
+}
+cat >"$revo_data_file" <<'REVO_NODE_BOOTSTRAP_DATA'
 @@REVO_NODE_BOOTSTRAP_DATA@@
-# revo-node-bootstrap-data-end
-
-# revo-node-bootstrap-payload-begin
+REVO_NODE_BOOTSTRAP_DATA
+cat >"$revo_payload_file" <<'REVO_NODE_BOOTSTRAP_PAYLOAD'
 @@REVO_NODE_BOOTSTRAP_PAYLOAD@@
-# revo-node-bootstrap-payload-end
+REVO_NODE_BOOTSTRAP_PAYLOAD
+chmod 600 "$revo_data_file" "$revo_payload_file"
+
+if command -v curl >/dev/null 2>&1; then
+  revo_run_staged_bounded "$revo_download_timeout" curl --fail --silent --show-error --output "$revo_archive" "$revo_url" || exit 1
+elif command -v wget >/dev/null 2>&1; then
+  revo_run_staged_bounded "$revo_download_timeout" wget --max-redirect=0 -q -O "$revo_archive" "$revo_url" || exit 1
+else
+  exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  revo_actual=$(sha256sum "$revo_archive" | awk '{print $1}')
+else
+  revo_actual=$(shasum -a 256 "$revo_archive" | awk '{print $1}')
+fi
+[ "$revo_actual" = "$revo_sha256" ] || exit 1
+
+case "$revo_format" in
+  tar.gz) tar -xzf "$revo_archive" -C "$revo_stage" --strip-components=1 ;;
+  tar.xz) tar -xJf "$revo_archive" -C "$revo_stage" --strip-components=1 ;;
+  *) exit 1 ;;
+esac
+revo_node=$revo_stage/bin/node
+revo_run_staged_bounded "$revo_probe_timeout" "$revo_node" --version >"$revo_probe_file" || exit 1
+[ "$(cat "$revo_probe_file")" = "v$revo_version" ] || exit 1
+REVO_NODE_TARGET=$revo_target REVO_NODE_ARCHIVE_SHA256=$revo_sha256 REVO_RECEIPT_PATH=$revo_receipt \
+  revo_run_staged_bounded "$revo_payload_timeout" "$revo_node" "$revo_payload_file" "$revo_data_file" || exit 1
+[ -f "$revo_receipt" ] && [ ! -L "$revo_receipt" ] || exit 1
+rm -f "$revo_archive" "$revo_data_file" "$revo_payload_file" "$revo_probe_file"
+mv "$revo_stage" "$revo_final"
+trap - EXIT HUP INT TERM

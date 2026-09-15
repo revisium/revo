@@ -6,22 +6,34 @@ import {
 } from './release-manifest-fixture.js';
 export const INSTALLER_DATA_SLOT = '@@REVO_NODE_BOOTSTRAP_DATA@@';
 export const INSTALLER_PAYLOAD_SLOT = '@@REVO_NODE_BOOTSTRAP_PAYLOAD@@';
+export const INSTALLER_POSIX_SLOT = '@@REVO_POSIX_BOOTSTRAP_TABLE@@';
+export const INSTALLER_DATA_DELIMITER = 'REVO_NODE_BOOTSTRAP_DATA';
+export const INSTALLER_PAYLOAD_DELIMITER = 'REVO_NODE_BOOTSTRAP_PAYLOAD';
 export const installerTemplate = `#!/bin/sh
 set -eu
+${INSTALLER_POSIX_SLOT}
 # revo-node-bootstrap-data-begin
+cat >"$revo_data_file" <<'${INSTALLER_DATA_DELIMITER}'
 ${INSTALLER_DATA_SLOT}
+${INSTALLER_DATA_DELIMITER}
 # revo-node-bootstrap-data-end
 # revo-node-bootstrap-payload-begin
+cat >"$revo_payload_file" <<'${INSTALLER_PAYLOAD_DELIMITER}'
 ${INSTALLER_PAYLOAD_SLOT}
+${INSTALLER_PAYLOAD_DELIMITER}
 # revo-node-bootstrap-payload-end
 `;
-export const installerPayload = `import { assertBootstrapMatchesManifest } from './lib/node-platform.mjs';
+export const installerPayload = `import { readFile } from 'node:fs/promises';
 
-const bootstrap = JSON.parse(Buffer.from(process.env.REVO_BOOTSTRAP_DATA, 'base64url'));
-assertBootstrapMatchesManifest(JSON.parse(process.env.REVO_MANIFEST), bootstrap);
+const bootstrap = JSON.parse(await readFile(process.argv[2], 'utf8'));
+if (bootstrap.nodeVersion !== process.versions.node) process.exitCode = 23;
 `;
 export const bootstrapPolicy = {
   schemaVersion: 'revo-node-bootstrap/v1',
+  downloadTimeoutSeconds: 30,
+  nodeProbeTimeoutSeconds: 10,
+  payloadTimeoutSeconds: 120,
+  terminationGraceSeconds: 5,
   targets: [
     { platform: 'darwin', arch: 'arm64', format: 'tar.gz' },
     { platform: 'darwin', arch: 'x64', format: 'tar.gz' },
@@ -41,6 +53,12 @@ export interface InstallerBuilderInput {
 export interface EmbeddedBootstrap {
   readonly schemaVersion: string;
   readonly nodeVersion: string;
+  readonly execution: {
+    readonly downloadTimeoutSeconds: number;
+    readonly nodeProbeTimeoutSeconds: number;
+    readonly payloadTimeoutSeconds: number;
+    readonly terminationGraceSeconds: number;
+  };
   readonly snapshot: { readonly url: string; readonly sha256: string };
   readonly archives: readonly NodeArchiveFixture[];
 }
@@ -62,22 +80,20 @@ export const installerBuilderScenario = (
     payload: installerPayload,
   };
 };
-const encodedBlock = (installer: string, name: 'data' | 'payload'): string => {
-  const expression = new RegExp(
-    `# revo-node-bootstrap-${name}-begin\\n# ([A-Za-z0-9_-]+)\\n# revo-node-bootstrap-${name}-end`,
-    'u',
-  );
-  const encoded = expression.exec(installer)?.[1];
-  if (encoded === undefined) {
-    throw new Error(`installer omitted its encoded ${name} block`);
+const literalBlock = (installer: string, name: 'data' | 'payload'): string => {
+  const delimiter = name === 'data' ? INSTALLER_DATA_DELIMITER : INSTALLER_PAYLOAD_DELIMITER;
+  const start = `<<'${delimiter}'\n`;
+  const from = installer.indexOf(start);
+  const to = installer.indexOf(`\n${delimiter}\n`, from + start.length);
+  if (from < 0 || to < 0) {
+    throw new Error(`installer omitted its literal ${name} block`);
   }
-  return encoded;
+  return installer.slice(from + start.length, to);
 };
 export const embeddedBootstrap = (installer: string): unknown =>
-  JSON.parse(Buffer.from(encodedBlock(installer, 'data'), 'base64url').toString('utf8')) as unknown;
+  JSON.parse(literalBlock(installer, 'data')) as unknown;
 
-export const embeddedPayload = (installer: string): string =>
-  Buffer.from(encodedBlock(installer, 'payload'), 'base64url').toString('utf8');
+export const embeddedPayload = (installer: string): string => literalBlock(installer, 'payload');
 export const withArchives = (
   input: InstallerBuilderInput,
   mutate: (archives: readonly NodeArchiveFixture[]) => readonly NodeArchiveFixture[],
@@ -104,6 +120,12 @@ export const archiveAt = (
 export const expectedBootstrap = (input: InstallerBuilderInput): EmbeddedBootstrap => ({
   schemaVersion: input.bootstrapPolicy.schemaVersion,
   nodeVersion: input.manifest.toolchain.node,
+  execution: {
+    downloadTimeoutSeconds: input.bootstrapPolicy.downloadTimeoutSeconds,
+    nodeProbeTimeoutSeconds: input.bootstrapPolicy.nodeProbeTimeoutSeconds,
+    payloadTimeoutSeconds: input.bootstrapPolicy.payloadTimeoutSeconds,
+    terminationGraceSeconds: input.bootstrapPolicy.terminationGraceSeconds,
+  },
   snapshot: { ...input.manifest.toolchain.nodeShasums },
   archives: [...input.manifest.toolchain.nodeArchives].sort((left, right) =>
     `${left.platform}/${left.arch}`.localeCompare(`${right.platform}/${right.arch}`),
