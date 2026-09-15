@@ -178,6 +178,25 @@ export class ServerOwnerScenario {
     return lifecycle.codes;
   }
 
+  async recordsRejectedCoreLifecycle() {
+    const lifecycle = new ServerLifecycleProbe();
+    const controlled = await this.controlledOwner(
+      new OwnerJournal(),
+      false,
+      false,
+      false,
+      false,
+      lifecycle,
+      false,
+      'stable',
+      true,
+    );
+    await controlled.owner.start(new AbortController().signal);
+    controlled.processes.failCoreCompletion();
+    await controlled.owner.outcome();
+    return lifecycle.codes;
+  }
+
   async recordsAlphaLifecycle() {
     const controlled = await this.controlledOwner(
       new OwnerJournal(),
@@ -590,6 +609,7 @@ export class ServerOwnerScenario {
     lifecycle?: ServerLifecycleSink,
     readinessFailure = false,
     channel: 'stable' | 'alpha' = 'stable',
+    rejectCoreCompletion = false,
   ) {
     this.journals.push(journal);
     const processes = new OwnerControlledProcesses(failFirstStop);
@@ -607,7 +627,16 @@ export class ServerOwnerScenario {
       databaseFailure,
       lifecycle,
     );
-    const service = new ServerOwnerService(controls, new CoreHostProcessService(processes));
+    const coreHosts = new CoreHostProcessService(processes);
+    if (rejectCoreCompletion) {
+      const openCore = coreHosts.open.bind(coreHosts);
+      coreHosts.open = (binding) => {
+        const resource = openCore(binding);
+        resource.settled = () => processes.coreCompletion;
+        return resource;
+      };
+    }
+    const service = new ServerOwnerService(controls, coreHosts);
     const operationId = this.nextOperation();
     const result = await service.open({
       configuration: {
@@ -810,6 +839,8 @@ class OwnerControlledChild implements OwnedProcess {
 
 class OwnerControlledProcesses extends ManagedProcessService {
   readonly child = new OwnerControlledChild(this);
+  readonly coreCompletion: Promise<never>;
+  private rejectCoreCompletion!: (error: Error) => void;
   private finishCompleted: (() => void) | undefined;
   readonly completed = new Promise<void>((resolve) => (this.finishCompleted = resolve));
   completionObserved = false;
@@ -819,6 +850,11 @@ class OwnerControlledProcesses extends ManagedProcessService {
 
   constructor(private readonly failFirstStop: boolean) {
     super();
+    this.coreCompletion = new Promise((_, reject) => (this.rejectCoreCompletion = reject));
+  }
+
+  failCoreCompletion() {
+    this.rejectCoreCompletion(new Error('Controlled Core completion failed'));
   }
 
   override async start(_request: ManagedProcessRequest) {

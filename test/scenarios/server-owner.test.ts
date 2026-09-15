@@ -61,6 +61,12 @@ describe('Server owner composition', () => {
     );
   });
 
+  it('records a rejected Core completion in lifecycle', async () => {
+    await expect(scenario.recordsRejectedCoreLifecycle()).resolves.toEqual(
+      expect.arrayContaining(['SERVER_CORE_FAILED']),
+    );
+  });
+
   it('keeps alpha lifecycle history separate from stable history', async () => {
     await expect(scenario.recordsAlphaLifecycle()).resolves.toEqual({ alpha: 8, stable: false });
   });
