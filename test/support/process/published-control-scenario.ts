@@ -233,7 +233,7 @@ export class PublishedControlScenario {
   }
 
   private async fixture() {
-    const root = await mkdtemp(join(await realpath(tmpdir()), 'pc-'));
+    const root = await mkdtemp(join(await realpath('/tmp'), 'pc-'));
     this.roots.add(root);
     const dataDir = join(root, 'd');
     await mkdir(dataDir, { mode: 0o700 });
