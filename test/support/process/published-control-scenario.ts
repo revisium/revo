@@ -186,6 +186,7 @@ export class PublishedControlScenario {
     await mkdir(dataDir, { mode: 0o700 });
     return {
       dataDir,
+      logDir: join(root, 'logs'),
       runtimeDir: join(root, 'r'),
       version: '1.2.3',
       channel: 'stable',
@@ -200,7 +201,11 @@ export class PublishedControlScenario {
   private async child(fixture: Awaited<ReturnType<PublishedControlScenario['fixture']>>) {
     const child = fork(new URL('./published-control-child.mjs', import.meta.url), [], {
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
-      env: { REVO_TEST_DATA: fixture.dataDir, REVO_TEST_RUNTIME: fixture.runtimeDir },
+      env: {
+        REVO_TEST_DATA: fixture.dataDir,
+        REVO_TEST_LOG: fixture.logDir,
+        REVO_TEST_RUNTIME: fixture.runtimeDir,
+      },
     });
     this.children.add(child);
     await new Promise<void>((resolve, reject) => {

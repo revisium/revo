@@ -82,6 +82,7 @@ export class ServerLauncherService {
         dataDir: resolved.layout.dataDir,
         ...(resolved.databaseUrl === undefined ? {} : { databaseUrl: resolved.databaseUrl }),
         host: resolved.host,
+        logDir: resolved.logDir,
         port: resolved.port,
         publicUrl: resolved.publicUrl,
         runtimeDir: resolved.layout.runtimeDir,

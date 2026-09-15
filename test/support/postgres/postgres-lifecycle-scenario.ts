@@ -372,11 +372,11 @@ export class PostgresLifecycleScenario {
     const dataDir = join(root, 'd');
     const runtimeDir = join(root, 'r');
     await Promise.all([mkdir(dataDir, { mode: 0o700 }), mkdir(runtimeDir, { mode: 0o700 })]);
-    return { dataDir, runtimeDir };
+    return { dataDir, logDir: join(root, 'logs'), runtimeDir };
   }
 
   private async open(
-    fixture: { dataDir: string; runtimeDir: string },
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
     operationId: string,
     allocator?: LoopbackPortAllocator,
     suppliedResource?: EmbeddedPostgresResourceService,
@@ -426,7 +426,10 @@ export class PostgresLifecycleScenario {
     return owner;
   }
 
-  private openResult(fixture: { dataDir: string; runtimeDir: string }, operationId: string) {
+  private openResult(
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
+    operationId: string,
+  ) {
     return new PublishedControlService().open({
       ...fixture,
       version: '1.0.0',
@@ -437,7 +440,7 @@ export class PostgresLifecycleScenario {
   }
 
   private async acquireEventually(
-    fixture: { dataDir: string; runtimeDir: string },
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
     operationId: string,
     deadline: number,
   ): Promise<PublishedControl> {

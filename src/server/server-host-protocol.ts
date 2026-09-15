@@ -67,8 +67,8 @@ const OPERATION_FIELDS = ['protocol', 'type', 'operationId'];
 const CONFIGURATION_FIELDS = [
   'channel',
   'dataDir',
-  'databaseUrl',
   'host',
+  'logDir',
   'port',
   'publicUrl',
   'runtimeDir',
@@ -119,12 +119,13 @@ export function parseServerHostParentMessage(value: unknown): ServerHostParentMe
 }
 
 function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefined {
-  if (!record(value) || !exact(value, CONFIGURATION_FIELDS)) {
+  if (!record(value) || !exact(value, CONFIGURATION_FIELDS, ['databaseUrl'])) {
     return undefined;
   }
   if (
     (value.channel !== 'stable' && value.channel !== 'alpha') ||
     !absolute(value.dataDir) ||
+    !absolute(value.logDir) ||
     !host(value.host) ||
     !port(value.port) ||
     !publicOrigin(value.publicUrl) ||
@@ -139,6 +140,7 @@ function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefine
   return {
     channel: value.channel,
     dataDir: value.dataDir,
+    logDir: value.logDir,
     ...(value.databaseUrl === undefined ? {} : { databaseUrl: value.databaseUrl }),
     host: value.host,
     port: value.port,
@@ -170,8 +172,19 @@ function parseEnvironment(value: unknown): Readonly<Record<string, string>> | un
 
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
-const exact = (value: Record<string, unknown>, fields: readonly string[]) =>
-  Object.keys(value).every((field) => fields.includes(field));
+const exact = (
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  optional: readonly string[] = [],
+) => {
+  const keys = Object.keys(value);
+  return (
+    keys.length >= fields.length &&
+    keys.length <= fields.length + optional.length &&
+    fields.every((field) => keys.includes(field)) &&
+    keys.every((field) => fields.includes(field) || optional.includes(field))
+  );
+};
 const text = (value: unknown): value is string =>
   typeof value === 'string' &&
   value.length > 0 &&

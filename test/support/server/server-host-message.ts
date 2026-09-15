@@ -16,6 +16,7 @@ export function validStartMessage(
     configuration: {
       channel: 'stable',
       dataDir: '/private/data',
+      logDir: '/private/logs',
       host: '127.0.0.1',
       port: 3210,
       publicUrl: 'http://127.0.0.1:3210',

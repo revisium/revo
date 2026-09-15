@@ -3,6 +3,7 @@ import { PublishedControlService } from '../../../dist/processes/published-contr
 let now = 0;
 const held = await new PublishedControlService().open({
   dataDir: process.env.REVO_TEST_DATA,
+  logDir: process.env.REVO_TEST_LOG,
   runtimeDir: process.env.REVO_TEST_RUNTIME,
   version: '1.2.3',
   channel: 'stable',

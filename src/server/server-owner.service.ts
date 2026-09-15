@@ -26,6 +26,10 @@ import {
   PublishedControlError,
   PublishedControlService,
 } from '../processes/published-control.service.js';
+import type {
+  ServerLifecycleCode,
+  ServerLifecycleCorePhase,
+} from '../server-logs/server-lifecycle.types.js';
 
 const CORE_ENTRY = fileURLToPath(new URL('../bin/revo-core-host.js', import.meta.url));
 const CLOSE_MILLISECONDS = 5_000;
@@ -35,6 +39,7 @@ export interface ServerOwnerConfiguration {
   readonly dataDir: string;
   readonly databaseUrl?: string;
   readonly host: string;
+  readonly logDir: string;
   readonly port: number;
   readonly publicUrl: string;
   readonly runtimeDir: string;
@@ -119,6 +124,7 @@ export class ServerOwnerService {
     try {
       held = await this.controls.open({
         dataDir: request.configuration.dataDir,
+        logDir: request.configuration.logDir,
         runtimeDir: request.configuration.runtimeDir,
         version: request.configuration.version,
         channel: request.configuration.channel,
@@ -248,6 +254,7 @@ export class ServerOwnerResource {
     const signal = AbortSignal.any([callerSignal, this.controller.signal]);
     const stopUnavailable = () => {
       this.failureCode ??= 'revo.server-owner.cancelled';
+      this.emitLifecycle('SERVER_CANCELLED');
       this.beginObservedClose();
     };
     callerSignal.addEventListener('abort', stopUnavailable, { once: true });
@@ -298,10 +305,12 @@ export class ServerOwnerResource {
       rejectUnavailable(signal, deadline);
       this.ready = true;
       this.lifecyclePhase = 'running';
+      this.emitLifecycle('SERVER_READY');
       return { kind: 'ready', url: this.request.configuration.publicUrl };
     } catch (error) {
       const primary = normalizeOwnerError(error, signal);
       this.failureCode ??= primary.code;
+      this.emitStartFailure(primary.code);
       try {
         await this.close();
       } catch {
@@ -332,8 +341,12 @@ export class ServerOwnerResource {
       throw new ServerOwnerError('revo.server-owner.database');
     }
     try {
-      return await this.held.startDatabase({ signal, timeoutMs: remaining(deadline) });
+      this.emitLifecycle('DATABASE_STARTING');
+      const database = await this.held.startDatabase({ signal, timeoutMs: remaining(deadline) });
+      this.emitLifecycle('DATABASE_READY');
+      return database;
     } catch (error) {
+      this.emitLifecycle('DATABASE_FAILED');
       throw new ServerOwnerError(
         'revo.server-owner.database',
         undefined,
@@ -360,13 +373,16 @@ export class ServerOwnerResource {
   private async persistStage(message: CoreHostStageMessage): Promise<void> {
     const progress = requiredProgress(this.held);
     if (message.status === 'started') {
+      this.emitLifecycle('CORE_STAGE_STARTED', message.stage);
       await progress.start(message.stage);
       return;
     }
     if (message.status === 'completed') {
+      this.emitLifecycle('CORE_STAGE_COMPLETED', message.stage);
       await progress.complete(message.stage);
       return;
     }
+    this.emitLifecycle('CORE_STAGE_FAILED', message.stage);
     await progress.fail(message.stage, { code: message.code ?? 'CORE_HOST_STAGE_FAILED' });
   }
 
@@ -453,6 +469,27 @@ export class ServerOwnerResource {
       () => undefined,
       () => undefined,
     );
+  }
+
+  private emitLifecycle(code: ServerLifecycleCode, corePhase?: ServerLifecycleCorePhase): void {
+    void this.held.lifecycle?.emit(code, corePhase).catch(() => undefined);
+  }
+
+  private emitStartFailure(code: ServerOwnerErrorCode): void {
+    if (code === 'revo.server-owner.cancelled') {
+      return;
+    }
+    if (code === 'revo.server-owner.core') {
+      this.emitLifecycle('SERVER_CORE_FAILED');
+      return;
+    }
+    if (code === 'revo.server-owner.readiness') {
+      this.emitLifecycle('SERVER_READINESS_FAILED');
+      return;
+    }
+    if (code !== 'revo.server-owner.database') {
+      this.emitLifecycle('SERVER_START_FAILED');
+    }
   }
 
   private resolveFailure(

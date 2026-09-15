@@ -6,6 +6,8 @@ import { Inject, Injectable } from '@nestjs/common';
 
 import { EmbeddedPostgresResourceService } from '../postgres/embedded-postgres-resource.service.js';
 import { ExternalPostgresResourceService } from '../postgres/external-postgres-resource.service.js';
+import type { ServerLifecycleSink } from '../server-logs/server-lifecycle.types.js';
+import { openServerLifecycleStore } from '../server-logs/store.service.js';
 import { OwnedStartupProgress } from '../startup-progress/startup-progress-facade.js';
 import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
 import {
@@ -53,6 +55,12 @@ export class PublishedControlService {
       return lease;
     }
     const canonicalDataDir = dirname(lease.lockPath);
+    const lifecycle = await openServerLifecycleStore({
+      logDir: request.logDir,
+      canonicalDataDir,
+      channel: request.channel === 'alpha' ? 'alpha' : 'stable',
+    });
+    emitLifecycle(lifecycle, 'SERVER_STARTING');
     const instanceId = randomBytes(16).toString('hex');
     const token = randomBytes(32).toString('hex');
     let endpoint: Awaited<ReturnType<ControlEndpointService['listen']>> | undefined;
@@ -98,6 +106,7 @@ export class PublishedControlService {
       await publishRecord(temporaryPath, join(canonicalDataDir, CONTROL_FILE), record);
       let finalClose: Promise<void> | undefined;
       let progressClose: Promise<void> | undefined;
+      const lifecycleStop = new LifecycleStop(lifecycle);
       let finalState: 'pending' | 'released' | 'failed' = 'pending';
       let resolveOwnershipReleased!: () => void;
       const ownershipReleased = new Promise<void>((resolve) => {
@@ -116,6 +125,7 @@ export class PublishedControlService {
               instanceId,
               token,
               lease,
+              lifecycleStop,
               resolveOwnershipReleased,
             );
           })();
@@ -135,6 +145,7 @@ export class PublishedControlService {
           await finalClose;
           return;
         }
+        lifecycleStop.begin();
         const postgresClose = postgres?.close();
         progressClose ??= progress?.close();
         let postgresFailed = false;
@@ -142,6 +153,7 @@ export class PublishedControlService {
           await postgresClose;
         } catch {
           postgresFailed = true;
+          lifecycleStop.resourcesFailed();
         }
         if (postgresFailed) {
           if (!finalClose) {
@@ -164,6 +176,7 @@ export class PublishedControlService {
         stopResult: createdEndpoint.stopResult,
         stopDelivery: createdEndpoint.stopDelivery,
         ...(progress ? { progress } : {}),
+        ...(lifecycle ? { lifecycle } : {}),
         ...(postgres ? { startDatabase: postgres.start.bind(postgres) } : {}),
         close,
         ownershipReleased: () => ownershipReleased,
@@ -181,7 +194,7 @@ export class PublishedControlService {
     } catch {
       throw new PublishedControlError(
         'startup',
-        await cleanupStartup(endpoint, temporaryPath, lease),
+        await cleanupStartup(endpoint, temporaryPath, lease, lifecycle),
       );
     }
   }
@@ -192,6 +205,7 @@ export class PublishedControlService {
     instanceId: string,
     token: string,
     lease: Extract<Awaited<ReturnType<ServerOwnershipService['acquire']>>, { kind: 'held' }>,
+    lifecycleStop: LifecycleStop,
     resolveOwnershipReleased: () => void,
   ): Promise<void> {
     const failures: ('endpoint' | 'metadata' | 'ownership')[] = [];
@@ -214,6 +228,7 @@ export class PublishedControlService {
     } catch {
       failures.push('metadata');
     }
+    await lifecycleStop.finish(failures);
     try {
       await lease.release();
       resolveOwnershipReleased();
@@ -234,6 +249,7 @@ async function cleanupStartup(
   endpoint: Awaited<ReturnType<ControlEndpointService['listen']>> | undefined,
   temporaryPath: string | undefined,
   lease: Extract<Awaited<ReturnType<ServerOwnershipService['acquire']>>, { kind: 'held' }>,
+  lifecycle: ServerLifecycleSink | undefined,
 ) {
   const failures: ('endpoint' | 'metadata' | 'ownership')[] = [];
   if (endpoint) {
@@ -252,6 +268,8 @@ async function cleanupStartup(
       }
     }
   }
+  await lifecycle?.emit('SERVER_START_FAILED').catch(() => undefined);
+  await lifecycle?.close().catch(() => undefined);
   try {
     await lease.release();
   } catch {
@@ -276,3 +294,38 @@ async function publishRecord(temporaryPath: string, locatorPath: string, record:
 
 const errorCode = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
+
+class LifecycleStop {
+  private started = false;
+  private failed = false;
+
+  constructor(private readonly sink: ServerLifecycleSink | undefined) {}
+
+  begin(): void {
+    if (this.started) {
+      return;
+    }
+    this.started = true;
+    emitLifecycle(this.sink, 'SERVER_STOPPING');
+  }
+
+  resourcesFailed(): void {
+    this.failed = true;
+  }
+
+  async finish(failures: readonly unknown[]): Promise<void> {
+    if (failures.length === 0 && !this.failed) {
+      emitLifecycle(this.sink, 'SERVER_RESOURCES_STOPPED');
+    } else {
+      emitLifecycle(this.sink, 'SERVER_STOP_FAILED');
+    }
+    await this.sink?.close().catch(() => undefined);
+  }
+}
+
+function emitLifecycle(
+  sink: ServerLifecycleSink | undefined,
+  code: Parameters<ServerLifecycleSink['emit']>[0],
+): void {
+  void sink?.emit(code).catch(() => undefined);
+}
