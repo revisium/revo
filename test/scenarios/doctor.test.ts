@@ -270,8 +270,12 @@ describe('revo doctor', () => {
 
   it('maps unsupported runtime input to a safe failure', () => {
     const service = new DoctorService();
-    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
-    expect(() => service.createInput()).toThrow('unsupported on this platform');
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    try {
+      expect(() => service.createInput()).toThrow('unsupported on this platform');
+    } finally {
+      platform.mockRestore();
+    }
   });
 });
 
