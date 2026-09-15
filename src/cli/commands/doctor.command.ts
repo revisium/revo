@@ -7,8 +7,8 @@ import { StrictCommandRunner } from './strict-command-runner.js';
 @Command({ name: 'doctor', description: 'Inspect the Revo installation' })
 export class DoctorCommand extends StrictCommandRunner {
   constructor(
-    private readonly doctor: DoctorService,
-    private readonly output: OutputService,
+    private readonly doctor: Pick<DoctorService, 'inspect' | 'createInput' | 'isHealthy'>,
+    private readonly output: Pick<OutputService, 'write'>,
   ) {
     super();
   }

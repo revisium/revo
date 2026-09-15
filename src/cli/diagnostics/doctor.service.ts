@@ -29,15 +29,24 @@ export interface DoctorReport {
 export class DoctorService {
   constructor(
     @Inject(ConfigurationResolver)
-    private readonly configuration = new ConfigurationResolver(),
+    private readonly configuration: Pick<
+      ConfigurationResolver,
+      'resolve'
+    > = new ConfigurationResolver(),
     @Inject(DoctorPathProbe)
-    private readonly pathProbe = new DoctorPathProbe(),
+    private readonly pathProbe: Pick<DoctorPathProbe, 'inspect'> = new DoctorPathProbe(),
     @Inject(DoctorComponentProbe)
-    private readonly componentProbe = new DoctorComponentProbe(),
+    private readonly componentProbe: Pick<
+      DoctorComponentProbe,
+      'inspect'
+    > = new DoctorComponentProbe(),
     @Inject(ServerStatusService)
-    private readonly serverStatus = new ServerStatusService(),
+    private readonly serverStatus: Pick<ServerStatusService, 'read'> = new ServerStatusService(),
     @Inject(PackageMetadataService)
-    private readonly metadata = new PackageMetadataService(),
+    private readonly metadata: Pick<
+      PackageMetadataService,
+      'version'
+    > = new PackageMetadataService(),
   ) {}
 
   async inspect(input: Readonly<ConfigurationInput>): Promise<DoctorReport> {
