@@ -133,12 +133,15 @@ function posixTable(bootstrap) {
     .filter((archive) => POSIX_TARGETS.has(targetIdentity(archive)))
     .map((archive) => {
       const target = `${archive.platform}-${archive.arch}`;
+      const pnpm = bootstrap.pnpmArchives?.find(
+        (item) => item.platform === archive.platform && item.arch === archive.arch,
+      );
       const receipt = JSON.stringify({
         version: bootstrap.nodeVersion,
         target,
         archiveSha256: archive.sha256,
       });
-      return `${archive.platform}/${archive.arch}/${archive.format}) revo_platform=${shellQuote(archive.platform)}; revo_arch=${shellQuote(archive.arch)}; revo_format=${shellQuote(archive.format)}; revo_url=${shellQuote(archive.url)}; revo_sha256=${shellQuote(archive.sha256)}; revo_version=${shellQuote(bootstrap.nodeVersion)}; revo_expected_receipt=${shellQuote(receipt)}; revo_download_timeout=${shellQuote(bootstrap.execution.downloadTimeoutSeconds)}; revo_probe_timeout=${shellQuote(bootstrap.execution.nodeProbeTimeoutSeconds)}; revo_payload_timeout=${shellQuote(bootstrap.execution.payloadTimeoutSeconds)}; revo_grace=${shellQuote(bootstrap.execution.terminationGraceSeconds)} ;;`;
+      return `${archive.platform}/${archive.arch}/${archive.format}) revo_platform=${shellQuote(archive.platform)}; revo_arch=${shellQuote(archive.arch)}; revo_format=${shellQuote(archive.format)}; revo_url=${shellQuote(archive.url)}; revo_sha256=${shellQuote(archive.sha256)}; revo_version=${shellQuote(bootstrap.nodeVersion)}; revo_expected_receipt=${shellQuote(receipt)}; revo_download_timeout=${shellQuote(bootstrap.execution.downloadTimeoutSeconds)}; revo_probe_timeout=${shellQuote(bootstrap.execution.nodeProbeTimeoutSeconds)}; revo_payload_timeout=${shellQuote(bootstrap.execution.payloadTimeoutSeconds)}; revo_grace=${shellQuote(bootstrap.execution.terminationGraceSeconds)};${pnpm === undefined ? '' : ` revo_channel=${shellQuote(bootstrap.channel)}; revo_pnpm_version=${shellQuote(bootstrap.pnpmVersion)}; revo_pnpm_url=${shellQuote(pnpm.url)}; revo_pnpm_sha256=${shellQuote(pnpm.sha256)};`} ;;`;
     })
     .join('\n');
 }
@@ -172,18 +175,17 @@ export function buildInstaller(value) {
     const pnpmArchivesByTarget = new Map(
       manifest.toolchain.pnpmArchives.map((archive) => [targetIdentity(archive), archive]),
     );
+    const v3Bootstrap = {
+      ...bootstrap,
+      channel: manifest.release.channel,
+      pnpmVersion: manifest.toolchain.pnpm,
+      pnpmArchives: PNPM_TARGETS.map(([platform, arch, format]) => ({
+        ...pnpmArchivesByTarget.get(`${platform}/${arch}/${format}`),
+      })),
+    };
     return input.template
-      .replace(POSIX_SLOT, () => posixTable(bootstrap))
-      .replace(DATA_SLOT, () =>
-        JSON.stringify({
-          ...bootstrap,
-          channel: manifest.release.channel,
-          pnpmVersion: manifest.toolchain.pnpm,
-          pnpmArchives: PNPM_TARGETS.map(([platform, arch, format]) => ({
-            ...pnpmArchivesByTarget.get(`${platform}/${arch}/${format}`),
-          })),
-        }),
-      )
+      .replace(POSIX_SLOT, () => posixTable(v3Bootstrap))
+      .replace(DATA_SLOT, () => JSON.stringify(v3Bootstrap))
       .replace(PAYLOAD_SLOT, () => input.payload);
   }
   return input.template
