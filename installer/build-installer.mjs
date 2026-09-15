@@ -24,6 +24,14 @@ const TARGETS = [
   ['win32', 'arm64', 'zip'],
   ['win32', 'x64', 'zip'],
 ];
+const PNPM_TARGETS = [
+  ['darwin', 'arm64', 'tar.gz'],
+  ['darwin', 'x64', 'tar.gz'],
+  ['linux', 'arm64', 'tar.gz'],
+  ['linux', 'x64', 'tar.gz'],
+  ['win32', 'arm64', 'zip'],
+  ['win32', 'x64', 'zip'],
+];
 const POSIX_TARGETS = new Set(
   TARGETS.slice(0, 4).map(([platform, arch, format]) => `${platform}/${arch}/${format}`),
 );
@@ -141,7 +149,9 @@ export function buildInstaller(value) {
   validateTemplate(input.template, input.payload);
   const manifest = validateInstallationReleaseManifest(input.manifest, input.policy);
   if (manifest.schemaVersion !== 'revo-install/v2') {
-    throw new Error('Invalid installer manifest schema version: expected revo-install/v2');
+    if (manifest.schemaVersion !== 'revo-install/v3') {
+      throw new Error('Invalid installer manifest schema version: expected revo-install/v2 or v3');
+    }
   }
   const archivesByTarget = new Map(
     manifest.toolchain.nodeArchives.map((archive) => [targetIdentity(archive), archive]),
@@ -158,6 +168,24 @@ export function buildInstaller(value) {
     snapshot: { ...manifest.toolchain.nodeShasums },
     archives: bootstrapPolicy.identities.map((identity) => ({ ...archivesByTarget.get(identity) })),
   };
+  if (manifest.schemaVersion === 'revo-install/v3') {
+    const pnpmArchivesByTarget = new Map(
+      manifest.toolchain.pnpmArchives.map((archive) => [targetIdentity(archive), archive]),
+    );
+    return input.template
+      .replace(POSIX_SLOT, () => posixTable(bootstrap))
+      .replace(DATA_SLOT, () =>
+        JSON.stringify({
+          ...bootstrap,
+          channel: manifest.release.channel,
+          pnpmVersion: manifest.toolchain.pnpm,
+          pnpmArchives: PNPM_TARGETS.map(([platform, arch, format]) => ({
+            ...pnpmArchivesByTarget.get(`${platform}/${arch}/${format}`),
+          })),
+        }),
+      )
+      .replace(PAYLOAD_SLOT, () => input.payload);
+  }
   return input.template
     .replace(POSIX_SLOT, () => posixTable(bootstrap))
     .replace(DATA_SLOT, () => JSON.stringify(bootstrap))

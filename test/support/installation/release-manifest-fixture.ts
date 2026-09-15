@@ -1,6 +1,14 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
-import type { InstallationReleaseManifest } from '../../../src/installation/metadata.types.js';
+import type {
+  InstallationReleaseManifest,
+  NodeInstallationReleaseManifest,
+  PnpmArchiveArchitecture,
+  PnpmArchiveFormat,
+  PnpmArchivePlatform,
+  PnpmInstallationReleaseManifest,
+} from '../../../src/installation/metadata.types.js';
 import type { InstallationReleasePolicy } from '../../../src/installation/release-policy.js';
 import type { ReleaseMetadata } from '../../../src/release-metadata.js';
 
@@ -33,6 +41,12 @@ export interface FutureReleasePolicy extends InstallationReleasePolicy {
       format: NodeArchiveFormat,
     ) => string;
     readonly nodeShasums: (version: string) => string;
+    readonly pnpmArchive: (
+      version: string,
+      platform: PnpmArchivePlatform,
+      arch: PnpmArchiveArchitecture,
+      format: PnpmArchiveFormat,
+    ) => string;
   };
 }
 
@@ -66,12 +80,32 @@ export interface NodeArchiveFixture {
   readonly sha256: string;
 }
 
+export interface PnpmArchiveFixture {
+  readonly platform: PnpmArchivePlatform;
+  readonly arch: PnpmArchiveArchitecture;
+  readonly format: PnpmArchiveFormat;
+  readonly url: string;
+  readonly sha256: string;
+}
+
 export interface FutureReleaseManifestFixture extends Omit<ReleaseManifestFixture, 'manifest'> {
-  readonly manifest: InstallationReleaseManifest & {
+  readonly manifest: NodeInstallationReleaseManifest & {
     readonly schemaVersion: 'revo-install/v2';
-    readonly toolchain: InstallationReleaseManifest['toolchain'] & {
+    readonly toolchain: NodeInstallationReleaseManifest['toolchain'] & {
       readonly nodeArchives: readonly NodeArchiveFixture[];
       readonly nodeShasums: { readonly url: string; readonly sha256: string };
+    };
+  };
+}
+
+export interface PnpmReleaseManifestFixture extends Omit<ReleaseManifestFixture, 'manifest'> {
+  readonly policy: FutureReleasePolicy;
+  readonly manifest: PnpmInstallationReleaseManifest & {
+    readonly schemaVersion: 'revo-install/v3';
+    readonly toolchain: PnpmInstallationReleaseManifest['toolchain'] & {
+      readonly nodeArchives: readonly NodeArchiveFixture[];
+      readonly nodeShasums: { readonly url: string; readonly sha256: string };
+      readonly pnpmArchives: readonly PnpmArchiveFixture[];
     };
   };
 }
@@ -123,6 +157,8 @@ export function futureReleasePolicyFixture(
       nodeArchive: (version, platform, arch, format) =>
         `${nodeRoot(version)}/node-v${version}-${platform === 'win32' ? 'win' : platform}-${arch}.${format}`,
       nodeShasums: (version) => `${nodeRoot(version)}/SHASUMS256.txt`,
+      pnpmArchive: (version, platform, arch, format) =>
+        `https://github.com/pnpm/pnpm/releases/download/v${version}/pnpm-${platform}-${arch}.${format}`,
     },
   };
 }
@@ -192,6 +228,47 @@ const NODE_26_8_2_ARCHIVES = [
   ['win32', 'arm64', 'zip', 'a4e8362e268f1fcf1735f046e0adb088b28eeb400fb1c33fe5cc94d1a3d42570'],
 ] as const;
 
+interface PnpmAssetFixture {
+  readonly version: string;
+  readonly archives: readonly {
+    readonly platform: PnpmArchivePlatform;
+    readonly arch: PnpmArchiveArchitecture;
+    readonly format: PnpmArchiveFormat;
+    readonly sha256: string;
+  }[];
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isPnpmAssetFixture = (value: unknown): value is PnpmAssetFixture =>
+  isRecord(value) &&
+  typeof value.version === 'string' &&
+  Array.isArray(value.archives) &&
+  value.archives.every(
+    (archive) =>
+      isRecord(archive) &&
+      typeof archive.platform === 'string' &&
+      typeof archive.arch === 'string' &&
+      typeof archive.format === 'string' &&
+      typeof archive.sha256 === 'string',
+  );
+
+const readPnpmAssetFixture = (): PnpmAssetFixture => {
+  const value: unknown = JSON.parse(
+    readFileSync(
+      new URL('../../fixtures/installation/pnpm-v12.4.1-assets.json', import.meta.url),
+      'utf8',
+    ),
+  );
+  if (!isPnpmAssetFixture(value)) {
+    throw new Error('pnpm asset fixture is invalid');
+  }
+  return value;
+};
+
+const PNPM_ASSET_FIXTURE = readPnpmAssetFixture();
+
 export function futureReleaseManifestFixture(
   options: FutureReleaseManifestFixtureOptions = {},
 ): FutureReleaseManifestFixture {
@@ -225,6 +302,60 @@ export function futureReleaseManifestFixture(
           sha256: snapshotSha256,
         },
       },
+    },
+  };
+}
+
+export function pnpmReleasePolicyFixture(
+  options: ReleasePolicyFixtureOptions = {},
+): FutureReleasePolicy {
+  return futureReleasePolicyFixture({
+    ...options,
+    supportedSchemaVersions: options.supportedSchemaVersions ?? ['revo-install/v3'],
+  });
+}
+
+export function pnpmReleaseManifestFixture(
+  options: Omit<ReleaseManifestFixtureOptions, 'policy'> & {
+    readonly policy?: FutureReleasePolicy;
+  } = {},
+): PnpmReleaseManifestFixture {
+  const policy = options.policy ?? pnpmReleasePolicyFixture();
+  const fixture = futureReleaseManifestFixture({ ...options, policy });
+  const pnpmVersion = fixture.manifest.toolchain.pnpm;
+  const pnpmArchives =
+    pnpmVersion === PNPM_ASSET_FIXTURE.version
+      ? PNPM_ASSET_FIXTURE.archives.map((archive) => ({
+          ...archive,
+          url: policy.locators.pnpmArchive(
+            pnpmVersion,
+            archive.platform,
+            archive.arch,
+            archive.format,
+          ),
+        }))
+      : (['darwin', 'linux', 'win32'] as const).flatMap((platform) =>
+          (['arm64', 'x64'] as const).map((arch) => {
+            const format: PnpmArchiveFormat = platform === 'win32' ? 'zip' : 'tar.gz';
+            return {
+              platform,
+              arch,
+              format,
+              url: policy.locators.pnpmArchive(pnpmVersion, platform, arch, format),
+              sha256: digest(
+                Buffer.from(`synthetic pnpm ${pnpmVersion} ${platform} ${arch} ${format}`),
+                'sha256',
+              ),
+            };
+          }),
+        );
+  return {
+    ...fixture,
+    policy,
+    manifest: {
+      ...fixture.manifest,
+      schemaVersion: 'revo-install/v3',
+      toolchain: { ...fixture.manifest.toolchain, pnpmArchives },
     },
   };
 }

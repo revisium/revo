@@ -5,6 +5,10 @@ import type {
   NodeArchiveFormat,
   NodeArchivePlatform,
   NodeReleaseToolchain,
+  PnpmArchiveArchitecture,
+  PnpmArchiveFormat,
+  PnpmArchivePlatform,
+  PnpmReleaseToolchain,
 } from './metadata.types.js';
 import { parseInstallationReleaseManifest } from './release-validation.js';
 
@@ -30,6 +34,12 @@ export interface InstallationReleasePolicy {
       format: NodeArchiveFormat,
     ) => string;
     readonly nodeShasums?: (version: string) => string;
+    readonly pnpmArchive?: (
+      version: string,
+      platform: PnpmArchivePlatform,
+      arch: PnpmArchiveArchitecture,
+      format: PnpmArchiveFormat,
+    ) => string;
   };
 }
 
@@ -116,6 +126,12 @@ export function validateInstallationReleaseManifest(
   if (manifest.schemaVersion === 'revo-install/v2') {
     validateNodeToolchain(manifest.toolchain, policy);
   }
+  if (manifest.schemaVersion === 'revo-install/v3') {
+    validateNodeToolchain(manifest.toolchain, policy);
+    if ('pnpmArchives' in manifest.toolchain) {
+      validatePnpmToolchain(manifest.toolchain, policy);
+    }
+  }
   return manifest;
 }
 
@@ -134,6 +150,23 @@ function validateNodeToolchain(
     const expected = nodeArchive(toolchain.node, archive.platform, archive.arch, archive.format);
     if (!isSafeUrlMatch(archive.url, expected)) {
       throw invalid('Node archive URL does not match the release policy locator');
+    }
+  }
+}
+
+function validatePnpmToolchain(
+  toolchain: PnpmReleaseToolchain,
+  policy: InstallationReleasePolicy,
+): void {
+  const { pnpmArchive } = policy.locators;
+  if (pnpmArchive === undefined) {
+    throw invalid('pnpm artifact locator is missing');
+  }
+  for (const archive of toolchain.pnpmArchives) {
+    const expected = pnpmArchive(toolchain.pnpm, archive.platform, archive.arch, archive.format);
+    const canonical = `https://github.com/pnpm/pnpm/releases/download/v${toolchain.pnpm}/pnpm-${archive.platform}-${archive.arch}.${archive.format}`;
+    if (!isSafeUrlMatch(expected, canonical) || !isSafeUrlMatch(archive.url, canonical)) {
+      throw invalid('pnpm archive URL does not match the release policy locator');
     }
   }
 }

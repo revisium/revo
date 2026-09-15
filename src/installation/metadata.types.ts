@@ -26,6 +26,20 @@ export interface NodeReleaseToolchain {
   readonly nodeShasums: ReleaseArtifact;
 }
 
+export type PnpmArchivePlatform = 'darwin' | 'linux' | 'win32';
+export type PnpmArchiveArchitecture = 'arm64' | 'x64';
+export type PnpmArchiveFormat = 'tar.gz' | 'zip';
+
+export interface PnpmArchiveReleaseArtifact extends ReleaseArtifact {
+  readonly platform: PnpmArchivePlatform;
+  readonly arch: PnpmArchiveArchitecture;
+  readonly format: PnpmArchiveFormat;
+}
+
+export interface PnpmReleaseToolchain extends NodeReleaseToolchain {
+  readonly pnpmArchives: readonly PnpmArchiveReleaseArtifact[];
+}
+
 export interface LegacyReleaseToolchain {
   readonly node: string;
   readonly pnpm: string;
@@ -55,6 +69,11 @@ export interface NodeInstallationReleaseManifest extends InstallationReleaseMani
   readonly toolchain: NodeReleaseToolchain;
 }
 
+export interface PnpmInstallationReleaseManifest extends InstallationReleaseManifestFields {
+  readonly schemaVersion: 'revo-install/v3';
+  readonly toolchain: PnpmReleaseToolchain;
+}
+
 declare const unknownInstallationSchemaVersion: unique symbol;
 
 export type UnknownInstallationSchemaVersion = string & {
@@ -69,4 +88,5 @@ export interface UnknownInstallationReleaseManifest extends InstallationReleaseM
 export type InstallationReleaseManifest =
   | LegacyInstallationReleaseManifest
   | NodeInstallationReleaseManifest
+  | PnpmInstallationReleaseManifest
   | UnknownInstallationReleaseManifest;
