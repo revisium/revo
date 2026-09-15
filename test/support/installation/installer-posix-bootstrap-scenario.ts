@@ -467,11 +467,16 @@ async function ensureHostToolLink(path: string, target: string): Promise<void> {
 
 async function resolveHostTool(name: string): Promise<string> {
   const dirs = (process.env.PATH ?? '').split(':').filter(Boolean);
-  for (const dir of dirs) {
+
+  async function resolveHostToolAt(i: number): Promise<string> {
+    const dir = dirs[i];
+    if (dir === undefined) {
+      throw new Error(`fixture could not resolve required host utility: ${name}`);
+    }
     const candidate = join(dir, name);
     const info = await stat(candidate).catch(() => undefined);
     if (info === undefined || !info.isFile()) {
-      continue;
+      return resolveHostToolAt(i + 1);
     }
     const usable = await access(candidate, constants.X_OK).then(
       () => true,
@@ -480,8 +485,10 @@ async function resolveHostTool(name: string): Promise<string> {
     if (usable) {
       return realpath(candidate);
     }
+    return resolveHostToolAt(i + 1);
   }
-  throw new Error(`fixture could not resolve required host utility: ${name}`);
+
+  return resolveHostToolAt(0);
 }
 
 async function executable(path: string, body: string): Promise<void> {
