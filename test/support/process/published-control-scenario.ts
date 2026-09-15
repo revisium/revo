@@ -1,5 +1,14 @@
 import { execFile, fork, type ChildProcess } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,8 +18,11 @@ import {
   ControlDiscoveryService,
 } from '../../../src/processes/control-discovery.service.js';
 import type { PublishedControl } from '../../../src/processes/control-discovery.types.js';
+import { ControlEndpointService } from '../../../src/processes/control-endpoint.service.js';
 import { PublishedControlService } from '../../../src/processes/published-control.service.js';
 import { ServerOwnershipService } from '../../../src/processes/server-ownership.service.js';
+import { parseLifecycleDocument } from '../../../src/server-logs/document.js';
+import { serverLifecyclePath } from '../../../src/server-logs/store.service.js';
 
 export class PublishedControlScenario {
   private readonly roots = new Set<string>();
@@ -144,7 +156,38 @@ export class PublishedControlScenario {
       close: closed[0]?.status,
       ownershipReleased: true,
       replacement: replacement.kind,
+      lifecycleStopFailed: parseLifecycleDocument(
+        await readFile(
+          serverLifecyclePath({
+            logDir: fixture.logDir,
+            canonicalDataDir: fixture.dataDir,
+            channel: 'stable',
+          }),
+          'utf8',
+        ),
+      )?.events.some((event) => event.code === 'SERVER_STOP_FAILED'),
     };
+  }
+
+  async recordsEndpointFailureLifecycle() {
+    const fixture = await this.fixture();
+    const service = new PublishedControlService(undefined, undefined, new FailingEndpointService());
+    const held = await service.open(fixture);
+    this.held.push(held);
+    if (held.kind !== 'held') {
+      return undefined;
+    }
+    await Promise.allSettled([held.close()]);
+    return parseLifecycleDocument(
+      await readFile(
+        serverLifecyclePath({
+          logDir: fixture.logDir,
+          canonicalDataDir: fixture.dataDir,
+          channel: 'stable',
+        }),
+        'utf8',
+      ),
+    )?.events.at(-1)?.code;
   }
 
   async rejectsOversizedPublicationAndReportsCleanupFailure() {
@@ -163,6 +206,16 @@ export class PublishedControlScenario {
       oversized: oversized[0]?.status,
       retry: retry.kind,
       cleanup: cleanup[0]?.status === 'rejected' ? cleanup[0].reason : undefined,
+      lifecycle: parseLifecycleDocument(
+        await readFile(
+          serverLifecyclePath({
+            logDir: fixture.logDir,
+            canonicalDataDir: fixture.dataDir,
+            channel: 'stable',
+          }),
+          'utf8',
+        ),
+      )?.events.at(-1)?.code,
     };
   }
 
@@ -231,6 +284,21 @@ class FailingReleaseOwnership extends ServerOwnershipService {
       lockPath: join(this.dataDir, '.revo-server.lock'),
       release: async () => {
         throw new Error('secret release failure');
+      },
+    };
+  }
+}
+
+class FailingEndpointService extends ControlEndpointService {
+  override async listen(
+    ...parameters: Parameters<ControlEndpointService['listen']>
+  ): Promise<Awaited<ReturnType<ControlEndpointService['listen']>>> {
+    const endpoint = await super.listen(...parameters);
+    return {
+      ...endpoint,
+      close: async () => {
+        await endpoint.close();
+        throw new Error('fixture endpoint failure');
       },
     };
   }

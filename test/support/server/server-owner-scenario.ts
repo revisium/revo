@@ -8,7 +8,10 @@ import { NestFactory } from '@nestjs/core';
 import { CoreHostProcessService } from '../../../src/core-host/core-host-process.service.js';
 import { EmbeddedPostgresError, ExternalPostgresError } from '../../../src/postgres/index.js';
 import { ControlClientService } from '../../../src/processes/control-client.service.js';
-import { ControlDiscoveryService } from '../../../src/processes/control-discovery.service.js';
+import {
+  CONTROL_FILE,
+  ControlDiscoveryService,
+} from '../../../src/processes/control-discovery.service.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type {
   ManagedProcessRequest,
@@ -23,6 +26,7 @@ import {
 } from '../../../src/processes/published-control.service.js';
 import { ServerOwnershipService } from '../../../src/processes/server-ownership.service.js';
 import { parseLifecycleDocument } from '../../../src/server-logs/document.js';
+import type { ServerLifecycleSink } from '../../../src/server-logs/server-lifecycle.types.js';
 import { serverLifecyclePath } from '../../../src/server-logs/store.service.js';
 import {
   ServerOwnerResource,
@@ -35,6 +39,7 @@ import {
   StartupProgressDiscoveryService,
   StartupProgressJournalWriter,
 } from '../../../src/startup-progress/startup-progress-journal.service.js';
+import { ServerLifecycleProbe } from './server-lifecycle-probe.js';
 
 const STARTUP_MILLISECONDS = 120_000;
 
@@ -96,14 +101,8 @@ export class ServerOwnerScenario {
     const controlled = await this.controlledOwner(new OwnerJournal(), false);
     await controlled.owner.start(new AbortController().signal);
     await controlled.owner.close();
-    const serialized = await readFile(
-      serverLifecyclePath({
-        logDir: join(this.root, 'logs'),
-        canonicalDataDir: this.dataDir,
-        channel: 'stable',
-      }),
-      'utf8',
-    );
+    await controlled.owner.close();
+    const serialized = await readFile(this.lifecyclePath(), 'utf8');
     if (serialized.includes('postgresql:') || serialized.includes('fixture')) {
       throw new Error('Lifecycle document exposed a connection detail');
     }
@@ -112,6 +111,112 @@ export class ServerOwnerScenario {
       throw new Error('Lifecycle document was not readable');
     }
     return document.events.map((event) => `${event.phase}:${event.state}:${event.code}`);
+  }
+
+  async cancellationDoesNotWaitForLifecycleEmit() {
+    const lifecycle = new ServerLifecycleProbe();
+    const controlled = await this.controlledOwner(
+      new OwnerJournal(),
+      false,
+      false,
+      false,
+      false,
+      lifecycle,
+    );
+    const controller = new AbortController();
+    lifecycle.block('SERVER_READY', () => controller.abort());
+    const starting = controlled.owner.start(controller.signal).then(
+      () => 'ready' as const,
+      () => 'failed' as const,
+    );
+    await waitBounded(lifecycle.entered);
+    const contender = await new ServerOwnershipService().acquire(this.dataDir);
+    lifecycle.release();
+    const startResult = await starting;
+    if (contender.kind === 'held') {
+      await contender.release();
+    }
+    return { startResult, contender: contender.kind, codes: lifecycle.codes };
+  }
+
+  async ignoresLifecycleWriteRejections() {
+    const lifecycle = new ServerLifecycleProbe(true);
+    const controlled = await this.controlledOwner(
+      new OwnerJournal(),
+      false,
+      false,
+      false,
+      false,
+      lifecycle,
+    );
+    await controlled.owner.start(new AbortController().signal);
+    await controlled.owner.close();
+    return { rejections: lifecycle.rejections, ready: controlled.owner.status().phase };
+  }
+
+  async recordsFailureLifecycle(failure: 'database' | 'readiness' | 'core' | 'stop') {
+    const lifecycle = new ServerLifecycleProbe();
+    const controlled = await this.controlledOwner(
+      new OwnerJournal(),
+      failure === 'stop',
+      false,
+      false,
+      failure === 'database' ? 'embedded' : false,
+      lifecycle,
+      failure === 'readiness',
+    );
+    if (failure === 'core') {
+      await controlled.owner.start(new AbortController().signal);
+      controlled.processes.child.completeNaturally();
+      await controlled.owner.outcome();
+    } else if (failure === 'stop') {
+      await controlled.owner.start(new AbortController().signal);
+      await Promise.allSettled([controlled.owner.close()]);
+    } else {
+      await controlled.owner.start(new AbortController().signal).catch(() => undefined);
+    }
+    return lifecycle.codes;
+  }
+
+  async recordsAlphaLifecycle() {
+    const controlled = await this.controlledOwner(
+      new OwnerJournal(),
+      false,
+      false,
+      false,
+      false,
+      undefined,
+      false,
+      'alpha',
+    );
+    await controlled.owner.start(new AbortController().signal);
+    await controlled.owner.close();
+    const alpha = parseLifecycleDocument(await readFile(this.lifecyclePath('alpha'), 'utf8'));
+    const stable = await readFile(this.lifecyclePath('stable'), 'utf8').catch(() => undefined);
+    return { alpha: alpha?.events.length ?? 0, stable: stable !== undefined };
+  }
+
+  async recordsStartupFailureLifecycle() {
+    await mkdir(join(this.dataDir, CONTROL_FILE));
+    await new ServerOwnerService()
+      .open({
+        configuration: {
+          channel: 'stable',
+          dataDir: this.dataDir,
+          logDir: join(this.root, 'logs'),
+          host: '127.0.0.1',
+          port: 0,
+          publicUrl: 'http://127.0.0.1:3210',
+          runtimeDir: this.runtimeDir,
+          startupTimeout: 5_000,
+          version: '0.0.0',
+        },
+        environment: this.environment(),
+        operationId: this.nextOperation(),
+      })
+      .catch(() => undefined);
+    const document = parseLifecycleDocument(await readFile(this.lifecyclePath(), 'utf8'));
+    return document?.events.map((event) => event.code) ?? [];
   }
 
   async restartsExistingData() {
@@ -450,6 +555,14 @@ export class ServerOwnerScenario {
     return result;
   }
 
+  private lifecyclePath(channel: 'stable' | 'alpha' = 'stable') {
+    return serverLifecyclePath({
+      logDir: join(this.root, 'logs'),
+      canonicalDataDir: this.dataDir,
+      channel,
+    });
+  }
+
   private nextOperation() {
     this.operation += 1;
     return this.operation.toString(16).padStart(32, '0');
@@ -474,12 +587,15 @@ export class ServerOwnerScenario {
     failFirstHeldClose = false,
     stopBeforeOwnerAssignment = false,
     databaseFailure: false | 'embedded' | 'external' | 'unknown' = false,
+    lifecycle?: ServerLifecycleSink,
+    readinessFailure = false,
+    channel: 'stable' | 'alpha' = 'stable',
   ) {
     this.journals.push(journal);
     const processes = new OwnerControlledProcesses(failFirstStop);
     const server = createServer((_request, response) => {
       response.setHeader('content-type', 'application/json');
-      response.end('{"data":{"__typename":"Query"}}');
+      response.end(readinessFailure ? '{}' : '{"data":{"__typename":"Query"}}');
     });
     this.servers.push(server);
     const port = await listen(server);
@@ -489,12 +605,13 @@ export class ServerOwnerScenario {
       failFirstHeldClose,
       stopBeforeOwnerAssignment,
       databaseFailure,
+      lifecycle,
     );
     const service = new ServerOwnerService(controls, new CoreHostProcessService(processes));
     const operationId = this.nextOperation();
     const result = await service.open({
       configuration: {
-        channel: 'stable',
+        channel,
         dataDir: this.dataDir,
         logDir: join(this.root, 'logs'),
         databaseUrl: 'postgresql://postgres:fixture@127.0.0.1:5432/revo?sslmode=disable',
@@ -576,6 +693,7 @@ class RealLeaseControlService extends PublishedControlService {
     private readonly failFirstClose = false,
     private readonly stopBeforeOwnerAssignment = false,
     private readonly databaseFailure: false | 'embedded' | 'external' | 'unknown' = false,
+    private readonly lifecycle: ServerLifecycleSink | undefined,
   ) {
     super(undefined, undefined, undefined, undefined, journal);
   }
@@ -615,6 +733,7 @@ class RealLeaseControlService extends PublishedControlService {
         }
         await held.close();
       },
+      ...(this.lifecycle ? { lifecycle: this.lifecycle } : {}),
     };
   }
 }

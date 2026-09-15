@@ -65,13 +65,18 @@ describe('owned control publication and discovery', () => {
       close: 'rejected',
       ownershipReleased: true,
       replacement: 'held',
+      lifecycleStopFailed: true,
     });
+  });
+  it('records endpoint cleanup failure in the lifecycle journal', async () => {
+    await expect(scenario.recordsEndpointFailureLifecycle()).resolves.toBe('SERVER_STOP_FAILED');
   });
   it('rejects oversized publication and reports safe startup cleanup outcomes', async () => {
     const result = await scenario.rejectsOversizedPublicationAndReportsCleanupFailure();
     expect(result).toMatchObject({
       oversized: 'rejected',
       retry: 'held',
+      lifecycle: 'SERVER_START_FAILED',
       cleanup: {
         code: 'PUBLISHED_CONTROL_ERROR',
         phase: 'startup',
