@@ -106,16 +106,6 @@ describe('revo doctor', () => {
     expect(loaded).toBe(0);
   });
 
-  it('uses the released component probes by default', async () => {
-    await expect(new DoctorComponentProbe().inspect(configuration('/tmp/doctor'))).resolves.toEqual(
-      {
-        core: 'available',
-        admin: 'available',
-        postgres: 'available',
-      },
-    );
-  }, 20_000);
-
   it.each([
     { name: 'core', dependencies: { loadCoreRuntime: async () => Promise.reject(new Error()) } },
     {

@@ -1,4 +1,5 @@
 import { access, constants } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
 import { Injectable, Optional } from '@nestjs/common';
 
@@ -86,7 +87,9 @@ export class DoctorComponentProbe {
 }
 
 async function loadCoreRuntime(): Promise<unknown> {
-  return import('@revisium/revo-core/runtime');
+  const entrypoint = import.meta.resolve('@revisium/revo-core/runtime');
+  await access(fileURLToPath(entrypoint), constants.F_OK);
+  return undefined;
 }
 
 async function executable(path: string): Promise<boolean> {

@@ -1,3 +1,4 @@
+import { Inject } from '@nestjs/common';
 import { Command } from 'nest-commander';
 
 import { DoctorService, type DoctorReport } from '../diagnostics/doctor.service.js';
@@ -7,7 +8,9 @@ import { StrictCommandRunner } from './strict-command-runner.js';
 @Command({ name: 'doctor', description: 'Inspect the Revo installation' })
 export class DoctorCommand extends StrictCommandRunner {
   constructor(
+    @Inject(DoctorService)
     private readonly doctor: Pick<DoctorService, 'inspect' | 'createInput' | 'isHealthy'>,
+    @Inject(OutputService)
     private readonly output: Pick<OutputService, 'write'>,
   ) {
     super();
