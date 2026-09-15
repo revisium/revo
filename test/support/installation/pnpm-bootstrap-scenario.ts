@@ -15,6 +15,9 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
   const root = await mkdtemp(join(tmpdir(), 'revo-bootstrap-data-'));
   const dataPath = join(root, 'bootstrap.json');
   const receiptPath = join(root, 'install-receipt.json');
+  const nodeExecutable = join(root, 'node');
+  await writeFile(nodeExecutable, '#!/bin/sh\nexit 0\n');
+  await chmod(nodeExecutable, 0o755);
   const write = (value: unknown) =>
     writeFile(dataPath, `${JSON.stringify(value)}\n`, { mode: 0o600 });
   await write(bootstrap);
@@ -36,8 +39,10 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
       child.once('close', (code, signal) => done({ code, signal, stdout, stderr }));
     });
   return {
+    root,
     dataPath,
     receiptPath,
+    nodeExecutable,
     write,
     receipt: async () => readFile(receiptPath, 'utf8').catch(() => undefined),
     receiptMode: async () =>
@@ -48,7 +53,7 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
     archive: async () => {
       const source = await mkdtemp(join(root, 'payload-'));
       await mkdir(join(source, 'dist'));
-      await writeFile(join(source, 'pnpm'), '#!/bin/sh\n');
+      await writeFile(join(source, 'pnpm'), '#!/bin/sh\nprintf "12.4.1\\n"\n');
       await chmod(join(source, 'pnpm'), 0o755);
       await writeFile(join(source, 'dist', 'index.js'), 'export {}\n');
       const archivePath = join(root, 'pnpm.tar.gz');
