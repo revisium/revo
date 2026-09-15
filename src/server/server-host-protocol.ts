@@ -1,6 +1,7 @@
 import net from 'node:net';
 import { isAbsolute } from 'node:path';
 
+import { MAX_STARTUP_TIMEOUT_MILLISECONDS } from '../configuration/configuration.types.js';
 import type { ServerOwnerConfiguration } from './server-owner.service.js';
 
 export const SERVER_HOST_PROTOCOL = 'revo-server-host/v1' as const;
@@ -184,7 +185,9 @@ const absolute = (value: unknown): value is string => text(value) && isAbsolute(
 const port = (value: unknown): value is number =>
   Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 65_535;
 const duration = (value: unknown): value is number =>
-  Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= 2_147_483_647;
+  Number.isSafeInteger(value) &&
+  Number(value) > 0 &&
+  Number(value) <= MAX_STARTUP_TIMEOUT_MILLISECONDS;
 const environmentName = (value: string) =>
   value.length <= MAX_ENVIRONMENT_KEY_LENGTH && /^[A-Za-z_]\w*$/u.test(value);
 
