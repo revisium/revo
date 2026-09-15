@@ -3,9 +3,13 @@ import { Module } from '@nestjs/common';
 import { ConfigurationResolver } from '../configuration/configuration-resolver.js';
 import { ServerModule } from '../server/server.module.js';
 import { DefaultCommand } from './commands/default.command.js';
+import { DoctorCommand } from './commands/doctor.command.js';
 import { ServerCommand } from './commands/server.command.js';
 import { VersionCommand } from './commands/version.command.js';
 import { BrowserOpenerService } from './diagnostics/browser-opener.service.js';
+import { DoctorComponentProbe } from './diagnostics/doctor-component-probe.js';
+import { DoctorPathProbe } from './diagnostics/doctor-path-probe.js';
+import { DoctorService } from './diagnostics/doctor.service.js';
 import { OutputService } from './output.service.js';
 import { PackageMetadataService } from './package-metadata.service.js';
 import { ServerCommandService } from './server-command.service.js';
@@ -20,7 +24,11 @@ import { WebCommandService } from './web-command.service.js';
     PackageMetadataService,
     ServerCommandService,
     WebCommandService,
+    DoctorComponentProbe,
+    DoctorPathProbe,
+    DoctorService,
     DefaultCommand,
+    DoctorCommand,
     VersionCommand,
     ...ServerCommand.registerWithSubCommands(),
   ],

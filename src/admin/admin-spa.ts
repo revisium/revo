@@ -63,7 +63,7 @@ export async function configureAdminSpa(runtime: AdminRuntime): Promise<void> {
   runtime.configureAfterCoreRoutes((app) => mountAdminSpa(app, clientDirectory));
 }
 
-async function resolveAdminClientDirectory(): Promise<string> {
+export async function resolveAdminClientDirectory(): Promise<string> {
   const { getRevoAdminClientDirectory } = await import('@revisium/revo-admin/runtime');
   const clientDirectory = getRevoAdminClientDirectory();
   try {
