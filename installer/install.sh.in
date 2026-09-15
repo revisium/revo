@@ -44,6 +44,7 @@ revo_active_pid=
 revo_active_group=
 revo_active_watchdog=
 revo_cleanup_safe=1
+revo_runtime_stage=
 revo_signal_code() {
   case "$1" in
     HUP) printf '%s\n' 129 ;;
@@ -169,6 +170,9 @@ revo_cleanup() {
   if [ -n "$revo_stage" ] && [ "$revo_cleanup_safe" -eq 1 ]; then
     rm -rf "$revo_stage" || revo_cleanup_status=1
   fi
+  if [ -n "$revo_runtime_stage" ] && [ "$revo_cleanup_safe" -eq 1 ]; then
+    rm -rf "$revo_runtime_stage" || revo_cleanup_status=1
+  fi
   if [ "$revo_lock_acquired" -eq 1 ] && [ "$revo_cleanup_safe" -eq 1 ]; then
     if [ ! -d "$revo_lock" ] || [ -L "$revo_lock" ] ||
       [ ! -f "$revo_lock_marker" ] || [ -L "$revo_lock_marker" ] ||
@@ -246,6 +250,7 @@ if [ -e "$revo_final" ] || [ -L "$revo_final" ]; then
     REVO_INSTALL_MODE=pnpm REVO_INSTALL_ROOT=$revo_channel_root \
       REVO_PRIVATE_NODE_ROOT=$revo_final REVO_INSTALL_SCRATCH=$revo_scratch \
       REVO_NODE_TARGET=$revo_target REVO_NODE_ARCHIVE_SHA256=$revo_sha256 \
+      REVO_PLATFORM=$revo_platform REVO_ARCH=$revo_arch \
       REVO_RECEIPT_PATH=$revo_final/install-receipt.json \
       revo_run_staged_bounded "$revo_payload_timeout" "$revo_final/bin/node" \
       "$revo_payload_file" "$revo_data_file" || revo_fail
@@ -287,12 +292,38 @@ esac
 revo_node=$revo_stage/bin/node
 revo_run_staged_bounded "$revo_probe_timeout" "$revo_node" --version >"$revo_probe_file" || revo_fail
 [ "$(cat "$revo_probe_file")" = "v$revo_version" ] || exit 1
-if [ "$revo_v3" -eq 1 ]; then
+if [ "$revo_v3" -eq 1 ] && [ "${revo_package_enabled:-0}" -eq 1 ]; then
+  REVO_INSTALL_MODE= REVO_NODE_TARGET=$revo_target REVO_NODE_ARCHIVE_SHA256=$revo_sha256 REVO_RECEIPT_PATH=$revo_receipt \
+    revo_run_staged_bounded "$revo_payload_timeout" "$revo_node" "$revo_payload_file" \
+    "$revo_data_file" || revo_fail
+  [ -f "$revo_receipt" ] && [ ! -L "$revo_receipt" ] || revo_fail
+  rm -f "$revo_archive" "$revo_probe_file"
+  [ ! -e "$revo_final" ] && [ ! -L "$revo_final" ] || revo_fail
+  mv "$revo_stage" "$revo_final" || revo_fail
+  revo_stage=
+  revo_runtime_stage=$(mktemp -d "$revo_channel_root/.package-runtime.XXXXXX")
+  chmod 700 "$revo_runtime_stage"
+  mv "$revo_final/bootstrap.json" "$revo_runtime_stage/bootstrap.json"
+  mv "$revo_final/payload.mjs" "$revo_runtime_stage/payload.mjs"
+  revo_scratch=$revo_runtime_stage/scratch
+  mkdir -m 700 "$revo_scratch"
+  REVO_INSTALL_MODE=pnpm REVO_INSTALL_ROOT=$revo_channel_root \
+    REVO_PRIVATE_NODE_ROOT=$revo_final REVO_INSTALL_SCRATCH=$revo_scratch \
+    REVO_NODE_TARGET=$revo_target REVO_NODE_ARCHIVE_SHA256=$revo_sha256 \
+    REVO_PLATFORM=$revo_platform REVO_ARCH=$revo_arch \
+    REVO_RECEIPT_PATH=$revo_final/install-receipt.json \
+    revo_run_staged_bounded "$revo_payload_timeout" "$revo_final/bin/node" \
+    "$revo_runtime_stage/payload.mjs" "$revo_runtime_stage/bootstrap.json" || revo_fail
+  rm -rf "$revo_runtime_stage"
+  revo_runtime_stage=
+  exit 0
+elif [ "$revo_v3" -eq 1 ]; then
   revo_scratch=$revo_stage/scratch
   mkdir -m 700 "$revo_scratch"
   REVO_INSTALL_MODE=pnpm REVO_INSTALL_ROOT=$revo_channel_root \
     REVO_PRIVATE_NODE_ROOT=$revo_stage REVO_INSTALL_SCRATCH=$revo_scratch \
     REVO_NODE_TARGET=$revo_target REVO_NODE_ARCHIVE_SHA256=$revo_sha256 \
+    REVO_PLATFORM=$revo_platform REVO_ARCH=$revo_arch \
     REVO_RECEIPT_PATH=$revo_receipt \
     revo_run_staged_bounded "$revo_payload_timeout" "$revo_node" "$revo_payload_file" \
     "$revo_data_file" || revo_fail
