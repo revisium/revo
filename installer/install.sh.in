@@ -20,39 +20,151 @@ esac
 revo_target=$revo_platform-$revo_arch
 revo_parent=$revo_root/$revo_version
 revo_final=$revo_parent/$revo_target
-revo_run_bounded() (
+revo_signal_status=
+revo_signal_name=
+revo_signal_escalated=0
+revo_active_pid=
+revo_active_group=
+revo_active_watchdog=
+revo_cleanup_safe=1
+revo_signal_code() {
+  case "$1" in
+    HUP) printf '%s\n' 129 ;;
+    INT) printf '%s\n' 130 ;;
+    TERM) printf '%s\n' 143 ;;
+  esac
+}
+revo_signal_active() {
+  revo_signal=$1
+  if [ "$revo_signal_escalated" -eq 1 ]; then
+    if [ -n "$revo_active_group" ]; then
+      kill -0 "-$revo_active_group" 2>/dev/null && kill -KILL "-$revo_active_group" 2>/dev/null || :
+    fi
+    if [ -n "$revo_active_pid" ]; then
+      kill -0 "$revo_active_pid" 2>/dev/null && kill -KILL "$revo_active_pid" 2>/dev/null || :
+    fi
+    if [ -n "$revo_active_watchdog" ]; then
+      kill -0 "$revo_active_watchdog" 2>/dev/null && kill -TERM "$revo_active_watchdog" 2>/dev/null || :
+    fi
+    return 0
+  fi
+  if [ -n "$revo_active_pid" ]; then
+    kill -0 "$revo_active_pid" 2>/dev/null && kill -"$revo_signal" "$revo_active_pid" 2>/dev/null || :
+  fi
+  if [ -n "$revo_active_group" ]; then
+    kill -0 "-$revo_active_group" 2>/dev/null && kill -"$revo_signal" "-$revo_active_group" 2>/dev/null || :
+  fi
+  if [ -n "$revo_active_watchdog" ]; then
+    revo_watchdog_signal=$revo_signal
+    [ "$revo_watchdog_signal" = INT ] && revo_watchdog_signal=TERM
+    kill -0 "$revo_active_watchdog" 2>/dev/null && kill -"$revo_watchdog_signal" "$revo_active_watchdog" 2>/dev/null || :
+  fi
+}
+revo_external_signal() {
+  revo_received=$1
+  if [ -z "$revo_signal_status" ]; then
+    revo_signal_name=$revo_received
+    revo_signal_status=$(revo_signal_code "$revo_received")
+  else
+    revo_signal_escalated=1
+  fi
+  revo_signal_active "$revo_received"
+}
+trap 'revo_external_signal HUP' HUP
+trap 'revo_external_signal INT' INT
+trap 'revo_external_signal TERM' TERM
+
+revo_run_bounded() {
   revo_limit=$1
   shift
-  "$@" </dev/null &
-  revo_pid=$!
+  [ -z "$revo_signal_status" ] || return "$revo_signal_status"
+  revo_cleanup_safe=0
+  revo_active_group=
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" </dev/null &
+    revo_active_group=$!
+  else
+    "$@" </dev/null &
+  fi
+  revo_active_pid=$!
   (
     revo_sleep=
-    trap '[ -z "$revo_sleep" ] || kill "$revo_sleep" 2>/dev/null || :; [ -z "$revo_sleep" ] || wait "$revo_sleep" 2>/dev/null || :; exit 0' HUP INT TERM
+    revo_watchdog_send() {
+      revo_watchdog_received=$1
+      kill -"$revo_watchdog_received" "$revo_active_pid" 2>/dev/null || :
+      [ -z "$revo_active_group" ] || kill -"$revo_watchdog_received" "-$revo_active_group" 2>/dev/null || :
+    }
+    revo_watchdog_signal() {
+      revo_watchdog_received=$1
+      trap ':' HUP INT TERM
+      [ -z "$revo_sleep" ] || kill "$revo_sleep" 2>/dev/null || :
+      [ -z "$revo_sleep" ] || wait "$revo_sleep" 2>/dev/null || :
+      kill -0 "$revo_active_pid" 2>/dev/null || exit 0
+      revo_watchdog_send "$revo_watchdog_received"
+      sleep "$revo_grace" &
+      revo_sleep=$!
+      wait "$revo_sleep" 2>/dev/null || :
+      kill -KILL "$revo_active_pid" 2>/dev/null || :
+      exit 0
+    }
+    trap 'revo_watchdog_signal HUP' HUP
+    trap 'revo_watchdog_signal INT' INT
+    trap 'revo_watchdog_signal TERM' TERM
     sleep "$revo_limit" &
     revo_sleep=$!
     wait "$revo_sleep" || exit 0
-    kill -TERM "$revo_pid" 2>/dev/null || exit 0
+    revo_watchdog_send TERM
     sleep "$revo_grace" &
     revo_sleep=$!
-    wait "$revo_sleep" || exit 0
-    kill -KILL "$revo_pid" 2>/dev/null || :
+    wait "$revo_sleep" || :
+    revo_watchdog_send KILL
   ) &
-  revo_watchdog=$!
+  revo_active_watchdog=$!
+  [ -z "$revo_signal_status" ] || revo_signal_active "$revo_signal_name"
   set +e
-  wait "$revo_pid"
-  revo_status=$?
+  revo_status=0
+  while :; do
+    wait "$revo_active_pid"
+    revo_status=$?
+    kill -0 "$revo_active_pid" 2>/dev/null
+    revo_alive=$?
+    [ "$revo_alive" -eq 0 ] || break
+    [ -n "$revo_signal_status" ] || break
+  done
+  kill -TERM "$revo_active_watchdog" 2>/dev/null || :
+  wait "$revo_active_watchdog" 2>/dev/null || :
+  revo_active_pid=
+  revo_active_group=
+  revo_active_watchdog=
+  revo_cleanup_safe=1
   set -e
-  kill "$revo_watchdog" 2>/dev/null || :
-  wait "$revo_watchdog" 2>/dev/null || :
-  exit "$revo_status"
-)
+  [ -z "$revo_signal_status" ] || return "$revo_signal_status"
+  return "$revo_status"
+}
+
+revo_stage=
+revo_probe_temp=
+revo_cleanup() {
+  [ -z "$revo_probe_temp" ] || rm -f "$revo_probe_temp"
+  [ -z "$revo_stage" ] || [ "$revo_cleanup_safe" -eq 1 ] || return 0
+  [ -z "$revo_stage" ] || rm -rf "$revo_stage"
+}
+trap revo_cleanup EXIT
+revo_fail() {
+  [ -z "$revo_signal_status" ] || exit "$revo_signal_status"
+  exit 1
+}
 
 if [ -e "$revo_final" ] || [ -L "$revo_final" ]; then
   [ -d "$revo_final" ] && [ ! -L "$revo_final" ] || exit 1
   [ -f "$revo_final/install-receipt.json" ] && [ ! -L "$revo_final/install-receipt.json" ] || exit 1
   [ "$(LC_ALL=C ls -ld "$revo_final/install-receipt.json" | cut -c 1-10)" = '-rw-------' ] || exit 1
   [ "$(cat "$revo_final/install-receipt.json")" = "$revo_expected_receipt" ] || exit 1
-  revo_found=$(revo_run_bounded "$revo_probe_timeout" "$revo_final/bin/node" --version) || exit 1
+  revo_probe_temp=$revo_parent/.revo-probe.$$
+  revo_run_bounded "$revo_probe_timeout" "$revo_final/bin/node" --version >"$revo_probe_temp" || revo_fail
+  revo_found=$(cat "$revo_probe_temp") || revo_fail
+  rm -f "$revo_probe_temp"
+  revo_probe_temp=
   [ "$revo_found" = "v$revo_version" ] || exit 1
   trap - EXIT HUP INT TERM
   exit 0
@@ -66,23 +178,11 @@ revo_data_file=$revo_stage/bootstrap.json
 revo_payload_file=$revo_stage/payload.mjs
 revo_probe_file=$revo_stage/node-version
 revo_receipt=$revo_stage/install-receipt.json
-revo_cleanup() {
-  rm -rf "$revo_stage"
-}
-revo_external_interrupt() {
-  trap - EXIT HUP INT TERM
-  exit 1
-}
-trap revo_cleanup EXIT
-trap revo_external_interrupt HUP INT TERM
 revo_run_staged_bounded() {
-  trap - EXIT HUP INT TERM
   set +e
   revo_run_bounded "$@"
   revo_status=$?
   set -e
-  trap revo_cleanup EXIT
-  trap revo_external_interrupt HUP INT TERM
   return "$revo_status"
 }
 cat >"$revo_data_file" <<'REVO_NODE_BOOTSTRAP_DATA'
@@ -94,9 +194,9 @@ REVO_NODE_BOOTSTRAP_PAYLOAD
 chmod 600 "$revo_data_file" "$revo_payload_file"
 
 if command -v curl >/dev/null 2>&1; then
-  revo_run_staged_bounded "$revo_download_timeout" curl --fail --silent --show-error --output "$revo_archive" "$revo_url" || exit 1
+  revo_run_staged_bounded "$revo_download_timeout" curl --fail --silent --show-error --output "$revo_archive" "$revo_url" || revo_fail
 elif command -v wget >/dev/null 2>&1; then
-  revo_run_staged_bounded "$revo_download_timeout" wget --max-redirect=0 -q -O "$revo_archive" "$revo_url" || exit 1
+  revo_run_staged_bounded "$revo_download_timeout" wget --max-redirect=0 -q -O "$revo_archive" "$revo_url" || revo_fail
 else
   exit 1
 fi
@@ -115,10 +215,10 @@ case "$revo_format" in
   *) exit 1 ;;
 esac
 revo_node=$revo_stage/bin/node
-revo_run_staged_bounded "$revo_probe_timeout" "$revo_node" --version >"$revo_probe_file" || exit 1
+revo_run_staged_bounded "$revo_probe_timeout" "$revo_node" --version >"$revo_probe_file" || revo_fail
 [ "$(cat "$revo_probe_file")" = "v$revo_version" ] || exit 1
 REVO_NODE_TARGET=$revo_target REVO_NODE_ARCHIVE_SHA256=$revo_sha256 REVO_RECEIPT_PATH=$revo_receipt \
-  revo_run_staged_bounded "$revo_payload_timeout" "$revo_node" "$revo_payload_file" "$revo_data_file" || exit 1
+  revo_run_staged_bounded "$revo_payload_timeout" "$revo_node" "$revo_payload_file" "$revo_data_file" || revo_fail
 [ -f "$revo_receipt" ] && [ ! -L "$revo_receipt" ] || exit 1
 rm -f "$revo_archive" "$revo_data_file" "$revo_payload_file" "$revo_probe_file"
 mv "$revo_stage" "$revo_final"
