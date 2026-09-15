@@ -146,6 +146,22 @@ function posixTable(bootstrap) {
     .join('\n');
 }
 
+function packagePlan(manifest) {
+  return {
+    schemaVersion: 'revo-package-install/v1',
+    release: JSON.parse(JSON.stringify(manifest.release)),
+    components: JSON.parse(JSON.stringify(manifest.components)),
+    artifacts: JSON.parse(JSON.stringify(manifest.artifacts)),
+    target: { platform: 'runtime-selected', arch: 'runtime-selected' },
+    toolchain: { node: manifest.toolchain.node, pnpm: manifest.toolchain.pnpm },
+  };
+}
+
+function packagePayload(payload, manifest) {
+  const envelope = JSON.stringify(packagePlan(manifest));
+  return `${payload}\nconst REVO_PACKAGE_INSTALL_PLAN = ${envelope};\n`;
+}
+
 export function buildInstaller(value) {
   const input = validateInput(value);
   const bootstrapPolicy = validateBootstrapPolicy(input.bootstrapPolicy);
@@ -186,7 +202,7 @@ export function buildInstaller(value) {
     return input.template
       .replace(POSIX_SLOT, () => posixTable(v3Bootstrap))
       .replace(DATA_SLOT, () => JSON.stringify(v3Bootstrap))
-      .replace(PAYLOAD_SLOT, () => input.payload);
+      .replace(PAYLOAD_SLOT, () => packagePayload(input.payload, manifest));
   }
   return input.template
     .replace(POSIX_SLOT, () => posixTable(bootstrap))

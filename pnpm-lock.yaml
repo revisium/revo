@@ -222,6 +222,9 @@ importers:
       oxlint-tsgolint:
         specifier: 7.0.2001
         version: 7.0.2001
+      rolldown:
+        specifier: 1.2.8
+        version: 1.2.8
       typescript:
         specifier: 7.0.2
         version: 7.0.2

@@ -14,7 +14,7 @@ import {
   rm,
 } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 const HASH = /^[a-f0-9]{64}$/u;
 const VERSION =
@@ -834,9 +834,11 @@ export async function runInstallMode({
   return { ...result, nodeExecutable };
 }
 
+// Keep the published v2/v3 receipt runner directly executable for older installers.
 if (
   process.argv[1] !== undefined &&
-  pathToFileURL(resolve(process.argv[1])).href === import.meta.url
+  process.env.REVO_BOOTSTRAP_ENTRY !== '1' &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 )
   if (process.env.REVO_INSTALL_MODE === 'pnpm')
     await runInstallMode({
