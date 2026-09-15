@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { MAX_STARTUP_TIMEOUT_MILLISECONDS } from '../../src/configuration/configuration.types.js';
 import { ConfigurationError } from '../../src/configuration/index.js';
 import {
   ConfigurationScenario,
@@ -201,6 +202,27 @@ describe('configuration resolution', () => {
 
     expect(error).toMatchObject({ code: 'revo.configuration.invalid', exitCode: 2, field });
     expect(error).not.toHaveProperty('message', expect.stringContaining(sensitiveValue));
+  });
+
+  it('accepts the maximum launchable startupTimeout', async () => {
+    const result = await ConfigurationScenario.defaults()
+      .withFlags({ startupTimeout: MAX_STARTUP_TIMEOUT_MILLISECONDS })
+      .resolve();
+
+    expect(result.startupTimeout).toBe(MAX_STARTUP_TIMEOUT_MILLISECONDS);
+  });
+
+  it('rejects a startupTimeout beyond the maximum launchable value', async () => {
+    await expect(
+      ConfigurationScenario.defaults()
+        .withFlags({ startupTimeout: MAX_STARTUP_TIMEOUT_MILLISECONDS + 1 })
+        .resolve(),
+    ).rejects.toMatchObject({
+      code: 'revo.configuration.invalid',
+      exitCode: 2,
+      field: 'startupTimeout',
+      source: 'flags',
+    });
   });
 
   it('attributes selected environment validation without exposing a database secret', async () => {

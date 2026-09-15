@@ -4,11 +4,12 @@ import path from 'node:path';
 import { resolveRevoLayout, type ReleaseChannel } from '../layout.js';
 import { ConfigFileLoader } from './config-file-loader.js';
 import { invalidConfiguration } from './configuration-error.js';
-import type {
-  ConfigurationFile,
-  ConfigurationFlags,
-  ConfigurationInput,
-  RevoConfiguration,
+import {
+  MAX_STARTUP_TIMEOUT_MILLISECONDS,
+  type ConfigurationFile,
+  type ConfigurationFlags,
+  type ConfigurationInput,
+  type RevoConfiguration,
 } from './configuration.types.js';
 
 const FILE_KEYS = new Set([
@@ -65,7 +66,7 @@ export class ConfigurationResolver {
     const startupTimeout = this.integer(
       this.value('startupTimeout', input.flags, input.env, file) ?? 180_000,
       'startupTimeout',
-      Number.MAX_SAFE_INTEGER,
+      MAX_STARTUP_TIMEOUT_MILLISECONDS,
       this.source('startupTimeout', input.flags, input.env, file),
     );
     const dataDir = this.optionalPath(
