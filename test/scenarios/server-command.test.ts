@@ -75,7 +75,7 @@ describe('revo server command line', () => {
 
     for (const [result, texts] of [
       [root, ['server']],
-      [group, ['Usage: revo server', 'start', 'status', 'stop']],
+      [group, ['Usage: revo server', 'start', 'status', 'stop', 'logs']],
       [start, START_OPTIONS.map(([usage]) => usage)],
     ] as const) {
       expect(result).toMatchObject({ exitCode: 0, stderr: '' });
@@ -89,9 +89,27 @@ describe('revo server command line', () => {
     expect(await CliScenario.runIsolated(['server'])).toEqual({
       exitCode: 2,
       signal: null,
-      stderr: `Usage: revo server <start|status|stop>\nRun 'revo server <command> --help' for options.\n`,
+      stderr: `Usage: revo server <start|status|stop|logs>\nRun 'revo server <command> --help' for options.\n`,
       stdout: '',
     });
+  });
+
+  it('exposes only the lifecycle log options', async () => {
+    const result = await CliScenario.runIsolated(['server', 'logs', '--help']);
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+    for (const option of [
+      '--channel <channel>',
+      '--config <path>',
+      '--data-dir <path>',
+      '--follow',
+      '--log-dir <path>',
+    ]) {
+      expect(result.stdout).toContain(option);
+    }
+    for (const option of ['--host', '--port', '--json', '--tail', '--open']) {
+      expect(result.stdout).not.toContain(option);
+    }
   });
 
   it.each([
@@ -111,6 +129,9 @@ describe('revo server command line', () => {
     { args: ['server', 'start', '--channel', 'x'], stderr: /configuration field channel/u },
     { args: ['server', 'start', '--host', ''], stderr: /^Invalid configuration field host/u },
     { args: ['server', 'start', '--startup-timeout', 'x'], stderr: /field startupTimeout/u },
+    { args: ['server', 'logs', '--host', '127.0.0.1'], stderr: /unknown option '--host'/u },
+    { args: ['server', 'logs', '--json'], stderr: /unknown option '--json'/u },
+    { args: ['server', 'logs', '--tail', '10'], stderr: /unknown option '--tail'/u },
   ])('rejects $args as a usage failure', async ({ args, stderr }) => {
     const result = await CliScenario.runIsolated(args);
 
@@ -206,6 +227,33 @@ describe('server command presentation', () => {
 });
 
 describe('server command requests and failures', () => {
+  it('resolves only the selected lifecycle log configuration', async () => {
+    const result = await ServerCommandScenario.run([
+      'server',
+      'logs',
+      '--channel',
+      'alpha',
+      '--config',
+      '/fixture/custom.json',
+      '--data-dir',
+      '/fixture/custom-data',
+      '--log-dir',
+      '/fixture/custom-logs',
+    ]);
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: '',
+      stdout: 'No server lifecycle logs found.\n',
+    });
+    expect(result.resolves[0]?.flags).toEqual({
+      channel: 'alpha',
+      config: '/fixture/custom.json',
+      dataDir: '/fixture/custom-data',
+      logDir: '/fixture/custom-logs',
+    });
+  });
+
   it('sends one launch request from flags, ambient state, and package metadata', async () => {
     process.env.REVO_COMMAND_SNAPSHOT = 'present';
     try {
@@ -236,16 +284,19 @@ describe('server command requests and failures', () => {
     expect(result.launches[0]?.flags).toEqual({ port: '3300' });
   });
 
-  it.each(['start', 'status', 'stop'] as const)('refuses server %s on win32', async (cmd) => {
-    const result = await run(['server', cmd], { platform: 'win32' });
+  it.each(['start', 'status', 'stop', 'logs'] as const)(
+    'refuses server %s on win32',
+    async (cmd) => {
+      const result = await run(['server', cmd], { platform: 'win32' });
 
-    expect(result).toMatchObject({
-      exitCode: 1,
-      stderr: 'Server commands are unsupported on this platform.\n',
-      stdout: '',
-    });
-    expect([result.launches, result.resolves, result.reads]).toEqual([[], [], []]);
-  });
+      expect(result).toMatchObject({
+        exitCode: 1,
+        stderr: 'Server commands are unsupported on this platform.\n',
+        stdout: '',
+      });
+      expect([result.launches, result.resolves, result.reads]).toEqual([[], [], []]);
+    },
+  );
 
   it.each([
     { error: launchError('START_BUSY'), stderr: 'Server start is busy.\n' },
