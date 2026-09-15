@@ -41,6 +41,12 @@ const targets: readonly PosixTarget[] = [
   { system: 'Darwin', machine: 'x86_64', platform: 'darwin', arch: 'x64', format: 'tar.gz' },
   { system: 'Darwin', machine: 'arm64', platform: 'darwin', arch: 'arm64', format: 'tar.gz' },
 ];
+const interruptStages = ['download', 'probe', 'payload'] as const;
+const interruptSignals = [
+  ['SIGHUP', 129],
+  ['SIGINT', 130],
+  ['SIGTERM', 143],
+] as const;
 
 describe('generated POSIX Node publication', () => {
   const scenarios: InstallerPosixBootstrapScenario[] = [];
@@ -152,30 +158,82 @@ describe('generated POSIX Node publication', () => {
     expect(result.ownedResidue).toEqual([]);
   });
 
-  it('preserves its owned stage and archive when directly terminated', async () => {
+  it.each(
+    interruptStages.flatMap((stage) =>
+      interruptSignals.map(([signal, exitCode]) => ({ stage, signal, exitCode })),
+    ),
+  )('handles $signal during $stage with drained ownership', async ({ stage, signal, exitCode }) => {
     const subject = await scenario();
-    const running = await subject.start({ ...linuxTarget, payload: 'held' });
-    await subject.waitFor('payload-held');
-    const heldChildPid = await subject.heldChildPid();
-    const before = await subject.stageSnapshot();
+    const running = await subject.start({ ...linuxTarget, hold: stage });
+    await subject.waitFor(`${stage}-held`);
+    await subject.waitFor('watchdog-held');
+    const child = await subject.stageIdentity(stage);
+    const watchdog = await subject.watchdogIdentity();
 
-    running.signal();
+    expect(child).toMatchObject({ invocation: subject.invocationId() });
+    expect(child.pid).toBeGreaterThan(0);
+    expect(watchdog).toMatchObject({ invocation: subject.invocationId() });
+    expect(watchdog.pid).toBeGreaterThan(0);
+
+    running.signal(signal);
     const result = await running.finish;
 
     expect({ exitCode: result.exitCode, signalCode: result.signalCode }).toEqual({
-      exitCode: null,
-      signalCode: 'SIGTERM',
+      exitCode,
+      signalCode: null,
     });
-    expect(await subject.stageSnapshot()).toEqual(before);
-    expect(before.some((entry) => entry.path.endsWith('/node-archive'))).toBe(true);
+    expect(result.finalLayout).toEqual([]);
     expect(result.receipt).toBeUndefined();
-    expect(await subject.finalSnapshot()).toEqual([]);
+    expect(result.ownedResidue).toEqual([]);
+    expect(await subject.processesAbsent([child.pid, watchdog.pid])).toBe(true);
+  });
 
-    await subject.releasePayload();
-    expect(await subject.waitForProcessExit(heldChildPid)).toBe(true);
-    const afterChildExit = await subject.stageSnapshot();
-    expect(afterChildExit.some((entry) => entry.path.endsWith('/node-archive'))).toBe(true);
-    expect(afterChildExit.some((entry) => entry.path.endsWith('/install-receipt.json'))).toBe(true);
+  it('handles HUP during a reused-target probe without downloading', async () => {
+    const subject = await scenario();
+    await subject.seedValidTarget(linuxTarget, 'probe');
+    const before = await subject.finalSnapshot();
+    const running = await subject.start({ ...linuxTarget, hold: 'probe' });
+    await subject.waitFor('probe-held');
+    await subject.waitFor('watchdog-held');
+    const probe = await subject.stageIdentity('probe');
+
+    running.signal('SIGHUP');
+    const result = await running.finish;
+
+    expect({ exitCode: result.exitCode, signalCode: result.signalCode }).toEqual({
+      exitCode: 129,
+      signalCode: null,
+    });
+    expect(result.downloadArgv).toEqual([]);
+    expect(result.finalLayout).toEqual(['LAYOUT', 'bin', 'install-receipt.json']);
+    expect(await subject.finalSnapshot()).toEqual(before);
+    expect(await subject.processesAbsent([probe.pid])).toBe(true);
+  });
+
+  it('escalates a resistant payload after INT and repeated TERM without an orphan', async () => {
+    const subject = await scenario();
+    const running = await subject.start({
+      ...linuxTarget,
+      hold: 'payload',
+      resistant: true,
+    });
+    await subject.waitFor('payload-held');
+    await subject.waitFor('watchdog-held');
+    const child = await subject.stageIdentity('payload');
+    const watchdog = await subject.watchdogIdentity();
+
+    running.signal('SIGINT');
+    running.signal('SIGTERM');
+    running.signal('SIGTERM');
+    const result = await running.finish;
+
+    expect({ exitCode: result.exitCode, signalCode: result.signalCode }).toEqual({
+      exitCode: 130,
+      signalCode: null,
+    });
+    expect(result.finalLayout).toEqual([]);
+    expect(result.ownedResidue).toEqual([]);
+    expect(await subject.processesAbsent([child.pid, watchdog.pid])).toBe(true);
   });
 
   it('removes its owned stage when verification fails after a bounded step returns', async () => {

@@ -80,6 +80,7 @@ const HOST_TOOL_ALLOWLIST = [
   'cp',
   'gzip',
   'xz',
+  'setsid',
 ] as const;
 
 interface InstallerBuilder {
@@ -93,6 +94,7 @@ export interface PosixTarget {
   readonly arch: NodeArchiveArchitecture;
   readonly format: Extract<NodeArchiveFormat, 'tar.gz' | 'tar.xz'>;
 }
+type HoldStage = 'download' | 'probe' | 'payload';
 
 // Each injected failure lets the installer's real step succeed first and only then reports a
 // nonzero status, so the installer observes a genuine late failure of a completed operation.
@@ -109,9 +111,11 @@ interface RunOptions extends PosixTarget {
   readonly publishedSha256?: 'authentic' | 'divergent';
   readonly failure?: InjectedFailure;
   readonly watchdog?: 'download-hang';
+  readonly hold?: HoldStage;
+  readonly resistant?: boolean;
 }
 
-type PayloadProgram = 'ready' | 'held' | 'receipt-then-fail';
+type PayloadProgram = 'ready' | 'held' | 'receipt-then-fail' | 'resistant';
 
 interface SnapshotEntry {
   readonly path: string;
@@ -141,7 +145,7 @@ interface Observation {
 
 interface RunningInstaller {
   readonly finish: Promise<Observation>;
-  signal(): void;
+  signal(signal?: NodeJS.Signals): void;
 }
 
 interface OwnedChild {
@@ -153,6 +157,9 @@ interface OwnedChild {
 export class InstallerPosixBootstrapScenario {
   private readonly children = new Map<ChildProcess, OwnedChild>();
   private cleanupUnsafe = false;
+  private invocation = '';
+  private invocationNumber = 0;
+  private stageGate = '';
 
   private constructor(private readonly root: string) {}
 
@@ -165,6 +172,7 @@ export class InstallerPosixBootstrapScenario {
   }
 
   async start(options: RunOptions): Promise<RunningInstaller> {
+    this.beginInvocation();
     await this.prepare(options);
     const child = spawn('/bin/sh', [this.path('install.sh')], {
       cwd: this.root,
@@ -181,6 +189,12 @@ export class InstallerPosixBootstrapScenario {
         REVO_TEST_HELD_CHILD_PID: this.path('held-child.pid'),
         REVO_TEST_WATCHDOG_PID: this.path('watchdog.pid'),
         REVO_TEST_WATCHDOG_BOUNDS: this.path('watchdog.bounds'),
+        REVO_TEST_INVOCATION: this.invocation,
+        REVO_TEST_STAGE_GATE: this.stageGate,
+        REVO_TEST_STAGE_IDENTITY: this.path('stage.identity'),
+        REVO_TEST_WATCHDOG_IDENTITY: this.path('watchdog.identity'),
+        REVO_TEST_WATCHDOG_ACTIVE: options.hold === undefined ? '' : '1',
+        REVO_TEST_WATCHDOG_LIMIT: watchdogLimit(options),
       },
       detached: true,
       stdio: 'ignore',
@@ -189,8 +203,43 @@ export class InstallerPosixBootstrapScenario {
     this.children.set(child, owned);
     return {
       finish: this.observe(child, options, owned.completion),
-      signal: () => child.kill('SIGTERM'),
+      signal: (signal = 'SIGTERM') => child.kill(signal),
     };
+  }
+
+  invocationId(): string {
+    return this.invocation;
+  }
+
+  async stageIdentity(
+    stage: HoldStage,
+  ): Promise<{ readonly invocation: string; readonly pid: number }> {
+    const [observedStage, invocation, rawPid] = (
+      await readFile(this.path('stage.identity'), 'utf8')
+    )
+      .trim()
+      .split('\n');
+    const pid = Number(rawPid);
+    if (
+      observedStage !== stage ||
+      invocation !== this.invocation ||
+      !Number.isSafeInteger(pid) ||
+      pid <= 0
+    ) {
+      throw new Error(`fixture did not record the current ${stage} identity`);
+    }
+    return { invocation, pid };
+  }
+
+  async watchdogIdentity(): Promise<{ readonly invocation: string; readonly pid: number }> {
+    const [invocation, rawPid] = (await readFile(this.path('watchdog.identity'), 'utf8'))
+      .trim()
+      .split('\n');
+    const pid = Number(rawPid);
+    if (invocation !== this.invocation || !Number.isSafeInteger(pid) || pid <= 0) {
+      throw new Error('fixture did not record the current watchdog identity');
+    }
+    return { invocation, pid };
   }
 
   expectedDownloadArgv(tool: 'curl' | 'wget', stage: string): readonly string[] {
@@ -217,7 +266,11 @@ export class InstallerPosixBootstrapScenario {
   }
 
   async releasePayload(): Promise<void> {
-    await writeFile(this.path('payload-gate'), 'release');
+    await Promise.all([writeFile(this.path('payload-gate'), 'release'), this.releaseStage()]);
+  }
+
+  async releaseStage(): Promise<void> {
+    await writeFile(this.stageGate, 'release');
   }
 
   async heldChildPid(): Promise<number> {
@@ -277,12 +330,18 @@ export class InstallerPosixBootstrapScenario {
     ]);
   }
 
-  async seedValidTarget(target: PosixTarget): Promise<void> {
-    await this.prepare({ ...target, payload: 'ready' });
+  async seedValidTarget(target: PosixTarget, hold?: HoldStage): Promise<void> {
+    this.beginInvocation();
+    await this.prepare({
+      ...target,
+      payload: 'ready',
+      ...(hold === undefined ? {} : { hold }),
+    });
     await this.seedDirectory(target, JSON.stringify(this.expectedReceipt(target)), 0o600);
   }
 
   async seedExisting(kind: 'invalid-receipt' | 'symlink', target: PosixTarget): Promise<void> {
+    this.beginInvocation();
     await this.prepare({ ...target, payload: 'ready' });
     if (kind === 'invalid-receipt') {
       await this.seedDirectory(target, '{"untrusted":true}', 0o666);
@@ -329,7 +388,15 @@ export class InstallerPosixBootstrapScenario {
   private preparedTarget = '';
   private sha = '';
 
+  private beginInvocation(): void {
+    this.invocation = `${process.pid}-${Date.now()}-${++this.invocationNumber}`;
+    this.stageGate = this.path(`stage-gate-${this.invocation}`);
+  }
+
   private async prepare(options: RunOptions): Promise<void> {
+    if (this.invocation === '') {
+      this.beginInvocation();
+    }
     await mkdir(this.path('tools'), { recursive: true });
     await this.seedOutsideState();
     await this.prepareArchive(options, payloadProgram(options));
@@ -348,7 +415,7 @@ export class InstallerPosixBootstrapScenario {
     );
   }
 
-  private async prepareArchive(options: PosixTarget, payload: PayloadProgram): Promise<void> {
+  private async prepareArchive(options: RunOptions, payload: PayloadProgram): Promise<void> {
     const target = `${options.platform}-${options.arch}`;
     if (this.preparedTarget === target) {
       return;
@@ -359,7 +426,10 @@ export class InstallerPosixBootstrapScenario {
     await mkdir(this.path('archive-root'), { recursive: true });
     const archiveRoot = this.path('archive-root', `node-v26.8.2-${target}`);
     await mkdir(join(archiveRoot, 'bin'), { recursive: true });
-    await executable(join(archiveRoot, 'bin', 'node'), this.nodeProgram(payload));
+    await executable(
+      join(archiveRoot, 'bin', 'node'),
+      this.nodeProgram(payload, options.hold, options.resistant === true),
+    );
     await writeFile(join(archiveRoot, 'LAYOUT'), 'canonical archive layout');
     this.cleanupUnsafe = true;
     await createTar(this.path('archive'), archiveRoot, options.format, () => {
@@ -405,7 +475,9 @@ export class InstallerPosixBootstrapScenario {
     const bounded =
       options.watchdog === 'download-hang'
         ? { ...bootstrapPolicy, downloadTimeoutSeconds: 1, terminationGraceSeconds: 1 }
-        : bootstrapPolicy;
+        : options.hold === undefined
+          ? bootstrapPolicy
+          : { ...bootstrapPolicy, terminationGraceSeconds: 1 };
     const { buildInstaller } = await vi.importActual<InstallerBuilder>(BUILDER);
     const template = await readFile(join(ROOT, 'installer', 'install.sh.in'), 'utf8');
     const payloadSource = await readFile(PAYLOAD, 'utf8');
@@ -472,12 +544,12 @@ export class InstallerPosixBootstrapScenario {
   // the symlink is unlinked before the wrapper is written: writing through it would replace the
   // host utility itself.
   private async writeBoundedSleep(options: RunOptions): Promise<void> {
-    if (options.watchdog !== 'download-hang') {
+    if (options.watchdog !== 'download-hang' && options.hold === undefined) {
       return;
     }
     const host = await resolveHostTool('sleep');
     await rm(this.path('tools', 'sleep'), { force: true });
-    await executable(this.path('tools', 'sleep'), boundedSleepProgram(host));
+    await executable(this.path('tools', 'sleep'), boundedSleepProgram(host, options));
   }
 
   private async recordedPid(name: string): Promise<number> {
@@ -488,11 +560,12 @@ export class InstallerPosixBootstrapScenario {
     return value;
   }
 
-  private nodeProgram(payload: PayloadProgram): string {
+  private nodeProgram(payload: PayloadProgram, hold?: HoldStage, resistant = false): string {
     return `#!/bin/sh
 if [ "$1" = --version ]; then
   printf '%s\\0' "$0" "$@" >"$REVO_TEST_NODE_PROBE_ARGV"
   if IFS= read -r ignored; then exit 91; fi
+${hold === 'probe' ? heldStageProgram('probe') : ''}
   printf 'probe-stdin-eof\\nprobe\\n' >>"$REVO_TEST_EVENTS"
   printf 'v26.8.2\\n'
   exit 0
@@ -500,7 +573,7 @@ fi
 printf '%s\\0' "$0" "$@" >"$REVO_TEST_NODE_PAYLOAD_ARGV"
 if IFS= read -r ignored; then exit 92; fi
 printf 'payload-stdin-eof\\n' >>"$REVO_TEST_EVENTS"
-${payload === 'held' ? `printf '%s' "$$" >"$REVO_TEST_HELD_CHILD_PID"\nprintf 'payload-held\\n' >>"$REVO_TEST_EVENTS"\nwhile [ ! -f "$REVO_PAYLOAD_GATE" ]; do sleep 0.02; done` : ''}
+${hold === 'payload' ? heldStageProgram('payload', resistant) : payload === 'held' ? `printf '%s' "$$" >"$REVO_TEST_HELD_CHILD_PID"\nprintf 'payload-held\\n' >>"$REVO_TEST_EVENTS"\nwhile [ ! -f "$REVO_PAYLOAD_GATE" ]; do sleep 0.02; done` : ''}
 printf 'payload\\n' >>"$REVO_TEST_EVENTS"
 ${
   payload === 'receipt-then-fail'
@@ -600,8 +673,19 @@ const downloaderProgram = (name: 'curl' | 'wget', options: RunOptions) => `#!/bi
 printf '${name}\\0' >>"$REVO_TEST_ARGV"
 printf '%s\\0' "$@" >>"$REVO_TEST_ARGV"
 printf 'download\\n' >>"$REVO_TEST_EVENTS"
-${options.watchdog === 'download-hang' ? HANGING_DOWNLOAD : copyingDownload(options.failure)}
+${
+  options.watchdog === 'download-hang'
+    ? HANGING_DOWNLOAD
+    : `${copyingDownload(options.failure)}${options.hold === 'download' ? `\n${heldStageProgram('download')}` : ''}`
+}
 `;
+
+const heldStageProgram = (
+  stage: HoldStage,
+  resistant = false,
+) => `printf '%s\\n%s\\n%s\\n' '${stage}' "$REVO_TEST_INVOCATION" "$$" >"$REVO_TEST_STAGE_IDENTITY"
+printf '${stage}-held\\n' >>"$REVO_TEST_EVENTS"
+${resistant ? "trap '' INT TERM\n" : ''}while [ ! -f "$REVO_TEST_STAGE_GATE" ]; do sleep 0.02; done`;
 
 const wrapper = (event: string, command: string) => `#!/bin/sh
 printf '${event}\\n' >>"$REVO_TEST_EVENTS"
@@ -618,10 +702,14 @@ exit 1
 
 // Instruments only the installer's bounded waits, whose limit the watchdog run pins to one second,
 // and records the watchdog process that owns them once.
-const boundedSleepProgram = (command: string) => `#!/bin/sh
-if [ "$1" = 1 ]; then
+const boundedSleepProgram = (command: string, options: RunOptions) => `#!/bin/sh
+if [ "${options.watchdog === 'download-hang' || options.hold !== undefined ? '1' : ''}" = 1 ] && [ "$1" = "$REVO_TEST_WATCHDOG_LIMIT" ]; then
   printf 'x' >>"$REVO_TEST_WATCHDOG_BOUNDS"
   [ -s "$REVO_TEST_WATCHDOG_PID" ] || printf '%s' "$PPID" >"$REVO_TEST_WATCHDOG_PID"
+  if [ "$REVO_TEST_WATCHDOG_ACTIVE" = 1 ] && [ ! -s "$REVO_TEST_WATCHDOG_IDENTITY" ]; then
+    printf '%s\\n%s\\n' "$REVO_TEST_INVOCATION" "$PPID" >"$REVO_TEST_WATCHDOG_IDENTITY"
+    printf 'watchdog-held\\n' >>"$REVO_TEST_EVENTS"
+  fi
 fi
 exec '${command}' "$@"
 `;
@@ -630,8 +718,20 @@ const payloadProgram = (options: RunOptions): PayloadProgram => {
   if (options.failure === 'payload-after-receipt') {
     return 'receipt-then-fail';
   }
+  if (options.resistant === true) {
+    return 'resistant';
+  }
   return options.payload === 'held' ? 'held' : 'ready';
 };
+
+const watchdogLimit = (options: RunOptions): string =>
+  options.watchdog === 'download-hang'
+    ? '1'
+    : options.hold === 'download'
+      ? '30'
+      : options.hold === 'probe'
+        ? '10'
+        : '120';
 
 async function ensureHostToolLink(path: string, target: string): Promise<void> {
   const existing = await lstat(path).catch(() => undefined);
