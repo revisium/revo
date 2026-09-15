@@ -7,12 +7,7 @@ const OPEN_TIMEOUT_MILLISECONDS = 1_000;
 @Injectable()
 export class BrowserOpenerService {
   open(url: string): Promise<boolean> {
-    const command =
-      process.platform === 'darwin'
-        ? 'open'
-        : process.platform === 'linux'
-          ? 'xdg-open'
-          : undefined;
+    const command = commandFor(process.platform);
     if (command === undefined) {
       return Promise.resolve(false);
     }
@@ -36,4 +31,14 @@ export class BrowserOpenerService {
       child.once('exit', (code) => finish(code === 0));
     });
   }
+}
+
+function commandFor(platform: NodeJS.Platform): 'open' | 'xdg-open' | undefined {
+  if (platform === 'darwin') {
+    return 'open';
+  }
+  if (platform === 'linux') {
+    return 'xdg-open';
+  }
+  return undefined;
 }
