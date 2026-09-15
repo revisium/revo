@@ -11,6 +11,7 @@ import {
   type PackageProcessResult,
 } from './package-process.js';
 import { acquireAndStagePackage, type PackageStage } from './package-stage.js';
+import type { PnpmProgressSink } from './pnpm-progress.js';
 
 export const PACKAGE_INSTALL_ARGS = Object.freeze([
   'install',
@@ -64,6 +65,7 @@ export async function installPackage({
   signal,
   policy,
   diagnosticPath = join(stage.directory, '.package-install.log'),
+  progress,
 }: {
   readonly stage: PackageStage;
   readonly pnpmExecutable: string;
@@ -71,6 +73,7 @@ export async function installPackage({
   readonly signal?: AbortSignal;
   readonly policy?: PackageProcessPolicy;
   readonly diagnosticPath?: string;
+  readonly progress?: PnpmProgressSink;
 }): Promise<PackageInstallResult> {
   await absoluteRegularFile(pnpmExecutable, 'pnpm executable');
   await absoluteRegularFile(nodeExecutable, 'Node executable');
@@ -86,6 +89,7 @@ export async function installPackage({
     cwd: stage.packageDirectory,
     env: environment(nodeExecutable, pnpmExecutable),
     diagnosticPath,
+    ...(progress === undefined ? {} : { progress }),
     ...(signal === undefined ? {} : { signal }),
     ...(policy === undefined ? {} : { policy }),
   });
@@ -110,6 +114,7 @@ export async function acquireAndInstallPackage({
   signal,
   request,
   onProgress,
+  progress,
 }: {
   readonly plan: PackageInstallPlan;
   readonly scratch: string;
@@ -120,6 +125,7 @@ export async function acquireAndInstallPackage({
   readonly signal?: AbortSignal;
   readonly request?: PackageArtifactRequest;
   readonly onProgress?: (stage: string, artifact?: string) => void;
+  readonly progress?: PnpmProgressSink;
 }): Promise<PackageInstallResult> {
   const stage = await acquireAndStagePackage({
     plan,
@@ -136,6 +142,7 @@ export async function acquireAndInstallPackage({
       nodeExecutable,
       ...(processPolicy === undefined ? {} : { policy: processPolicy }),
       ...(signal === undefined ? {} : { signal }),
+      ...(progress === undefined ? {} : { progress }),
     });
   } catch (cause) {
     await rm(stage.directory, { recursive: true, force: true }).catch(() => undefined);

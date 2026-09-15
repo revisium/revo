@@ -3,6 +3,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { open, rm } from 'node:fs/promises';
 
+import type { PnpmProgressSink } from './pnpm-progress.js';
+
 export const DEFAULT_PACKAGE_PROCESS_POLICY = Object.freeze({
   timeoutMs: 10 * 60_000,
   terminationGraceMs: 5_000,
@@ -75,6 +77,7 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
   policy: inputPolicy,
   platform = process.platform,
   spawnProcess = (command, argv, options) => spawn(command, [...argv], options),
+  progress,
 }: {
   readonly executable: string;
   readonly args: readonly string[];
@@ -85,6 +88,7 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
   readonly policy?: PackageProcessPolicy;
   readonly platform?: NodeJS.Platform;
   readonly spawnProcess?: SpawnRequest;
+  readonly progress?: PnpmProgressSink;
 }): Promise<PackageProcessResult> {
   if (!executable.startsWith('/') || !cwd.startsWith('/') || !diagnosticPath.startsWith('/'))
     throw failure('absolute paths are required');
@@ -102,6 +106,7 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
   let stopFailure: Error | undefined;
   let stopReason: string | undefined;
   let logFailure: Error | undefined;
+  let progressFinished = false;
   try {
     child = spawnProcess(executable, args, {
       cwd,
@@ -134,6 +139,7 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
           },
         );
       });
+      progress?.feed(chunk instanceof Uint8Array ? chunk : String(chunk));
     };
     child.stdout?.on('data', (chunk) => output('stdout', chunk));
     child.stderr?.on('data', (chunk) => output('stderr', chunk));
@@ -179,8 +185,12 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
       policy.timeoutMs,
     );
     const result = await completion.catch((cause) => {
+      progress?.finish({ exitCode: 1, signal: null });
+      progressFinished = true;
       throw failure(cause instanceof Error ? cause.message : 'spawn failed');
     });
+    progress?.finish({ exitCode: result.code, signal: result.signal });
+    progressFinished = true;
     signal?.removeEventListener('abort', abort);
     if (signal?.aborted) throw failure('cancelled');
     if (outputOverflow) throw failure('diagnostic output exceeded its bound');
@@ -197,6 +207,7 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     await file.close().catch(() => undefined);
+    if (!progressFinished) progress?.finish({ exitCode: 1, signal: null });
     if (child === undefined) await rm(diagnosticPath, { force: true }).catch(() => undefined);
   }
 }
