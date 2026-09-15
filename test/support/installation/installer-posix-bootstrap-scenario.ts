@@ -37,6 +37,28 @@ const ROOT = dirname(dirname(dirname(SUPPORT)));
 const BUILDER = new URL('../../../installer/build-installer.mjs', import.meta.url).href;
 const PAYLOAD = join(ROOT, 'installer', 'node-bootstrap.mjs');
 const DIVERGENT_ARCHIVE_SHA256 = createHash('sha256').update('divergent archive').digest('hex');
+const HOST_SHA256SUM = '/usr/bin/sha256sum';
+const HOST_TAR = '/bin/tar';
+
+// A sentinel any shell expansion of the fixture's hostile names would create in the spawned
+// installer's working directory, which is this fixture root.
+const SENTINEL = 'hostile-sentinel';
+
+// State the installer must never read, write, or expand: the directory handed to it as TMPDIR, and
+// an unrelated neighbour. Both names carry whitespace, shell punctuation, and a sentinel command
+// substitution, so any unquoted use of them is observable rather than silent.
+const OUTSIDE_STATE = [
+  {
+    directory: `hostile tmp; $(touch ${SENTINEL}) 'quoted' \`touch ${SENTINEL}\``,
+    file: `marker; $(touch ${SENTINEL}).txt`,
+    bytes: 'hostile tmpdir marker',
+  },
+  {
+    directory: 'unrelated',
+    file: `kept note; $(touch ${SENTINEL}) 'quoted'.txt`,
+    bytes: 'unrelated state',
+  },
+] as const;
 
 // install.sh.in shells out to these by bare name (mkdir, mktemp, cat, ls, cut, awk, rm, mv, sleep,
 // chmod), and the fixture's own downloader wrappers shell out to bare cp; every other external
@@ -72,11 +94,24 @@ export interface PosixTarget {
   readonly format: Extract<NodeArchiveFormat, 'tar.gz' | 'tar.xz'>;
 }
 
+// Each injected failure lets the installer's real step succeed first and only then reports a
+// nonzero status, so the installer observes a genuine late failure of a completed operation.
+export type InjectedFailure =
+  | 'download-after-copy'
+  | 'sha256-after-output'
+  | 'shasum-after-output'
+  | 'tar-after-extract'
+  | 'payload-after-receipt';
+
 interface RunOptions extends PosixTarget {
   readonly downloader?: 'curl' | 'wget';
   readonly payload?: 'ready' | 'held' | 'hostile';
   readonly publishedSha256?: 'authentic' | 'divergent';
+  readonly failure?: InjectedFailure;
+  readonly watchdog?: 'download-hang';
 }
+
+type PayloadProgram = 'ready' | 'held' | 'receipt-then-fail';
 
 interface SnapshotEntry {
   readonly path: string;
@@ -101,6 +136,7 @@ interface Observation {
   readonly hostileSentinel: boolean;
   readonly targetSnapshot: readonly SnapshotEntry[];
   readonly ownedResidue: readonly string[];
+  readonly watchdogTermGrace: boolean;
 }
 
 interface RunningInstaller {
@@ -134,6 +170,7 @@ export class InstallerPosixBootstrapScenario {
       cwd: this.root,
       env: {
         PATH: this.path('tools'),
+        TMPDIR: this.path(OUTSIDE_STATE[0].directory),
         REVO_INSTALL_ROOT: this.path('state'),
         REVO_PAYLOAD_GATE: this.path('payload-gate'),
         REVO_TEST_ARCHIVE: this.path('archive'),
@@ -142,6 +179,8 @@ export class InstallerPosixBootstrapScenario {
         REVO_TEST_NODE_PAYLOAD_ARGV: this.path('payload.argv'),
         REVO_TEST_NODE_PROBE_ARGV: this.path('probe.argv'),
         REVO_TEST_HELD_CHILD_PID: this.path('held-child.pid'),
+        REVO_TEST_WATCHDOG_PID: this.path('watchdog.pid'),
+        REVO_TEST_WATCHDOG_BOUNDS: this.path('watchdog.bounds'),
       },
       detached: true,
       stdio: 'ignore',
@@ -182,15 +221,22 @@ export class InstallerPosixBootstrapScenario {
   }
 
   async heldChildPid(): Promise<number> {
-    const value = Number(await readFile(this.path('held-child.pid'), 'utf8'));
-    if (!Number.isSafeInteger(value) || value <= 0) {
-      throw new Error('fixture did not record a valid held child PID');
-    }
-    return value;
+    return this.recordedPid('held-child.pid');
+  }
+
+  async watchdogPid(): Promise<number> {
+    return this.recordedPid('watchdog.pid');
   }
 
   async waitForProcessExit(pid: number): Promise<boolean> {
     return pollProcessExit(pid, 200);
+  }
+
+  // Observes already completed runs, so it only reads process existence and never signals a PID
+  // this fixture no longer owns.
+  async processesAbsent(pids: readonly number[]): Promise<boolean> {
+    const observed = await Promise.all(pids.map(async (pid) => pollProcessAbsent(pid, 50)));
+    return observed.every((absent) => absent);
   }
 
   async receipt(): Promise<unknown> {
@@ -203,6 +249,32 @@ export class InstallerPosixBootstrapScenario {
 
   async finalSnapshot(): Promise<readonly SnapshotEntry[]> {
     return snapshot(this.path('state', '26.8.2', 'linux-x64'));
+  }
+
+  async stageRoots(): Promise<readonly string[]> {
+    return (await this.stageSnapshot())
+      .map((entry) => entry.path)
+      .filter((path) => !path.slice('26.8.2/'.length).includes('/'));
+  }
+
+  async stateOutsideStage(): Promise<readonly string[]> {
+    return (await snapshot(this.path('state')))
+      .map((entry) => entry.path)
+      .filter((path) => path !== '.' && path !== '26.8.2' && !path.includes('.stage.'));
+  }
+
+  async outsideSnapshot(): Promise<readonly SnapshotEntry[]> {
+    const roots = await Promise.all(
+      OUTSIDE_STATE.map(async ({ directory }) => snapshot(this.path(directory))),
+    );
+    return roots.flat();
+  }
+
+  expectedOutsideSnapshot(): readonly SnapshotEntry[] {
+    return OUTSIDE_STATE.flatMap(({ file, bytes }) => [
+      { path: '.', kind: 'directory' as const, mode: 0o700 },
+      { path: file, kind: 'file' as const, mode: 0o600, bytes },
+    ]);
   }
 
   async seedValidTarget(target: PosixTarget): Promise<void> {
@@ -259,12 +331,24 @@ export class InstallerPosixBootstrapScenario {
 
   private async prepare(options: RunOptions): Promise<void> {
     await mkdir(this.path('tools'), { recursive: true });
-    await this.prepareArchive(options, options.payload === 'held' ? 'held' : 'ready');
+    await this.seedOutsideState();
+    await this.prepareArchive(options, payloadProgram(options));
     await this.writeTools(options);
     await this.writeInstaller(options);
   }
 
-  private async prepareArchive(options: PosixTarget, payload: 'ready' | 'held'): Promise<void> {
+  private async seedOutsideState(): Promise<void> {
+    await Promise.all(
+      OUTSIDE_STATE.map(async ({ directory, file, bytes }) => {
+        await mkdir(this.path(directory), { recursive: true });
+        await chmod(this.path(directory), 0o700);
+        await writeFile(this.path(directory, file), bytes, { mode: 0o600 });
+        await chmod(this.path(directory, file), 0o600);
+      }),
+    );
+  }
+
+  private async prepareArchive(options: PosixTarget, payload: PayloadProgram): Promise<void> {
     const target = `${options.platform}-${options.arch}`;
     if (this.preparedTarget === target) {
       return;
@@ -318,16 +402,20 @@ export class InstallerPosixBootstrapScenario {
         ),
       },
     };
+    const bounded =
+      options.watchdog === 'download-hang'
+        ? { ...bootstrapPolicy, downloadTimeoutSeconds: 1, terminationGraceSeconds: 1 }
+        : bootstrapPolicy;
     const { buildInstaller } = await vi.importActual<InstallerBuilder>(BUILDER);
     const template = await readFile(join(ROOT, 'installer', 'install.sh.in'), 'utf8');
     const payloadSource = await readFile(PAYLOAD, 'utf8');
     const payload =
       options.payload === 'hostile'
-        ? `${payloadSource}\n// '; touch ${this.path('hostile-sentinel')} #\n`
+        ? `${payloadSource}\n// '; touch ${this.path(SENTINEL)} #\n`
         : payloadSource;
     await writeFile(
       this.path('install.sh'),
-      buildInstaller({ manifest, policy, bootstrapPolicy, template, payload }),
+      buildInstaller({ manifest, policy, bootstrapPolicy: bounded, template, payload }),
       { mode: 0o700 },
     );
   }
@@ -337,22 +425,70 @@ export class InstallerPosixBootstrapScenario {
       this.path('tools', 'uname'),
       `#!/bin/sh\n[ "$1" = -s ] && printf '%s\\n' '${options.system}' || printf '%s\\n' '${options.machine}'\n`,
     );
-    await executable(this.path('tools', 'curl'), downloaderProgram('curl'));
+    await executable(this.path('tools', 'curl'), downloaderProgram('curl', options));
     if (options.downloader === 'wget') {
       await rm(this.path('tools', 'curl'));
     }
-    await executable(this.path('tools', 'wget'), downloaderProgram('wget'));
-    await executable(this.path('tools', 'sha256sum'), wrapper('sha256', '/usr/bin/sha256sum'));
-    await executable(this.path('tools', 'tar'), wrapper(`tar:${options.format}`, '/bin/tar'));
+    await executable(this.path('tools', 'wget'), downloaderProgram('wget', options));
+    await this.writeHasher(options);
+    await executable(
+      this.path('tools', 'tar'),
+      options.failure === 'tar-after-extract'
+        ? failingWrapper(`tar:${options.format}`, HOST_TAR, '"$@"')
+        : wrapper(`tar:${options.format}`, HOST_TAR),
+    );
     await executable(this.path('tools', 'node'), '#!/bin/sh\nexit 97\n');
     await Promise.all(
       HOST_TOOL_ALLOWLIST.map(async (name) =>
         ensureHostToolLink(this.path('tools', name), await resolveHostTool(name)),
       ),
     );
+    await this.writeBoundedSleep(options);
   }
 
-  private nodeProgram(payload: 'ready' | 'held'): string {
+  private async writeHasher(options: RunOptions): Promise<void> {
+    if (options.failure === 'shasum-after-output') {
+      await rm(this.path('tools', 'sha256sum'), { force: true });
+      await executable(
+        this.path('tools', 'shasum'),
+        failingWrapper(
+          'shasum',
+          HOST_SHA256SUM,
+          '"$3"',
+          '[ "$1" = -a ] && [ "$2" = 256 ] || exit 89\n',
+        ),
+      );
+      return;
+    }
+    await executable(
+      this.path('tools', 'sha256sum'),
+      options.failure === 'sha256-after-output'
+        ? failingWrapper('sha256', HOST_SHA256SUM, '"$@"')
+        : wrapper('sha256', HOST_SHA256SUM),
+    );
+  }
+
+  // The allowlist already linked sleep to the host binary, so the host binary is resolved first and
+  // the symlink is unlinked before the wrapper is written: writing through it would replace the
+  // host utility itself.
+  private async writeBoundedSleep(options: RunOptions): Promise<void> {
+    if (options.watchdog !== 'download-hang') {
+      return;
+    }
+    const host = await resolveHostTool('sleep');
+    await rm(this.path('tools', 'sleep'), { force: true });
+    await executable(this.path('tools', 'sleep'), boundedSleepProgram(host));
+  }
+
+  private async recordedPid(name: string): Promise<number> {
+    const value = Number(await readFile(this.path(name), 'utf8'));
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`fixture did not record a valid PID: ${name}`);
+    }
+    return value;
+  }
+
+  private nodeProgram(payload: PayloadProgram): string {
     return `#!/bin/sh
 if [ "$1" = --version ]; then
   printf '%s\\0' "$0" "$@" >"$REVO_TEST_NODE_PROBE_ARGV"
@@ -366,7 +502,11 @@ if IFS= read -r ignored; then exit 92; fi
 printf 'payload-stdin-eof\\n' >>"$REVO_TEST_EVENTS"
 ${payload === 'held' ? `printf '%s' "$$" >"$REVO_TEST_HELD_CHILD_PID"\nprintf 'payload-held\\n' >>"$REVO_TEST_EVENTS"\nwhile [ ! -f "$REVO_PAYLOAD_GATE" ]; do sleep 0.02; done` : ''}
 printf 'payload\\n' >>"$REVO_TEST_EVENTS"
-exec "${process.execPath}" "$@"
+${
+  payload === 'receipt-then-fail'
+    ? `"${process.execPath}" "$@" || exit 93\n[ -f "$REVO_RECEIPT_PATH" ] || exit 94\nexit 1`
+    : `exec "${process.execPath}" "$@"`
+}
 `;
   }
 
@@ -414,8 +554,12 @@ exec "${process.execPath}" "$@"
         (names) => names.sort(),
         () => [],
       ),
-      hostileSentinel: await lstat(this.path('hostile-sentinel')).then(
+      hostileSentinel: await lstat(this.path(SENTINEL)).then(
         () => true,
+        () => false,
+      ),
+      watchdogTermGrace: await readFile(this.path('watchdog.bounds'), 'utf8').then(
+        (value) => value.length >= 2,
         () => false,
       ),
       targetSnapshot: await snapshot(this.path('state')),
@@ -437,22 +581,57 @@ exec "${process.execPath}" "$@"
   }
 }
 
-const downloaderProgram = (name: 'curl' | 'wget') => `#!/bin/sh
-printf '${name}\\0' >>"$REVO_TEST_ARGV"
-printf '%s\\0' "$@" >>"$REVO_TEST_ARGV"
-printf 'download\\n' >>"$REVO_TEST_EVENTS"
-output=''
+// Records its own PID before replacing itself with an unkillable-by-TERM sleep, so the installer's
+// escalation has to terminate exactly that process: the wrapper never forks a descendant.
+const HANGING_DOWNLOAD = `printf '%s' "$$" >"$REVO_TEST_HELD_CHILD_PID"
+trap '' TERM
+exec sleep 30`;
+
+const copyingDownload = (failure: RunOptions['failure']) => `output=''
 while [ "$#" -gt 0 ]; do
   case "$1" in --output|-O) shift; output=$1 ;; esac
   shift
 done
-cp "$REVO_TEST_ARCHIVE" "$output"
+cp "$REVO_TEST_ARCHIVE" "$output" || { printf 'download-unguarded\\n' >>"$REVO_TEST_EVENTS"; exit 89; }${
+  failure === 'download-after-copy' ? '\nexit 1' : ''
+}`;
+
+const downloaderProgram = (name: 'curl' | 'wget', options: RunOptions) => `#!/bin/sh
+printf '${name}\\0' >>"$REVO_TEST_ARGV"
+printf '%s\\0' "$@" >>"$REVO_TEST_ARGV"
+printf 'download\\n' >>"$REVO_TEST_EVENTS"
+${options.watchdog === 'download-hang' ? HANGING_DOWNLOAD : copyingDownload(options.failure)}
 `;
 
 const wrapper = (event: string, command: string) => `#!/bin/sh
 printf '${event}\\n' >>"$REVO_TEST_EVENTS"
 exec '${command}' "$@"
 `;
+
+// Completes the real operation before injecting the failure, and reports an unguarded event of its
+// own when that real operation fails, so a broken fixture can never look like an injected one.
+const failingWrapper = (event: string, command: string, argv: string, guard = '') => `#!/bin/sh
+printf '${event}\\n' >>"$REVO_TEST_EVENTS"
+${guard}'${command}' ${argv} || { printf '${event}-unguarded\\n' >>"$REVO_TEST_EVENTS"; exit 89; }
+exit 1
+`;
+
+// Instruments only the installer's bounded waits, whose limit the watchdog run pins to one second,
+// and records the watchdog process that owns them once.
+const boundedSleepProgram = (command: string) => `#!/bin/sh
+if [ "$1" = 1 ]; then
+  printf 'x' >>"$REVO_TEST_WATCHDOG_BOUNDS"
+  [ -s "$REVO_TEST_WATCHDOG_PID" ] || printf '%s' "$PPID" >"$REVO_TEST_WATCHDOG_PID"
+fi
+exec '${command}' "$@"
+`;
+
+const payloadProgram = (options: RunOptions): PayloadProgram => {
+  if (options.failure === 'payload-after-receipt') {
+    return 'receipt-then-fail';
+  }
+  return options.payload === 'held' ? 'held' : 'ready';
+};
 
 async function ensureHostToolLink(path: string, target: string): Promise<void> {
   const existing = await lstat(path).catch(() => undefined);
@@ -757,6 +936,27 @@ async function pollProcessExit(pid: number, remaining: number): Promise<boolean>
   }
   await delay(10);
   return pollProcessExit(pid, remaining - 1);
+}
+
+// A historical PID may already name an unrelated process, so absence is read from /proc alone and
+// never probed with a signal. A collected entry and a zombie awaiting a reaper both count as gone.
+async function pollProcessAbsent(pid: number, remaining: number): Promise<boolean> {
+  const raw = await readFile(`/proc/${pid}/stat`, 'utf8').then(
+    (value) => value,
+    () => undefined,
+  );
+  if (raw === undefined) {
+    return true;
+  }
+  const named = raw.lastIndexOf(') ');
+  if (named >= 0 && raw.slice(named + 2).split(' ')[0] === 'Z') {
+    return true;
+  }
+  if (remaining === 0) {
+    return false;
+  }
+  await delay(10);
+  return pollProcessAbsent(pid, remaining - 1);
 }
 
 function errorCode(value: unknown): unknown {
