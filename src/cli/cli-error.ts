@@ -3,6 +3,18 @@ interface CliFailure {
   readonly message?: string;
 }
 
+/** Commander rejections, the server group usage error, and configuration rejections. */
+const USAGE_CODE = /^(?:commander\.|revo\.configuration\.|revo\.cli\.usage$)/u;
+
+export class CliUsageError extends Error {
+  readonly code = 'revo.cli.usage';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'CliUsageError';
+  }
+}
+
 function property(error: unknown, name: string): unknown {
   if (typeof error !== 'object' || error === null || !(name in error)) {
     return undefined;
@@ -19,7 +31,7 @@ export function cliFailure(error: unknown): CliFailure {
   }
 
   const message = error instanceof Error ? error.message : String(error);
-  if (typeof code === 'string' && code.startsWith('commander.')) {
+  if (typeof code === 'string' && USAGE_CODE.test(code)) {
     return { exitCode: 2, message };
   }
 

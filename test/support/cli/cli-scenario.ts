@@ -29,14 +29,18 @@ const BUILT_CLI = resolve(REPOSITORY_ROOT, 'dist/bin/revo.js');
 export class CliScenario {
   private constructor() {}
 
-  static async run(args: readonly string[]): Promise<CliResult> {
+  static async run(
+    args: readonly string[],
+    env: NodeJS.ProcessEnv = process.env,
+  ): Promise<CliResult> {
     const unrelatedDirectory = await mkdtemp(`${tmpdir()}/revo-cli-`);
     try {
       const result = spawnSync(process.execPath, [BUILT_CLI, ...args], {
         cwd: unrelatedDirectory,
         encoding: 'utf8',
+        env,
         input: '',
-        timeout: 2_000,
+        timeout: 10_000,
       });
 
       if (result.error !== undefined) {
@@ -51,6 +55,23 @@ export class CliScenario {
       };
     } finally {
       await rm(unrelatedDirectory, { recursive: true });
+    }
+  }
+
+  /** Runs the built CLI against a private home so ambient product state is never observed. */
+  static async runIsolated(args: readonly string[]): Promise<CliResult> {
+    const home = await mkdtemp(`${tmpdir()}/revo-home-`);
+    try {
+      return await this.run(args, {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        XDG_CACHE_HOME: `${home}/cache`,
+        XDG_CONFIG_HOME: `${home}/config`,
+        XDG_DATA_HOME: `${home}/data`,
+        XDG_STATE_HOME: `${home}/state`,
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
     }
   }
 
