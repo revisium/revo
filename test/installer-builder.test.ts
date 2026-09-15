@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   INSTALLER_DATA_SLOT,
+  INSTALLER_DATA_DELIMITER,
+  INSTALLER_PAYLOAD_DELIMITER,
   INSTALLER_PAYLOAD_SLOT,
+  INSTALLER_POSIX_SLOT,
   archiveAt,
   bootstrapPolicy,
   embeddedBootstrap,
@@ -45,7 +48,9 @@ describe('programmatic installer builder', () => {
     expect(first).toMatch(/^#!\/bin\/sh\n/u);
     expect(first).not.toContain(INSTALLER_DATA_SLOT);
     expect(first).not.toContain(INSTALLER_PAYLOAD_SLOT);
+    expect(first).not.toContain(INSTALLER_POSIX_SLOT);
     expect(first).not.toMatch(/revo-(?:lab|fixture|test)-/iu);
+    expect(first).not.toMatch(/base64|openssl/iu);
     expect(embeddedPayload(first)).toBe(input.payload);
   });
   it('embeds the validated generic release values and six canonical descriptors', () => {
@@ -197,15 +202,57 @@ describe('programmatic installer builder', () => {
       );
     }
   });
-  it('encodes a hostile payload without interpreting it as shell source', () => {
+  it('requires explicit positive integer execution budgets', () => {
     const input = installerBuilderScenario();
-    const injection = '\'"$()`; touch /tmp/revo-builder-must-not-run #';
+    const fields = [
+      'downloadTimeoutSeconds',
+      'nodeProbeTimeoutSeconds',
+      'payloadTimeoutSeconds',
+      'terminationGraceSeconds',
+    ] as const;
+    for (const field of fields) {
+      const missing = { ...input.bootstrapPolicy } as Record<string, unknown>;
+      delete missing[field];
+      expect(() => build({ ...input, bootstrapPolicy: missing })).toThrow(
+        /policy|duration|timeout|grace/iu,
+      );
+      for (const value of [0, -1, 1.5, '1', Number.POSITIVE_INFINITY]) {
+        expect(() =>
+          build({
+            ...input,
+            bootstrapPolicy: { ...input.bootstrapPolicy, [field]: value },
+          }),
+        ).toThrow(/policy|duration|timeout|grace/iu);
+      }
+    }
+  });
+  it('renders generic execution budgets and safely quoted POSIX descriptors', () => {
+    const input = installerBuilderScenario();
+    const policy = {
+      ...input.bootstrapPolicy,
+      downloadTimeoutSeconds: 41,
+      nodeProbeTimeoutSeconds: 17,
+      payloadTimeoutSeconds: 131,
+      terminationGraceSeconds: 7,
+    };
+    const installer = build({ ...input, bootstrapPolicy: policy });
+    expect(record(embeddedBootstrap(installer)).execution).toEqual({
+      downloadTimeoutSeconds: 41,
+      nodeProbeTimeoutSeconds: 17,
+      payloadTimeoutSeconds: 131,
+      terminationGraceSeconds: 7,
+    });
+    expect(installer).toContain('darwin/arm64/tar.gz');
+    expect(installer).toContain('linux/x64/tar.xz');
+    expect(installer).not.toContain('win32/x64/zip)');
+  });
+  it('preserves hostile payload bytes in the literal block', () => {
+    const input = installerBuilderScenario();
+    const injection = "'\"$()`; $$ $& $` $' touch /tmp/revo-builder-must-not-run #";
     const payload = `${input.payload}\n// ${injection}\n`;
     const installer = build({ ...input, payload });
     expect(embeddedPayload(installer)).toBe(payload);
     expect(record(embeddedBootstrap(installer)).nodeVersion).toBe(input.manifest.toolchain.node);
-    expect(installer).not.toContain(injection);
-    expect(installer).not.toContain('touch /tmp/revo-builder-must-not-run');
   });
   it('rejects missing, duplicated, or unresolved composition slots', () => {
     const input = installerBuilderScenario();
@@ -227,11 +274,32 @@ describe('programmatic installer builder', () => {
         ),
       ],
       ['unresolved slot', `${input.template}\n@@REVO_UNRESOLVED@@\n`],
+      ['missing POSIX table', input.template.replace(INSTALLER_POSIX_SLOT, '')],
+      [
+        'duplicate POSIX table',
+        input.template.replace(
+          INSTALLER_POSIX_SLOT,
+          `${INSTALLER_POSIX_SLOT}\n${INSTALLER_POSIX_SLOT}`,
+        ),
+      ],
     ] as const;
     for (const [, template] of slotCases) {
       expect(() => build({ ...input, template })).toThrow(
         /template|data|payload|unresolved|slot/iu,
       );
     }
+  });
+  it.each([
+    ['template data delimiter', 'template', INSTALLER_DATA_DELIMITER],
+    ['template payload delimiter', 'template', INSTALLER_PAYLOAD_DELIMITER],
+    ['payload delimiter', 'payload', INSTALLER_PAYLOAD_DELIMITER],
+  ] as const)('rejects standalone heredoc collision in %s', (_name, source, delimiter) => {
+    const input = installerBuilderScenario();
+    const collision = `before\n${delimiter}\nafter`;
+    const changed =
+      source === 'template'
+        ? { ...input, template: `${input.template}\n${collision}` }
+        : { ...input, payload: `${input.payload}\n${collision}` };
+    expect(() => build(changed)).toThrow(/delimiter|heredoc|collision|template|payload/iu);
   });
 });
