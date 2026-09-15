@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 
 import { Injectable } from '@nestjs/common';
 
-const OPEN_TIMEOUT_MILLISECONDS = 5_000;
+const OPEN_TIMEOUT_MILLISECONDS = 1_000;
 
 @Injectable()
 export class BrowserOpenerService {
