@@ -7,7 +7,7 @@ import {
   type ServerHostStartMessage,
 } from './server-host-protocol.js';
 
-interface ServerLaunchProcessPort {
+export interface ServerLaunchProcessPort {
   readonly completion: Promise<ProcessCompletion>;
   abandonUncertain(): Promise<void>;
   detachCommitted(): Promise<void>;
