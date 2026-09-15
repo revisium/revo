@@ -9,7 +9,6 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { ControlClientService } from '../../../src/processes/control-client.service.js';
