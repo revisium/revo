@@ -2,8 +2,18 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { open, readFile, lstat, mkdtemp, readdir, rm } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import {
+  open,
+  readFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  realpath,
+  rename,
+  rm,
+} from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const HASH = /^[a-f0-9]{64}$/u;
@@ -28,9 +38,19 @@ const NODE_TARGETS = archiveTargets(true);
 const PNPM_TARGETS = archiveTargets(false);
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const DEFAULT_LIMIT = 512 * 1024 * 1024;
+export const PNPM_PROGRESS_STAGES = Object.freeze([
+  'validate',
+  'download',
+  'verify',
+  'extract',
+  'probe',
+  'publish',
+  'reuse',
+]);
 export const DEFAULT_PNPM_POLICY = Object.freeze({
   downloadTimeoutMs: 60_000,
   extractTimeoutMs: 120_000,
+  probeTimeoutMs: 30_000,
   terminationGraceMs: 5_000,
   redirectLimit: 2,
   maxDownloadBytes: DEFAULT_LIMIT,
@@ -185,6 +205,7 @@ const policyFor = (value = {}) => {
   for (const key of [
     'downloadTimeoutMs',
     'extractTimeoutMs',
+    'probeTimeoutMs',
     'terminationGraceMs',
     'maxOutputBytes',
   ])
@@ -369,7 +390,7 @@ async function downloadPnpm(url, destination, policy, signal, request) {
   }
 }
 
-function runTar(archive, stage, policy, signal) {
+function runProcess(command, args, stage, timeoutMs, policy, signal) {
   return new Promise((done, reject) => {
     if (signal?.aborted) {
       reject(acquisitionFailure('extract', 'cancelled'));
@@ -377,7 +398,7 @@ function runTar(archive, stage, policy, signal) {
     }
     let child;
     try {
-      child = spawn('tar', ['-xzf', archive, '-C', stage], {
+      child = spawn(command, args, {
         shell: false,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -387,7 +408,11 @@ function runTar(archive, stage, policy, signal) {
       reject(acquisitionFailure('extract', 'tar could not start'));
       return;
     }
+    let stdout = '';
     let stderr = '';
+    child.stdout?.on('data', (chunk) => {
+      stdout += boundedText(chunk, policy.maxOutputBytes - stdout.length);
+    });
     child.stderr?.on('data', (chunk) => {
       stderr += boundedText(chunk, policy.maxOutputBytes - stderr.length);
     });
@@ -413,7 +438,7 @@ function runTar(archive, stage, policy, signal) {
       kill('SIGTERM');
       grace = setTimeout(() => kill('SIGKILL'), policy.terminationGraceMs);
     };
-    const timer = setTimeout(() => stop(true), policy.extractTimeoutMs);
+    const timer = setTimeout(() => stop(true), timeoutMs);
     const abort = () => stop(false);
     signal?.addEventListener('abort', abort, { once: true });
     child.once('error', () => {});
@@ -425,10 +450,20 @@ function runTar(archive, stage, policy, signal) {
       else if (timedOut) reject(acquisitionFailure('extract', 'timed out'));
       else if (code !== 0)
         reject(acquisitionFailure('extract', `tar failed${term ? ` (${term})` : ''}: ${stderr}`));
-      else done();
+      else done(stdout);
     });
   });
 }
+
+const runTar = (archive, stage, policy, signal) =>
+  runProcess(
+    'tar',
+    ['-xzf', archive, '-C', stage],
+    'extract',
+    policy.extractTimeoutMs,
+    policy,
+    signal,
+  );
 
 async function safeLayout(root) {
   const walk = async (path) => {
@@ -500,6 +535,189 @@ export async function acquirePnpmArtifact({
   } finally {
     if (!transferred) await rm(stage, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+const absolutePath = (value, name) => {
+  if (typeof value !== 'string' || value.includes('\0') || !isAbsolute(value))
+    throw acquisitionFailure('validate', `${name} must be absolute`);
+  return resolve(value);
+};
+async function privateNode(nodeExecutable, scratch) {
+  const nodePath = absolutePath(nodeExecutable, 'nodeExecutable');
+  const scratchPath = absolutePath(scratch, 'scratch');
+  const [nodeInfo, scratchInfo, nodeReal, scratchReal] = await Promise.all([
+    lstat(nodePath).catch(() => undefined),
+    lstat(scratchPath).catch(() => undefined),
+    realpath(nodePath).catch(() => undefined),
+    realpath(scratchPath).catch(() => undefined),
+  ]);
+  if (
+    nodeInfo === undefined ||
+    !nodeInfo.isFile() ||
+    nodeInfo.isSymbolicLink() ||
+    (nodeInfo.mode & 0o111) === 0 ||
+    scratchInfo === undefined ||
+    !scratchInfo.isDirectory() ||
+    scratchInfo.isSymbolicLink() ||
+    nodeReal === undefined ||
+    scratchReal === undefined ||
+    (nodeReal !== scratchReal &&
+      (relative(scratchReal, nodeReal).startsWith('..') ||
+        isAbsolute(relative(scratchReal, nodeReal))))
+  )
+    throw acquisitionFailure('validate', 'private Node is not a safe executable in scratch');
+  return { nodePath, scratchPath };
+}
+async function targetParents(target, root) {
+  const base = absolutePath(root, 'channelRoot');
+  const baseInfo = await lstat(base).catch(() => undefined);
+  if (baseInfo === undefined || !baseInfo.isDirectory() || baseInfo.isSymbolicLink())
+    throw acquisitionFailure('validate', 'channelRoot is unsafe');
+  const suffix = relative(base, dirname(target));
+  if (suffix.startsWith('..') || isAbsolute(suffix))
+    throw acquisitionFailure('validate', 'target escapes channelRoot');
+  let current = base;
+  for (const part of suffix.split('/').filter(Boolean)) {
+    current = join(current, part);
+    const info = await lstat(current).catch(() => undefined);
+    if (info !== undefined && (!info.isDirectory() || info.isSymbolicLink()))
+      throw acquisitionFailure('validate', 'target ancestor is unsafe');
+    if (info === undefined) await mkdir(current, { mode: 0o700 });
+  }
+}
+const pnpmReceipt = (bootstrap, archive, platform, arch) => ({
+  schemaVersion: 'revo-pnpm-bootstrap/v1',
+  version: bootstrap.pnpmVersion,
+  nodeVersion: bootstrap.nodeVersion,
+  platform,
+  arch,
+  archiveSha256: archive.sha256,
+});
+async function existingTarget(target, expected, policy, signal) {
+  const info = await lstat(target).catch(() => undefined);
+  if (info === undefined) return undefined;
+  if (!info.isDirectory() || info.isSymbolicLink())
+    throw acquisitionFailure('reuse', 'target is unsafe');
+  const executablePath = await safeLayout(target);
+  const receiptPath = join(target, 'install-receipt.json');
+  const receiptInfo = await lstat(receiptPath).catch(() => undefined);
+  if (
+    receiptInfo === undefined ||
+    !receiptInfo.isFile() ||
+    receiptInfo.isSymbolicLink() ||
+    (receiptInfo.mode & 0o777) !== 0o600
+  )
+    throw acquisitionFailure('reuse', 'receipt is unsafe');
+  let found;
+  try {
+    found = JSON.parse(await readFile(receiptPath, 'utf8'));
+  } catch {
+    throw acquisitionFailure('reuse', 'receipt is corrupt');
+  }
+  if (
+    !record(found) ||
+    Object.keys(found).length !== Object.keys(expected).length ||
+    JSON.stringify(found) !== JSON.stringify(expected)
+  )
+    throw acquisitionFailure('reuse', 'receipt is incompatible');
+  const output = await runProcess(
+    executablePath,
+    ['--version'],
+    'probe',
+    policy.probeTimeoutMs,
+    policy,
+    signal,
+  );
+  if (output.trim() !== expected.version)
+    throw acquisitionFailure('probe', 'pnpm version does not match');
+  return executablePath;
+}
+
+/** Publish or reuse one managed pnpm target; the caller owns any channel lock. */
+export async function provisionPnpm({
+  bootstrap,
+  nodeExecutable,
+  channelRoot,
+  scratch,
+  platform,
+  arch,
+  policy: inputPolicy,
+  signal,
+  request,
+  onProgress,
+} = {}) {
+  if (platform === 'win32')
+    throw acquisitionFailure('validate', 'Windows pnpm provisioning is unsupported');
+  if (!TARGETS.some(([itemPlatform, itemArch]) => itemPlatform === platform && itemArch === arch))
+    throw acquisitionFailure('validate', 'unsupported target');
+  if (signal?.aborted) throw acquisitionFailure('validate', 'cancelled');
+  const policy = policyFor(inputPolicy);
+  const { scratchPath } = await privateNode(nodeExecutable, scratch);
+  const raw = record(bootstrap) && record(bootstrap.bootstrap) ? bootstrap.bootstrap : bootstrap;
+  const decoded = decodeBootstrap(raw, { platform, arch, nodeVersion: process.versions.node });
+  if (decoded.pnpmArchive === undefined)
+    throw acquisitionFailure('validate', 'v3 pnpm archive is required');
+  const root = absolutePath(channelRoot, 'channelRoot');
+  const target = join(
+    root,
+    'pnpm',
+    decoded.bootstrap.nodeVersion,
+    `${platform}-${arch}`,
+    decoded.bootstrap.pnpmVersion,
+  );
+  await targetParents(target, root);
+  onProgress?.('validate');
+  const expected = pnpmReceipt(decoded.bootstrap, decoded.pnpmArchive, platform, arch);
+  const reused = await existingTarget(target, expected, policy, signal);
+  if (reused !== undefined) {
+    onProgress?.('probe');
+    onProgress?.('reuse');
+    return { executablePath: reused, version: decoded.bootstrap.pnpmVersion, reused: true };
+  }
+  const acquired = await acquirePnpmArtifact({
+    bootstrap: decoded.bootstrap,
+    platform,
+    arch,
+    scratch: scratchPath,
+    policy,
+    signal,
+    request,
+    onProgress,
+  });
+  const output = await runProcess(
+    join(acquired.directory, 'pnpm'),
+    ['--version'],
+    'probe',
+    policy.probeTimeoutMs,
+    policy,
+    signal,
+  );
+  if (output.trim() !== decoded.bootstrap.pnpmVersion)
+    throw acquisitionFailure('probe', 'pnpm version does not match');
+  onProgress?.('probe');
+  const receiptPath = join(acquired.directory, 'install-receipt.json');
+  const file = await open(receiptPath, 'wx', 0o600);
+  try {
+    await file.writeFile(`${JSON.stringify(expected)}\n`, 'utf8');
+  } finally {
+    await file.close();
+  }
+  const appeared = await lstat(target).catch(() => undefined);
+  if (appeared !== undefined)
+    throw acquisitionFailure('publish', 'target appeared before publication');
+  try {
+    await rename(acquired.directory, target);
+  } catch (error) {
+    if (error?.code === 'EXDEV')
+      throw acquisitionFailure('publish', 'atomic rename crossed filesystems');
+    throw acquisitionFailure('publish', 'atomic rename failed');
+  }
+  onProgress?.('publish');
+  return {
+    executablePath: join(target, 'pnpm'),
+    version: decoded.bootstrap.pnpmVersion,
+    reused: false,
+  };
 }
 
 function targetParts(target) {
