@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   InstallerPosixBootstrapScenario,
+  type ExistingInstallLock,
   type InjectedFailure,
   type PosixTarget,
 } from './support/installation/installer-posix-bootstrap-scenario.js';
@@ -185,6 +186,7 @@ describe('generated POSIX Node publication', () => {
     expect(result.finalLayout).toEqual([]);
     expect(result.receipt).toBeUndefined();
     expect(result.ownedResidue).toEqual([]);
+    expect(await subject.lockSnapshot(linuxTarget)).toEqual([]);
     expect(await subject.processesAbsent([child.pid, watchdog.pid])).toBe(true);
   });
 
@@ -207,6 +209,7 @@ describe('generated POSIX Node publication', () => {
     expect(result.downloadArgv).toEqual([]);
     expect(result.finalLayout).toEqual(['LAYOUT', 'bin', 'install-receipt.json']);
     expect(await subject.finalSnapshot()).toEqual(before);
+    expect(await subject.lockSnapshot(linuxTarget)).toEqual([]);
     expect(await subject.processesAbsent([probe.pid])).toBe(true);
   });
 
@@ -338,6 +341,118 @@ describe('generated POSIX Node publication', () => {
       expect(result.downloadArgv).toEqual([]);
     },
   );
+
+  it('keeps a held fresh install single-owner and leaves the owner lock unchanged', async () => {
+    const subject = await scenario();
+    const owner = await subject.start({ ...linuxTarget, hold: 'payload' });
+    await subject.waitFor('payload-held');
+    const before = await subject.lockSnapshot(linuxTarget);
+    const contender = await subject.startContender(linuxTarget);
+    const result = await contender.finish;
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.downloadArgv).toEqual([]);
+    expect(result.events).toEqual([]);
+    expect(await subject.lockSnapshot(linuxTarget)).toEqual(before);
+
+    await subject.releasePayload();
+    await owner.finish;
+    expect(await subject.lockSnapshot(linuxTarget)).toEqual([]);
+  });
+
+  it('keeps a held reuse probe single-owner without changing the final target', async () => {
+    const subject = await scenario();
+    await subject.seedValidTarget(linuxTarget, 'probe');
+    const before = await subject.finalSnapshot();
+    const owner = await subject.start({ ...linuxTarget, hold: 'probe' });
+    await subject.waitFor('probe-held');
+    const lock = await subject.lockSnapshot(linuxTarget);
+    const contender = await subject.startContender(linuxTarget);
+    const result = await contender.finish;
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.downloadArgv).toEqual([]);
+    expect(result.events).toEqual([]);
+    expect(await subject.finalSnapshot()).toEqual(before);
+    expect(await subject.lockSnapshot(linuxTarget)).toEqual(lock);
+
+    owner.signal('SIGHUP');
+    expect((await owner.finish).exitCode).toBe(129);
+    expect(await subject.lockSnapshot(linuxTarget)).toEqual([]);
+  });
+
+  it.each<ExistingInstallLock>(['empty-dir', 'stale-dir', 'foreign-marker', 'file', 'symlink'])(
+    'fails closed for a preexisting %s install lock',
+    async (kind) => {
+      const subject = await scenario();
+      await subject.seedLock(kind, linuxTarget);
+      const before = await subject.lockSnapshot(linuxTarget);
+      const result = await subject.run(linuxTarget);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.downloadArgv).toEqual([]);
+      expect(result.ownedResidue).toEqual([]);
+      expect(await subject.lockSnapshot(linuxTarget)).toEqual(before);
+    },
+  );
+
+  it.each(['replace', 'delete'] as const)(
+    'preserves a lock marker that changes during cleanup: %s',
+    async (change) => {
+      const subject = await scenario();
+      const owner = await subject.start({ ...linuxTarget, hold: 'payload' });
+      await subject.waitFor('payload-held');
+      if (change === 'replace') {
+        await subject.replaceLockMarker(linuxTarget);
+      } else {
+        await subject.deleteLockMarker(linuxTarget);
+      }
+      const expected = await subject.lockSnapshot(linuxTarget);
+      await subject.releasePayload();
+      expect((await owner.finish).exitCode).not.toBe(0);
+      expect(await subject.lockSnapshot(linuxTarget)).toEqual(expected);
+    },
+  );
+
+  it('releases the lock after a failure and reacquires it for the next invocation', async () => {
+    const subject = await scenario();
+    const failed = await subject.run({ ...linuxTarget, publishedSha256: 'divergent' });
+    expect(failed.exitCode).toBe(1);
+    expect(await subject.lockSnapshot(linuxTarget)).toEqual([]);
+    const retried = await subject.run({ ...linuxTarget, publishedSha256: 'divergent' });
+    expect(retried.exitCode).toBe(1);
+    expect(retried.events.slice(-2)).toEqual(['download', 'sha256']);
+  });
+
+  it('runs a generated installer supplied directly on stdin for fresh and reuse paths', async () => {
+    const fresh = await scenario();
+    const freshResult = await (await fresh.startFromStdin(linuxTarget)).finish;
+    expect(freshResult.events).toContain('probe-stdin-eof');
+    expect(freshResult.events).toContain('payload-stdin-eof');
+    expect(freshResult.exitCode).toBe(0);
+
+    const reused = await scenario();
+    await reused.seedValidTarget(linuxTarget);
+    const reusedResult = await (await reused.startFromStdin(linuxTarget)).finish;
+    expect(reusedResult.exitCode).toBe(0);
+    expect(reusedResult.events).toEqual(['probe-stdin-eof', 'probe']);
+  });
+
+  it('executes exact generated bytes through absolute curl and shell over loopback', async () => {
+    const fresh = await scenario();
+    const freshRun = await fresh.startOverHttp(linuxTarget);
+    const freshResult = await freshRun.finish;
+    expect(freshResult.exitCode).toBe(0);
+    expect(fresh.servedScript()).toBe(await fresh.generatedScript());
+    expect(fresh.servedScriptChunks().length).toBeGreaterThan(1);
+    expect(freshResult.events).toContain('probe-stdin-eof');
+
+    const reused = await scenario();
+    await reused.seedValidTarget(linuxTarget);
+    const reusedResult = await (await reused.startOverHttp(linuxTarget)).finish;
+    expect(reusedResult.exitCode).toBe(0);
+    expect(reused.servedScript()).toBe(await reused.generatedScript());
+    expect(reusedResult.events).toEqual(['probe-stdin-eof', 'probe']);
+  });
 
   describe('hermetic spawned PATH', () => {
     const inheritedPath = process.env.PATH;

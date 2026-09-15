@@ -20,6 +20,10 @@ esac
 revo_target=$revo_platform-$revo_arch
 revo_parent=$revo_root/$revo_version
 revo_final=$revo_parent/$revo_target
+revo_lock=$revo_parent/.$revo_target.install.lock
+revo_lock_marker=
+revo_lock_token=
+revo_lock_acquired=0
 revo_signal_status=
 revo_signal_name=
 revo_signal_escalated=0
@@ -145,15 +149,50 @@ revo_run_bounded() {
 revo_stage=
 revo_probe_temp=
 revo_cleanup() {
-  [ -z "$revo_probe_temp" ] || rm -f "$revo_probe_temp"
-  [ -z "$revo_stage" ] || [ "$revo_cleanup_safe" -eq 1 ] || return 0
-  [ -z "$revo_stage" ] || rm -rf "$revo_stage"
+  revo_cleanup_status=0
+  if [ -n "$revo_probe_temp" ]; then
+    rm -f "$revo_probe_temp" || revo_cleanup_status=1
+  fi
+  if [ -n "$revo_stage" ] && [ "$revo_cleanup_safe" -eq 1 ]; then
+    rm -rf "$revo_stage" || revo_cleanup_status=1
+  fi
+  if [ "$revo_lock_acquired" -eq 1 ] && [ "$revo_cleanup_safe" -eq 1 ]; then
+    if [ ! -d "$revo_lock" ] || [ -L "$revo_lock" ] ||
+      [ ! -f "$revo_lock_marker" ] || [ -L "$revo_lock_marker" ] ||
+      [ "$(cat "$revo_lock_marker" 2>/dev/null)" != "$revo_lock_token" ]; then
+      revo_cleanup_status=1
+    elif ! rm -f "$revo_lock_marker" || [ -e "$revo_lock_marker" ] || [ -L "$revo_lock_marker" ]; then
+      revo_cleanup_status=1
+    elif ! rmdir "$revo_lock"; then
+      revo_cleanup_status=1
+    else
+      revo_lock_acquired=0
+    fi
+  fi
+  if [ -n "$revo_signal_status" ]; then
+    trap - EXIT
+    exit "$revo_signal_status"
+  fi
+  if [ "$revo_cleanup_status" -ne 0 ]; then
+    trap - EXIT
+    exit 1
+  fi
+  return 0
 }
 trap revo_cleanup EXIT
 revo_fail() {
   [ -z "$revo_signal_status" ] || exit "$revo_signal_status"
   exit 1
 }
+
+mkdir -p -m 700 "$revo_parent"
+if ! mkdir -m 700 "$revo_lock"; then
+  exit 1
+fi
+revo_lock_acquired=1
+revo_lock_marker=$(mktemp "$revo_lock/.owner.XXXXXX") || revo_fail
+revo_lock_token=$revo_lock_marker
+printf '%s\n' "$revo_lock_token" >"$revo_lock_marker" || revo_fail
 
 if [ -e "$revo_final" ] || [ -L "$revo_final" ]; then
   [ -d "$revo_final" ] && [ ! -L "$revo_final" ] || exit 1
@@ -166,11 +205,9 @@ if [ -e "$revo_final" ] || [ -L "$revo_final" ]; then
   rm -f "$revo_probe_temp"
   revo_probe_temp=
   [ "$revo_found" = "v$revo_version" ] || exit 1
-  trap - EXIT HUP INT TERM
   exit 0
 fi
 
-mkdir -p -m 700 "$revo_parent"
 revo_stage=$(mktemp -d "$revo_parent/$revo_target.stage.XXXXXX")
 chmod 700 "$revo_stage"
 revo_archive=$revo_stage/node-archive
@@ -221,5 +258,6 @@ REVO_NODE_TARGET=$revo_target REVO_NODE_ARCHIVE_SHA256=$revo_sha256 REVO_RECEIPT
   revo_run_staged_bounded "$revo_payload_timeout" "$revo_node" "$revo_payload_file" "$revo_data_file" || revo_fail
 [ -f "$revo_receipt" ] && [ ! -L "$revo_receipt" ] || exit 1
 rm -f "$revo_archive" "$revo_data_file" "$revo_payload_file" "$revo_probe_file"
+[ ! -e "$revo_final" ] && [ ! -L "$revo_final" ] || revo_fail
 mv "$revo_stage" "$revo_final"
-trap - EXIT HUP INT TERM
+revo_stage=

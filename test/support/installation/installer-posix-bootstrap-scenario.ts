@@ -17,6 +17,7 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,7 +62,7 @@ const OUTSIDE_STATE = [
 ] as const;
 
 // install.sh.in shells out to these by bare name (mkdir, mktemp, cat, ls, cut, awk, rm, mv, sleep,
-// chmod), and the fixture's own downloader wrappers shell out to bare cp; every other external
+// chmod, rmdir), and the fixture's own downloader wrappers shell out to bare cp; every other external
 // command run (uname/curl/wget/sha256sum/tar/node) is one of the fixture's own instrumented
 // wrappers below. gzip and xz are tar transitive compressor helpers. The spawned installer's
 // PATH is tools-only, so each entry here must be resolved from the host and linked in, or the
@@ -81,6 +82,7 @@ const HOST_TOOL_ALLOWLIST = [
   'gzip',
   'xz',
   'setsid',
+  'rmdir',
 ] as const;
 
 interface InstallerBuilder {
@@ -95,6 +97,7 @@ export interface PosixTarget {
   readonly format: Extract<NodeArchiveFormat, 'tar.gz' | 'tar.xz'>;
 }
 type HoldStage = 'download' | 'probe' | 'payload';
+export type ExistingInstallLock = 'empty-dir' | 'stale-dir' | 'foreign-marker' | 'file' | 'symlink';
 
 // Each injected failure lets the installer's real step succeed first and only then reports a
 // nonzero status, so the installer observes a genuine late failure of a completed operation.
@@ -148,6 +151,19 @@ interface RunningInstaller {
   signal(signal?: NodeJS.Signals): void;
 }
 
+interface InvocationPaths {
+  readonly stageGate: string;
+  readonly downloadArgv: string;
+  readonly events: string;
+  readonly payloadArgv: string;
+  readonly probeArgv: string;
+  readonly heldChildPid: string;
+  readonly watchdogPid: string;
+  readonly watchdogBounds: string;
+  readonly stageIdentity: string;
+  readonly watchdogIdentity: string;
+}
+
 interface OwnedChild {
   completion: Promise<void>;
   readonly processGroupId: number | undefined;
@@ -160,6 +176,7 @@ export class InstallerPosixBootstrapScenario {
   private invocation = '';
   private invocationNumber = 0;
   private stageGate = '';
+  private servedChunks: Buffer[] = [];
 
   private constructor(private readonly root: string) {}
 
@@ -174,37 +191,111 @@ export class InstallerPosixBootstrapScenario {
   async start(options: RunOptions): Promise<RunningInstaller> {
     this.beginInvocation();
     await this.prepare(options);
+    const paths = this.invocationPaths();
     const child = spawn('/bin/sh', [this.path('install.sh')], {
       cwd: this.root,
-      env: {
-        PATH: this.path('tools'),
-        TMPDIR: this.path(OUTSIDE_STATE[0].directory),
-        REVO_INSTALL_ROOT: this.path('state'),
-        REVO_PAYLOAD_GATE: this.path('payload-gate'),
-        REVO_TEST_ARCHIVE: this.path('archive'),
-        REVO_TEST_ARGV: this.path('download.argv'),
-        REVO_TEST_EVENTS: this.path('events'),
-        REVO_TEST_NODE_PAYLOAD_ARGV: this.path('payload.argv'),
-        REVO_TEST_NODE_PROBE_ARGV: this.path('probe.argv'),
-        REVO_TEST_HELD_CHILD_PID: this.path('held-child.pid'),
-        REVO_TEST_WATCHDOG_PID: this.path('watchdog.pid'),
-        REVO_TEST_WATCHDOG_BOUNDS: this.path('watchdog.bounds'),
-        REVO_TEST_INVOCATION: this.invocation,
-        REVO_TEST_STAGE_GATE: this.stageGate,
-        REVO_TEST_STAGE_IDENTITY: this.path('stage.identity'),
-        REVO_TEST_WATCHDOG_IDENTITY: this.path('watchdog.identity'),
-        REVO_TEST_WATCHDOG_ACTIVE: options.hold === undefined ? '' : '1',
-        REVO_TEST_WATCHDOG_LIMIT: watchdogLimit(options),
-      },
+      env: this.environment(options, paths, this.invocation),
       detached: true,
       stdio: 'ignore',
     });
     const owned = trackOwnedChild(child);
     this.children.set(child, owned);
     return {
-      finish: this.observe(child, options, owned.completion),
+      finish: this.observe(child, options, owned.completion, paths),
       signal: (signal = 'SIGTERM') => child.kill(signal),
     };
+  }
+
+  async startContender(options: RunOptions): Promise<RunningInstaller> {
+    const invocation = `${process.pid}-${Date.now()}-${++this.invocationNumber}`;
+    const scope = `contender-${this.invocationNumber}`;
+    await mkdir(this.path(scope), { recursive: true });
+    const paths = this.invocationPaths(scope);
+    const child = spawn('/bin/sh', [this.path('install.sh')], {
+      cwd: this.root,
+      env: this.environment(options, paths, invocation),
+      detached: true,
+      stdio: 'ignore',
+    });
+    const owned = trackOwnedChild(child);
+    this.children.set(child, owned);
+    return {
+      finish: this.observe(child, options, owned.completion, paths),
+      signal: (signal = 'SIGTERM') => child.kill(signal),
+    };
+  }
+
+  async startFromStdin(options: RunOptions): Promise<RunningInstaller> {
+    this.beginInvocation();
+    await this.prepare(options);
+    const paths = this.invocationPaths();
+    const child = spawn('/bin/sh', [], {
+      cwd: this.root,
+      env: this.environment(options, paths, this.invocation),
+      detached: true,
+      stdio: ['pipe', 'ignore', 'ignore'],
+    });
+    child.stdin?.end(await readFile(this.path('install.sh')));
+    const owned = trackOwnedChild(child);
+    this.children.set(child, owned);
+    return {
+      finish: this.observe(child, options, owned.completion, paths),
+      signal: (signal = 'SIGTERM') => child.kill(signal),
+    };
+  }
+
+  async startOverHttp(options: RunOptions): Promise<RunningInstaller> {
+    this.beginInvocation();
+    await this.prepare(options);
+    const script = await readFile(this.path('install.sh'));
+    this.servedChunks = chunkScript(script);
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      for (const chunk of this.servedChunks) {
+        response.write(chunk);
+      }
+      response.end();
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    if (address === null || typeof address === 'string') {
+      throw new Error('fixture server missing port');
+    }
+    const paths = this.invocationPaths();
+    const url = `http://127.0.0.1:${address.port}/install.sh`;
+    const child = spawn(
+      '/bin/sh',
+      ['-c', `/usr/bin/curl --fail --silent --show-error '${url}' | /bin/sh`],
+      {
+        cwd: this.root,
+        env: { ...this.environment(options, paths, this.invocation), NO_PROXY: '127.0.0.1' },
+        detached: true,
+        stdio: 'ignore',
+      },
+    );
+    const owned = trackOwnedChild(child);
+    this.children.set(child, owned);
+    const finish = (async () => {
+      const result = await this.observe(child, options, owned.completion, paths);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      return result;
+    })();
+    return { finish, signal: (signal = 'SIGTERM') => child.kill(signal) };
+  }
+
+  servedScript(): string {
+    return Buffer.concat(this.servedChunks).toString('utf8');
+  }
+
+  async generatedScript(): Promise<string> {
+    return readFile(this.path('install.sh'), 'utf8');
+  }
+
+  servedScriptChunks(): readonly string[] {
+    return this.servedChunks.map((chunk) => chunk.toString('utf8'));
   }
 
   invocationId(): string {
@@ -313,7 +404,13 @@ export class InstallerPosixBootstrapScenario {
   async stateOutsideStage(): Promise<readonly string[]> {
     return (await snapshot(this.path('state')))
       .map((entry) => entry.path)
-      .filter((path) => path !== '.' && path !== '26.8.2' && !path.includes('.stage.'));
+      .filter(
+        (path) =>
+          path !== '.' &&
+          path !== '26.8.2' &&
+          !path.includes('.stage.') &&
+          !path.includes('.install.lock'),
+      );
   }
 
   async outsideSnapshot(): Promise<readonly SnapshotEntry[]> {
@@ -351,6 +448,51 @@ export class InstallerPosixBootstrapScenario {
     await writeFile(this.path('outside', 'preserved'), 'outside');
     await mkdir(dirname(this.finalPath(target)), { recursive: true });
     await symlink(this.path('outside'), this.finalPath(target));
+  }
+
+  async seedLock(kind: ExistingInstallLock, target: PosixTarget): Promise<void> {
+    this.beginInvocation();
+    await this.prepare({ ...target, payload: 'ready' });
+    const lock = this.lockPath(target);
+    await mkdir(dirname(lock), { recursive: true });
+    if (kind === 'file') {
+      await writeFile(lock, 'foreign lock');
+    } else if (kind === 'symlink') {
+      await mkdir(this.path('foreign-lock'), { recursive: true });
+      await writeFile(this.path('foreign-lock', 'preserved'), 'foreign');
+      await symlink(this.path('foreign-lock'), lock);
+    } else {
+      await mkdir(lock);
+      if (kind === 'stale-dir') {
+        await writeFile(join(lock, '.owner.stale'), 'stale');
+      }
+      if (kind === 'foreign-marker') {
+        await writeFile(join(lock, '.owner.foreign'), 'foreign');
+      }
+    }
+  }
+
+  async lockSnapshot(target: PosixTarget): Promise<readonly SnapshotEntry[]> {
+    return snapshot(this.lockPath(target));
+  }
+
+  async replaceLockMarker(target: PosixTarget): Promise<void> {
+    const lock = this.lockPath(target);
+    const marker = (await readdir(lock)).find((name) => name.startsWith('.owner.'));
+    if (marker === undefined) {
+      throw new Error('fixture lock marker missing');
+    }
+    await rm(join(lock, marker));
+    await writeFile(join(lock, marker), 'foreign replacement');
+  }
+
+  async deleteLockMarker(target: PosixTarget): Promise<void> {
+    const lock = this.lockPath(target);
+    const marker = (await readdir(lock)).find((name) => name.startsWith('.owner.'));
+    if (marker === undefined) {
+      throw new Error('fixture lock marker missing');
+    }
+    await rm(join(lock, marker));
   }
 
   async existingSnapshot(): Promise<readonly SnapshotEntry[]> {
@@ -391,6 +533,50 @@ export class InstallerPosixBootstrapScenario {
   private beginInvocation(): void {
     this.invocation = `${process.pid}-${Date.now()}-${++this.invocationNumber}`;
     this.stageGate = this.path(`stage-gate-${this.invocation}`);
+  }
+
+  private invocationPaths(scope = ''): InvocationPaths {
+    const path = (name: string): string =>
+      scope === '' ? this.path(name) : this.path(scope, name);
+    return {
+      stageGate: path(`stage-gate-${this.invocation}`),
+      downloadArgv: path('download.argv'),
+      events: path('events'),
+      payloadArgv: path('payload.argv'),
+      probeArgv: path('probe.argv'),
+      heldChildPid: path('held-child.pid'),
+      watchdogPid: path('watchdog.pid'),
+      watchdogBounds: path('watchdog.bounds'),
+      stageIdentity: path('stage.identity'),
+      watchdogIdentity: path('watchdog.identity'),
+    };
+  }
+
+  private environment(
+    options: RunOptions,
+    paths: InvocationPaths,
+    invocation: string,
+  ): NodeJS.ProcessEnv {
+    return {
+      PATH: this.path('tools'),
+      TMPDIR: this.path(OUTSIDE_STATE[0].directory),
+      REVO_INSTALL_ROOT: this.path('state'),
+      REVO_PAYLOAD_GATE: this.path('payload-gate'),
+      REVO_TEST_ARCHIVE: this.path('archive'),
+      REVO_TEST_ARGV: paths.downloadArgv,
+      REVO_TEST_EVENTS: paths.events,
+      REVO_TEST_NODE_PAYLOAD_ARGV: paths.payloadArgv,
+      REVO_TEST_NODE_PROBE_ARGV: paths.probeArgv,
+      REVO_TEST_HELD_CHILD_PID: paths.heldChildPid,
+      REVO_TEST_WATCHDOG_PID: paths.watchdogPid,
+      REVO_TEST_WATCHDOG_BOUNDS: paths.watchdogBounds,
+      REVO_TEST_INVOCATION: invocation,
+      REVO_TEST_STAGE_GATE: paths.stageGate,
+      REVO_TEST_STAGE_IDENTITY: paths.stageIdentity,
+      REVO_TEST_WATCHDOG_IDENTITY: paths.watchdogIdentity,
+      REVO_TEST_WATCHDOG_ACTIVE: options.hold === undefined ? '' : '1',
+      REVO_TEST_WATCHDOG_LIMIT: watchdogLimit(options),
+    };
   }
 
   private async prepare(options: RunOptions): Promise<void> {
@@ -600,10 +786,15 @@ ${
     return this.path('state', '26.8.2', `${target.platform}-${target.arch}`);
   }
 
+  private lockPath(target: PosixTarget): string {
+    return join(dirname(this.finalPath(target)), `.${target.platform}-${target.arch}.install.lock`);
+  }
+
   private async observe(
     child: ChildProcess,
     target: PosixTarget,
     completion: Promise<void>,
+    paths: InvocationPaths = this.invocationPaths(),
   ): Promise<Observation> {
     await completion;
     const exitCode = child.exitCode;
@@ -611,13 +802,13 @@ ${
     const final = this.finalPath(target);
     const receiptPath = join(final, 'install-receipt.json');
     const receiptInfo = await lstat(receiptPath).catch(() => undefined);
-    const payloadArgv = await nulArguments(this.path('payload.argv'));
+    const payloadArgv = await nulArguments(paths.payloadArgv);
     return {
       exitCode,
       signalCode,
-      downloadArgv: await nulArguments(this.path('download.argv')),
-      events: await this.events(),
-      probeArgv: await nulArguments(this.path('probe.argv')),
+      downloadArgv: await nulArguments(paths.downloadArgv),
+      events: await this.eventsAt(paths.events),
+      probeArgv: await nulArguments(paths.probeArgv),
       payloadArgv,
       dataPath: payloadArgv[2] ?? '',
       payloadPath: payloadArgv[1] ?? '',
@@ -631,7 +822,7 @@ ${
         () => true,
         () => false,
       ),
-      watchdogTermGrace: await readFile(this.path('watchdog.bounds'), 'utf8').then(
+      watchdogTermGrace: await readFile(paths.watchdogBounds, 'utf8').then(
         (value) => value.length >= 2,
         () => false,
       ),
@@ -643,7 +834,11 @@ ${
   }
 
   private async events(): Promise<readonly string[]> {
-    return readFile(this.path('events'), 'utf8').then(
+    return this.eventsAt(this.path('events'));
+  }
+
+  private async eventsAt(path: string): Promise<readonly string[]> {
+    return readFile(path, 'utf8').then(
       (value) => value.trim().split('\n').filter(Boolean),
       () => [],
     );
@@ -773,6 +968,14 @@ async function resolveHostTool(name: string): Promise<string> {
 async function executable(path: string, body: string): Promise<void> {
   await writeFile(path, body, { mode: 0o700 });
   await chmod(path, 0o700);
+}
+
+function chunkScript(script: Buffer): Buffer[] {
+  const chunks: Buffer[] = [];
+  for (let offset = 0; offset < script.length; offset += 113) {
+    chunks.push(script.subarray(offset, Math.min(offset + 113, script.length)));
+  }
+  return chunks;
 }
 
 async function createTar(
