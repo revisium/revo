@@ -787,6 +787,7 @@ export async function runInstallMode({
   signal,
   request,
   onProgress,
+  packageInstaller,
 } = {}) {
   if (
     [dataPath, receiptPath, target, archiveSha256, channelRoot, privateNodeRoot, scratch].some(
@@ -815,6 +816,16 @@ export async function runInstallMode({
     request,
     onProgress,
   });
+  if (packageInstaller !== undefined) {
+    await packageInstaller({
+      nodeExecutable,
+      pnpmExecutable: result.executablePath,
+      channelRoot,
+      scratch,
+      ...(signal === undefined ? {} : { signal }),
+      ...(onProgress === undefined ? {} : { progress: onProgress }),
+    });
+  }
   const receipt = `${JSON.stringify({ version: decoded.bootstrap.nodeVersion, target, archiveSha256 })}\n`;
   const receiptInfo = await lstat(receiptPath).catch(() => undefined);
   if (receiptInfo === undefined) {

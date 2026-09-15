@@ -128,7 +128,7 @@ function validateTemplate(template, payload) {
   }
 }
 
-function posixTable(bootstrap) {
+function posixTable(bootstrap, packageEnabled = false) {
   return bootstrap.archives
     .filter((archive) => POSIX_TARGETS.has(targetIdentity(archive)))
     .map((archive) => {
@@ -141,7 +141,7 @@ function posixTable(bootstrap) {
         target,
         archiveSha256: archive.sha256,
       });
-      return `${archive.platform}/${archive.arch}/${archive.format}) revo_platform=${shellQuote(archive.platform)}; revo_arch=${shellQuote(archive.arch)}; revo_format=${shellQuote(archive.format)}; revo_url=${shellQuote(archive.url)}; revo_sha256=${shellQuote(archive.sha256)}; revo_version=${shellQuote(bootstrap.nodeVersion)}; revo_expected_receipt=${shellQuote(receipt)}; revo_download_timeout=${shellQuote(bootstrap.execution.downloadTimeoutSeconds)}; revo_probe_timeout=${shellQuote(bootstrap.execution.nodeProbeTimeoutSeconds)}; revo_payload_timeout=${shellQuote(bootstrap.execution.payloadTimeoutSeconds)}; revo_grace=${shellQuote(bootstrap.execution.terminationGraceSeconds)};${pnpm === undefined ? '' : ` revo_channel=${shellQuote(bootstrap.channel)}; revo_pnpm_version=${shellQuote(bootstrap.pnpmVersion)}; revo_pnpm_url=${shellQuote(pnpm.url)}; revo_pnpm_sha256=${shellQuote(pnpm.sha256)};`} ;;`;
+      return `${archive.platform}/${archive.arch}/${archive.format}) revo_platform=${shellQuote(archive.platform)}; revo_arch=${shellQuote(archive.arch)}; revo_format=${shellQuote(archive.format)}; revo_url=${shellQuote(archive.url)}; revo_sha256=${shellQuote(archive.sha256)}; revo_version=${shellQuote(bootstrap.nodeVersion)}; revo_expected_receipt=${shellQuote(receipt)}; revo_download_timeout=${shellQuote(bootstrap.execution.downloadTimeoutSeconds)}; revo_probe_timeout=${shellQuote(bootstrap.execution.nodeProbeTimeoutSeconds)}; revo_payload_timeout=${shellQuote(bootstrap.execution.payloadTimeoutSeconds)}; revo_grace=${shellQuote(bootstrap.execution.terminationGraceSeconds)};${pnpm === undefined ? '' : ` revo_channel=${shellQuote(bootstrap.channel)}; revo_pnpm_version=${shellQuote(bootstrap.pnpmVersion)}; revo_pnpm_url=${shellQuote(pnpm.url)}; revo_pnpm_sha256=${shellQuote(pnpm.sha256)}; revo_package_enabled=${packageEnabled ? 1 : 0};`} ;;`;
     })
     .join('\n');
 }
@@ -159,7 +159,7 @@ function packagePlan(manifest) {
 
 function packagePayload(payload, manifest) {
   const envelope = JSON.stringify(packagePlan(manifest));
-  return `${payload}\nconst REVO_PACKAGE_INSTALL_PLAN = ${envelope};\n`;
+  return `const REVO_PACKAGE_INSTALL_PLAN = ${envelope};\n${payload}`;
 }
 
 export function buildInstaller(value) {
@@ -200,7 +200,7 @@ export function buildInstaller(value) {
       })),
     };
     return input.template
-      .replace(POSIX_SLOT, () => posixTable(v3Bootstrap))
+      .replace(POSIX_SLOT, () => posixTable(v3Bootstrap, /packageInstaller/u.test(input.payload)))
       .replace(DATA_SLOT, () => JSON.stringify(v3Bootstrap))
       .replace(PAYLOAD_SLOT, () => packagePayload(input.payload, manifest));
   }

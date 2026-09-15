@@ -17,7 +17,7 @@ export async function buildPayload({ entry = resolve(ROOT, 'bootstrap-entry.mjs'
   const output = bundle.output?.[0];
   if (output?.type !== 'chunk' || typeof output.code !== 'string')
     throw new Error('Payload bundler did not produce one ESM chunk.');
-  return output.code;
+  return output.code.replaceAll(/^\/\/#(?:region|endregion).*$/gmu, '');
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
