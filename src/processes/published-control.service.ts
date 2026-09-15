@@ -55,11 +55,7 @@ export class PublishedControlService {
       return lease;
     }
     const canonicalDataDir = dirname(lease.lockPath);
-    const lifecycle = await openServerLifecycleStore({
-      logDir: request.logDir,
-      canonicalDataDir,
-      channel: request.channel === 'alpha' ? 'alpha' : 'stable',
-    });
+    const lifecycle = await openLifecycle(request, canonicalDataDir);
     emitLifecycle(lifecycle, 'SERVER_STARTING');
     const instanceId = randomBytes(16).toString('hex');
     const token = randomBytes(32).toString('hex');
@@ -294,6 +290,17 @@ async function publishRecord(temporaryPath: string, locatorPath: string, record:
 
 const errorCode = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
+
+async function openLifecycle(
+  request: OpenPublishedControlRequest,
+  canonicalDataDir: string,
+): Promise<ServerLifecycleSink | undefined> {
+  return openServerLifecycleStore({
+    logDir: request.logDir,
+    canonicalDataDir,
+    channel: request.channel === 'alpha' ? 'alpha' : 'stable',
+  });
+}
 
 class LifecycleStop {
   private started = false;
