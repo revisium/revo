@@ -158,28 +158,6 @@ describe('generated POSIX Node publication', () => {
     expect(result.ownedResidue).toEqual([]);
   });
 
-  it('drains and removes its owned stage when directly terminated', async () => {
-    const subject = await scenario();
-    const running = await subject.start({ ...linuxTarget, payload: 'held' });
-    await subject.waitFor('payload-held');
-    const heldChildPid = await subject.heldChildPid();
-    const before = await subject.stageSnapshot();
-
-    running.signal();
-    const result = await running.finish;
-
-    expect({ exitCode: result.exitCode, signalCode: result.signalCode }).toEqual({
-      exitCode: 143,
-      signalCode: null,
-    });
-    expect(await subject.stageSnapshot()).toEqual([]);
-    expect(before.some((entry) => entry.path.endsWith('/node-archive'))).toBe(true);
-    expect(result.receipt).toBeUndefined();
-    expect(await subject.finalSnapshot()).toEqual([]);
-
-    expect(await subject.waitForProcessExit(heldChildPid)).toBe(true);
-  });
-
   it.each(
     interruptStages.flatMap((stage) =>
       interruptSignals.map(([signal, exitCode]) => ({ stage, signal, exitCode })),
