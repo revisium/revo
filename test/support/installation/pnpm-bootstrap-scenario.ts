@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,5 +45,24 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
         .then((info) => info.mode & 0o777)
         .catch(() => undefined),
     runDirect,
+    archive: async () => {
+      const source = await mkdtemp(join(root, 'payload-'));
+      await mkdir(join(source, 'dist'));
+      await writeFile(join(source, 'pnpm'), '#!/bin/sh\n');
+      await chmod(join(source, 'pnpm'), 0o755);
+      await writeFile(join(source, 'dist', 'index.js'), 'export {}\n');
+      const archivePath = join(root, 'pnpm.tar.gz');
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn('tar', ['-czf', archivePath, '-C', source, '.'], {
+          shell: false,
+          stdio: 'ignore',
+        });
+        child.once('error', reject);
+        child.once('close', (code) => (code === 0 ? resolve() : reject(new Error(`tar ${code}`))));
+      });
+      const bytes = await readFile(archivePath);
+      await rm(source, { recursive: true, force: true });
+      return { bytes, sha256: createHash('sha256').update(bytes).digest('hex') };
+    },
   };
 }

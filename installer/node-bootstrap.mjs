@@ -1,7 +1,9 @@
-// oxlint-disable curly -- self-contained installer payload keeps guarded operations compact
+// oxlint-disable curly, no-await-in-loop -- self-contained installer payload keeps guarded operations compact
 
-import { open, readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { open, readFile, lstat, mkdtemp, readdir, rm } from 'node:fs/promises';
+import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const HASH = /^[a-f0-9]{64}$/u;
@@ -24,6 +26,16 @@ const archiveTargets = (node) =>
   ]);
 const NODE_TARGETS = archiveTargets(true);
 const PNPM_TARGETS = archiveTargets(false);
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+const DEFAULT_LIMIT = 512 * 1024 * 1024;
+export const DEFAULT_PNPM_POLICY = Object.freeze({
+  downloadTimeoutMs: 60_000,
+  extractTimeoutMs: 120_000,
+  terminationGraceMs: 5_000,
+  redirectLimit: 2,
+  maxDownloadBytes: DEFAULT_LIMIT,
+  maxOutputBytes: 4_096,
+});
 const ARCHIVE_KEYS = ['arch', 'format', 'platform', 'sha256', 'url'];
 const EXECUTION_KEYS = [
   'downloadTimeoutSeconds',
@@ -164,6 +176,330 @@ export function decodeBootstrap(value, options) {
   )
     fail('selected pnpm target');
   return { bootstrap: value, nodeArchive, pnpmArchive };
+}
+
+const acquisitionFailure = (stage, reason) => new Error(`pnpm ${stage}: ${reason}`);
+const policyFor = (value = {}) => {
+  if (!record(value)) throw acquisitionFailure('validate', 'policy must be an object');
+  const policy = { ...DEFAULT_PNPM_POLICY, ...value };
+  for (const key of [
+    'downloadTimeoutMs',
+    'extractTimeoutMs',
+    'terminationGraceMs',
+    'maxOutputBytes',
+  ])
+    if (!positive(policy[key]) || policy[key] > 600_000)
+      throw acquisitionFailure('validate', `policy.${key} is unbounded`);
+  if (!positive(policy.maxDownloadBytes) || policy.maxDownloadBytes > DEFAULT_LIMIT)
+    throw acquisitionFailure('validate', 'policy.maxDownloadBytes is unbounded');
+  if (
+    !Number.isSafeInteger(policy.redirectLimit) ||
+    policy.redirectLimit < 0 ||
+    policy.redirectLimit > 5
+  )
+    throw acquisitionFailure('validate', 'policy.redirectLimit is unbounded');
+  return policy;
+};
+const boundedText = (value, limit) =>
+  String(value ?? '')
+    .replace(/\p{Cc}/gu, ' ')
+    .slice(0, limit);
+const header = (response, name) => response.headers?.get?.(name) ?? response.headers?.[name];
+const dispose = async (response) => {
+  try {
+    await response?.body?.cancel?.();
+  } catch {
+    /* body disposal is best effort */
+  }
+};
+
+async function downloadPnpm(url, destination, policy, signal, request) {
+  let initial;
+  try {
+    initial = new URL(url);
+  } catch {
+    throw acquisitionFailure('download', 'archive URL is invalid');
+  }
+  if (
+    initial.protocol !== 'https:' ||
+    initial.hostname !== 'github.com' ||
+    initial.username ||
+    initial.password ||
+    initial.hash ||
+    initial.search
+  )
+    throw acquisitionFailure('download', 'archive URL is not canonical GitHub');
+  const fetcher = request ?? globalThis.fetch;
+  if (typeof fetcher !== 'function') throw acquisitionFailure('download', 'request is unavailable');
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => controller.abort(), policy.downloadTimeoutMs);
+  let current = initial.href;
+  let redirects = 0;
+  try {
+    let response;
+    for (;;) {
+      if (controller.signal.aborted)
+        throw acquisitionFailure('download', signal?.aborted ? 'cancelled' : 'timed out');
+      try {
+        const pending = Promise.resolve().then(() =>
+          fetcher(current, { redirect: 'manual', signal: controller.signal }),
+        );
+        response = await new Promise((resolveResponse, rejectResponse) => {
+          const cancel = () => rejectResponse(acquisitionFailure('download', 'request aborted'));
+          controller.signal.addEventListener('abort', cancel, { once: true });
+          pending.then(
+            (value) => {
+              controller.signal.removeEventListener('abort', cancel);
+              resolveResponse(value);
+            },
+            (error) => {
+              controller.signal.removeEventListener('abort', cancel);
+              rejectResponse(error);
+            },
+          );
+        });
+      } catch {
+        throw acquisitionFailure(
+          'download',
+          controller.signal.aborted
+            ? signal?.aborted
+              ? 'cancelled'
+              : 'timed out'
+            : 'request failed',
+        );
+      }
+      if (response === undefined || typeof response.status !== 'number') {
+        throw acquisitionFailure('download', 'request returned no response');
+      }
+      if (!REDIRECTS.has(response.status)) break;
+      if (redirects++ >= policy.redirectLimit) {
+        await dispose(response);
+        throw acquisitionFailure('download', 'redirect limit exceeded');
+      }
+      const location = header(response, 'location');
+      if (typeof location !== 'string' || location === '') {
+        await dispose(response);
+        throw acquisitionFailure('download', 'redirect location is missing');
+      }
+      let next;
+      try {
+        next = new URL(location, current);
+      } catch {
+        await dispose(response);
+        throw acquisitionFailure('download', 'redirect target is invalid');
+      }
+      const from = new URL(current);
+      if (
+        next.protocol !== 'https:' ||
+        next.hostname !== 'release-assets.githubusercontent.com' ||
+        next.username ||
+        next.password ||
+        next.hash ||
+        !next.search ||
+        (from.href !== initial.href && from.hostname !== next.hostname)
+      ) {
+        await dispose(response);
+        throw acquisitionFailure('download', 'redirect target is not allowed');
+      }
+      await dispose(response);
+      current = next.href;
+    }
+    if (response.status !== 200) {
+      await dispose(response);
+      throw acquisitionFailure('download', `HTTP ${String(response.status)}`);
+    }
+    const rawLength = header(response, 'content-length');
+    const length =
+      rawLength === undefined || rawLength === null || rawLength === ''
+        ? undefined
+        : Number(rawLength);
+    if (
+      length !== undefined &&
+      (!Number.isSafeInteger(length) || length < 0 || length > policy.maxDownloadBytes)
+    ) {
+      await dispose(response);
+      throw acquisitionFailure('download', 'archive exceeds size bound');
+    }
+    const chunks = [];
+    let bytes = 0;
+    try {
+      if (response.body?.[Symbol.asyncIterator] !== undefined) {
+        for await (const chunk of response.body) {
+          if (controller.signal.aborted)
+            throw acquisitionFailure('download', signal?.aborted ? 'cancelled' : 'timed out');
+          const data = Buffer.from(chunk);
+          bytes += data.length;
+          if (bytes > policy.maxDownloadBytes)
+            throw acquisitionFailure('download', 'archive exceeds size bound');
+          chunks.push(data);
+        }
+      } else if (typeof response.arrayBuffer === 'function') {
+        const data = Buffer.from(await response.arrayBuffer());
+        bytes = data.length;
+        if (bytes > policy.maxDownloadBytes)
+          throw acquisitionFailure('download', 'archive exceeds size bound');
+        chunks.push(data);
+      } else throw acquisitionFailure('download', 'response body is missing');
+    } catch (error) {
+      await dispose(response);
+      if (error instanceof Error && error.message.startsWith('pnpm ')) throw error;
+      throw acquisitionFailure(
+        'download',
+        controller.signal.aborted ? (signal?.aborted ? 'cancelled' : 'timed out') : 'body failed',
+      );
+    }
+    if (controller.signal.aborted)
+      throw acquisitionFailure('download', signal?.aborted ? 'cancelled' : 'timed out');
+    if (length !== undefined && bytes !== length)
+      throw acquisitionFailure('download', 'response was truncated');
+    const data = Buffer.concat(chunks);
+    const archiveSha256 = createHash('sha256').update(data).digest('hex');
+    const file = await open(destination, 'wx', 0o600);
+    try {
+      await file.writeFile(data);
+    } finally {
+      await file.close();
+    }
+    return archiveSha256;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+function runTar(archive, stage, policy, signal) {
+  return new Promise((done, reject) => {
+    if (signal?.aborted) {
+      reject(acquisitionFailure('extract', 'cancelled'));
+      return;
+    }
+    let child;
+    try {
+      child = spawn('tar', ['-xzf', archive, '-C', stage], {
+        shell: false,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch {
+      reject(acquisitionFailure('extract', 'tar could not start'));
+      return;
+    }
+    let stderr = '';
+    child.stderr?.on('data', (chunk) => {
+      stderr += boundedText(chunk, policy.maxOutputBytes - stderr.length);
+    });
+    let stopping = false;
+    let timedOut = false;
+    let grace;
+    const kill = (name) => {
+      try {
+        if (child.pid === undefined) child.kill(name);
+        else process.kill(-child.pid, name);
+      } catch {
+        try {
+          child.kill(name);
+        } catch {
+          /* exited */
+        }
+      }
+    };
+    const stop = (timeout) => {
+      if (stopping) return;
+      stopping = true;
+      timedOut = timeout;
+      kill('SIGTERM');
+      grace = setTimeout(() => kill('SIGKILL'), policy.terminationGraceMs);
+    };
+    const timer = setTimeout(() => stop(true), policy.extractTimeoutMs);
+    const abort = () => stop(false);
+    signal?.addEventListener('abort', abort, { once: true });
+    child.once('error', () => {});
+    child.once('close', (code, term) => {
+      clearTimeout(timer);
+      clearTimeout(grace);
+      signal?.removeEventListener('abort', abort);
+      if (signal?.aborted) reject(acquisitionFailure('extract', 'cancelled'));
+      else if (timedOut) reject(acquisitionFailure('extract', 'timed out'));
+      else if (code !== 0)
+        reject(acquisitionFailure('extract', `tar failed${term ? ` (${term})` : ''}: ${stderr}`));
+      else done();
+    });
+  });
+}
+
+async function safeLayout(root) {
+  const walk = async (path) => {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) throw acquisitionFailure('extract', 'archive contains a symlink');
+    if (info.isDirectory()) for (const child of await readdir(path)) await walk(join(path, child));
+  };
+  await walk(root);
+  const executable = join(root, 'pnpm');
+  const pnpm = await lstat(executable).catch(() => undefined);
+  const dist = await lstat(join(root, 'dist')).catch(() => undefined);
+  if (
+    pnpm === undefined ||
+    !pnpm.isFile() ||
+    (pnpm.mode & 0o111) === 0 ||
+    dist === undefined ||
+    !dist.isDirectory()
+  )
+    throw acquisitionFailure('extract', 'archive has no safe pnpm+dist layout');
+  return executable;
+}
+
+/** Acquire the verified v3 pnpm archive into an owned temporary directory. */
+export async function acquirePnpmArtifact({
+  bootstrap,
+  platform,
+  arch,
+  scratch,
+  policy: inputPolicy,
+  signal,
+  request,
+  onProgress,
+} = {}) {
+  if (platform === 'win32')
+    throw acquisitionFailure('validate', 'Windows pnpm acquisition is unsupported');
+  if (!TARGETS.some(([itemPlatform, itemArch]) => itemPlatform === platform && itemArch === arch))
+    throw acquisitionFailure('validate', 'unsupported target');
+  if (signal?.aborted) throw acquisitionFailure('validate', 'cancelled');
+  const policy = policyFor(inputPolicy);
+  if (typeof scratch !== 'string' || scratch.includes('\0') || !isAbsolute(scratch))
+    throw acquisitionFailure('validate', 'scratch must be absolute');
+  const scratchInfo = await lstat(scratch).catch(() => undefined);
+  if (scratchInfo === undefined || !scratchInfo.isDirectory() || scratchInfo.isSymbolicLink())
+    throw acquisitionFailure('validate', 'scratch must be an owned directory');
+  const raw = record(bootstrap) && record(bootstrap.bootstrap) ? bootstrap.bootstrap : bootstrap;
+  const decoded = decodeBootstrap(raw, { platform, arch, nodeVersion: process.versions.node });
+  if (decoded.pnpmArchive === undefined)
+    throw acquisitionFailure('validate', 'v3 pnpm archive is required');
+  const stage = await mkdtemp(join(scratch, '.pnpm-stage-'));
+  let transferred = false;
+  try {
+    onProgress?.('download');
+    const archivePath = join(stage, 'pnpm.tar.gz');
+    const found = await downloadPnpm(decoded.pnpmArchive.url, archivePath, policy, signal, request);
+    onProgress?.('verify');
+    if (found !== decoded.pnpmArchive.sha256)
+      throw acquisitionFailure('verify', 'archive checksum mismatch');
+    onProgress?.('extract');
+    await runTar(archivePath, stage, policy, signal);
+    await rm(archivePath, { force: true });
+    const executablePath = await safeLayout(stage);
+    transferred = true;
+    return {
+      directory: stage,
+      executablePath,
+      version: decoded.bootstrap.pnpmVersion,
+      archiveSha256: found,
+    };
+  } finally {
+    if (!transferred) await rm(stage, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 function targetParts(target) {
