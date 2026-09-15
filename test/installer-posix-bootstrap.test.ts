@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   InstallerPosixBootstrapScenario,
+  type InjectedFailure,
   type PosixTarget,
 } from './support/installation/installer-posix-bootstrap-scenario.js';
 
@@ -16,6 +17,24 @@ const linuxTarget: PosixTarget = {
   arch: 'x64',
   format: 'tar.xz',
 };
+const lateFailures: readonly { readonly failure: InjectedFailure; readonly events: string[] }[] = [
+  { failure: 'download-after-copy', events: ['download'] },
+  { failure: 'sha256-after-output', events: ['download', 'sha256'] },
+  { failure: 'shasum-after-output', events: ['download', 'shasum'] },
+  { failure: 'tar-after-extract', events: ['download', 'sha256', 'tar:tar.xz'] },
+  {
+    failure: 'payload-after-receipt',
+    events: [
+      'download',
+      'sha256',
+      'tar:tar.xz',
+      'probe-stdin-eof',
+      'probe',
+      'payload-stdin-eof',
+      'payload',
+    ],
+  },
+];
 const targets: readonly PosixTarget[] = [
   linuxTarget,
   { system: 'Linux', machine: 'aarch64', platform: 'linux', arch: 'arm64', format: 'tar.xz' },
@@ -171,6 +190,70 @@ describe('generated POSIX Node publication', () => {
     expect(result.ownedResidue).toEqual([]);
     expect(result.finalLayout).toEqual([]);
     expect(result.receipt).toBeUndefined();
+  });
+
+  it.each(lateFailures)(
+    'publishes nothing when the $failure step reports failure after it succeeded',
+    async ({ failure, events }) => {
+      const subject = await scenario();
+      const result = await subject.run({ ...linuxTarget, failure });
+
+      expect({ exitCode: result.exitCode, signalCode: result.signalCode }).toEqual({
+        exitCode: 1,
+        signalCode: null,
+      });
+      expect(result.events).toEqual(events);
+      expect(result.finalLayout).toEqual([]);
+      expect(result.receipt).toBeUndefined();
+      expect(result.ownedResidue).toEqual([]);
+      expect(result.hostileSentinel).toBe(false);
+      expect(await subject.outsideSnapshot()).toEqual(subject.expectedOutsideSnapshot());
+    },
+  );
+
+  it('terminates a download that outlives its bound and ignores termination', async () => {
+    const subject = await scenario();
+    const running = await subject.start({ ...linuxTarget, watchdog: 'download-hang' });
+    await subject.waitFor('download');
+    const held = Date.now();
+    const result = await running.finish;
+
+    expect(Date.now() - held).toBeLessThanOrEqual(3_500);
+    expect({ exitCode: result.exitCode, signalCode: result.signalCode }).toEqual({
+      exitCode: 1,
+      signalCode: null,
+    });
+    expect(result.watchdogTermGrace).toBe(true);
+    expect(result.events).toEqual(['download']);
+    expect(result.finalLayout).toEqual([]);
+    expect(result.receipt).toBeUndefined();
+    expect(result.ownedResidue).toEqual([]);
+    expect(await subject.outsideSnapshot()).toEqual(subject.expectedOutsideSnapshot());
+
+    const observed = [await subject.heldChildPid(), await subject.watchdogPid()];
+    expect(observed.map((pid) => Number.isSafeInteger(pid) && pid > 0)).toEqual([true, true]);
+    expect(await subject.processesAbsent(observed)).toBe(true);
+  });
+
+  it('stages only under the install root while a hostile TMPDIR is offered', async () => {
+    const subject = await scenario();
+    const running = await subject.start({ ...linuxTarget, payload: 'held' });
+    await subject.waitFor('payload-held');
+
+    expect(await subject.stageRoots()).toEqual([
+      expect.stringMatching(/^26\.8\.2\/linux-x64\.stage\.[^/]+$/u),
+    ]);
+    expect(await subject.stateOutsideStage()).toEqual([]);
+    expect(await subject.outsideSnapshot()).toEqual(subject.expectedOutsideSnapshot());
+
+    await subject.releasePayload();
+    const result = await running.finish;
+
+    expect(result.exitCode).toBe(0);
+    expect(result.receipt).toEqual(subject.expectedReceipt(linuxTarget));
+    expect(result.ownedResidue).toEqual([]);
+    expect(result.hostileSentinel).toBe(false);
+    expect(await subject.outsideSnapshot()).toEqual(subject.expectedOutsideSnapshot());
   });
 
   it('reuses an exact receipt only after a fresh successful Node probe', async () => {
