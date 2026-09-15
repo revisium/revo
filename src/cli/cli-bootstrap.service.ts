@@ -12,10 +12,6 @@ export class CliBootstrapService {
   ) {}
 
   async run(): Promise<number> {
-    if (process.argv.length === 2) {
-      process.argv.push('--help');
-    }
-
     try {
       await CommandFactory.run(CliModule, {
         cliName: this.metadata.cliName,

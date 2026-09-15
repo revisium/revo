@@ -10,10 +10,10 @@
 
 ## Status
 
-Production CLI foundation. The `revo` binary provides help and version commands through a thin
-NestJS application context. Cross-platform channel layout resolution and release metadata
-validation are also implemented; server and installation commands arrive in later production
-stages.
+Production CLI foundation. The `revo` binary starts the configured server and prints its verified
+public URL through a thin NestJS application context. Cross-platform channel layout resolution,
+release metadata validation, and server lifecycle commands are also implemented; installation
+commands arrive in later production stages.
 
 ## Responsibilities
 
@@ -45,10 +45,15 @@ The current commands are:
 node dist/bin/revo.js --help
 node dist/bin/revo.js --version
 node dist/bin/revo.js version
+node dist/bin/revo.js
+node dist/bin/revo.js --web
+node dist/bin/revo.js server start
+node dist/bin/revo.js server status
+node dist/bin/revo.js server stop
 ```
 
-Running `revo` without arguments displays help. Unknown commands and options fail with exit code 2.
-The package manifest remains private during the foundation stage.
+Running `revo` without arguments ensures the server is running and prints one verified URL. `--web`
+also opens that URL in the default browser. Unknown root arguments and options fail with exit code 2. The package manifest remains private during the foundation stage.
 
 ## Development
 
