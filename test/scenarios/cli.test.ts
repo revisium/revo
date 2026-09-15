@@ -13,6 +13,7 @@ describe('Revo CLI', () => {
       expect(result.exitCode).toBe(0);
       expect(result.signal).toBeNull();
       expect(result.stdout).toContain('Usage: revo');
+      expect(result.stdout).toContain('server');
       expect(result.stdout).toContain('version');
       expect(result.stderr).toBe('');
     },
