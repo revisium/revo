@@ -45,6 +45,7 @@ The current commands are:
 node dist/bin/revo.js --help
 node dist/bin/revo.js --version
 node dist/bin/revo.js version
+node dist/bin/revo.js doctor
 node dist/bin/revo.js
 node dist/bin/revo.js --web
 node dist/bin/revo.js server start
