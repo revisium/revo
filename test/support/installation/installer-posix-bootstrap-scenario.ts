@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
 import {
+  access,
   chmod,
   copyFile,
   lstat,
@@ -9,7 +11,9 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
   rm,
+  stat,
   symlink,
   writeFile,
 } from 'node:fs/promises';
@@ -33,6 +37,28 @@ const ROOT = dirname(dirname(dirname(SUPPORT)));
 const BUILDER = new URL('../../../installer/build-installer.mjs', import.meta.url).href;
 const PAYLOAD = join(ROOT, 'installer', 'node-bootstrap.mjs');
 const DIVERGENT_ARCHIVE_SHA256 = createHash('sha256').update('divergent archive').digest('hex');
+
+// install.sh.in shells out to these by bare name (mkdir, mktemp, cat, ls, cut, awk, rm, mv, sleep,
+// chmod), and the fixture's own downloader wrappers shell out to bare cp; every other external
+// command run (uname/curl/wget/sha256sum/tar/node) is one of the fixture's own instrumented
+// wrappers below. gzip and xz are tar transitive compressor helpers. The spawned installer's
+// PATH is tools-only, so each entry here must be resolved from the host and linked in, or the
+// script fails with "not found".
+const HOST_TOOL_ALLOWLIST = [
+  'mkdir',
+  'mktemp',
+  'chmod',
+  'cat',
+  'ls',
+  'cut',
+  'awk',
+  'rm',
+  'mv',
+  'sleep',
+  'cp',
+  'gzip',
+  'xz',
+] as const;
 
 interface InstallerBuilder {
   readonly buildInstaller: (input: unknown) => string;
@@ -107,7 +133,7 @@ export class InstallerPosixBootstrapScenario {
     const child = spawn('/bin/sh', [this.path('install.sh')], {
       cwd: this.root,
       env: {
-        PATH: `${this.path('tools')}:${process.env.PATH ?? ''}`,
+        PATH: this.path('tools'),
         REVO_INSTALL_ROOT: this.path('state'),
         REVO_PAYLOAD_GATE: this.path('payload-gate'),
         REVO_TEST_ARCHIVE: this.path('archive'),
@@ -319,6 +345,11 @@ export class InstallerPosixBootstrapScenario {
     await executable(this.path('tools', 'sha256sum'), wrapper('sha256', '/usr/bin/sha256sum'));
     await executable(this.path('tools', 'tar'), wrapper(`tar:${options.format}`, '/bin/tar'));
     await executable(this.path('tools', 'node'), '#!/bin/sh\nexit 97\n');
+    await Promise.all(
+      HOST_TOOL_ALLOWLIST.map(async (name) =>
+        ensureHostToolLink(this.path('tools', name), await resolveHostTool(name)),
+      ),
+    );
   }
 
   private nodeProgram(payload: 'ready' | 'held'): string {
@@ -422,6 +453,36 @@ const wrapper = (event: string, command: string) => `#!/bin/sh
 printf '${event}\\n' >>"$REVO_TEST_EVENTS"
 exec '${command}' "$@"
 `;
+
+async function ensureHostToolLink(path: string, target: string): Promise<void> {
+  const existing = await lstat(path).catch(() => undefined);
+  if (existing?.isSymbolicLink() && (await readlink(path)) === target) {
+    return;
+  }
+  if (existing !== undefined) {
+    await rm(path, { force: true });
+  }
+  await symlink(target, path);
+}
+
+async function resolveHostTool(name: string): Promise<string> {
+  const dirs = (process.env.PATH ?? '').split(':').filter(Boolean);
+  for (const dir of dirs) {
+    const candidate = join(dir, name);
+    const info = await stat(candidate).catch(() => undefined);
+    if (info === undefined || !info.isFile()) {
+      continue;
+    }
+    const usable = await access(candidate, constants.X_OK).then(
+      () => true,
+      () => false,
+    );
+    if (usable) {
+      return realpath(candidate);
+    }
+  }
+  throw new Error(`fixture could not resolve required host utility: ${name}`);
+}
 
 async function executable(path: string, body: string): Promise<void> {
   await writeFile(path, body, { mode: 0o700 });

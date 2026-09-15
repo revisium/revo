@@ -1,6 +1,8 @@
+import { chmod, lstat, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   InstallerPosixBootstrapScenario,
@@ -195,4 +197,57 @@ describe('generated POSIX Node publication', () => {
       expect(result.downloadArgv).toEqual([]);
     },
   );
+
+  describe('hermetic spawned PATH', () => {
+    const inheritedPath = process.env.PATH;
+    let sentinelDir: string;
+    let sentinelTouched: string;
+
+    beforeEach(async () => {
+      sentinelDir = await mkdtemp(join(tmpdir(), 'revo-b2a-sentinel-'));
+      sentinelTouched = join(sentinelDir, 'sentinel-touched');
+      const sentinelCurl = join(sentinelDir, 'curl');
+      await writeFile(sentinelCurl, `#!/bin/sh\ntouch '${sentinelTouched}'\nexit 1\n`, {
+        mode: 0o700,
+      });
+      await chmod(sentinelCurl, 0o700);
+      process.env.PATH = `${sentinelDir}:${inheritedPath ?? ''}`;
+    });
+
+    afterEach(async () => {
+      if (inheritedPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = inheritedPath;
+      }
+      await rm(sentinelDir, { recursive: true, force: true });
+    });
+
+    const sentinelUntouched = () =>
+      lstat(sentinelTouched).then(
+        () => false,
+        () => true,
+      );
+
+    it('still uses the fixture curl argv with an ambient curl sentinel on the inherited PATH', async () => {
+      const subject = await scenario();
+      const result = await subject.run(linuxTarget);
+      expect(result.exitCode).toBe(0);
+      expect(result.downloadArgv).toEqual(
+        subject.expectedDownloadArgv('curl', dirname(result.payloadPath)),
+      );
+      expect(await sentinelUntouched()).toBe(true);
+    });
+
+    it('falls back to the fixture wget without invoking an ambient curl sentinel', async () => {
+      const subject = await scenario();
+      const result = await subject.run({ ...linuxTarget, downloader: 'wget' });
+      expect(result.exitCode).toBe(0);
+      expect(result.downloadArgv).toEqual(
+        subject.expectedDownloadArgv('wget', dirname(result.payloadPath)),
+      );
+      expect(result.events).toContain('download');
+      expect(await sentinelUntouched()).toBe(true);
+    });
+  });
 });
