@@ -35,6 +35,48 @@ describe('Server owner composition', () => {
     ]);
   });
 
+  it('does not release ownership while a lifecycle emit is blocked during cancellation', async () => {
+    await expect(scenario.cancellationDoesNotWaitForLifecycleEmit()).resolves.toMatchObject({
+      startResult: 'ready',
+      contender: 'busy',
+      codes: expect.arrayContaining(['SERVER_CANCELLED']),
+    });
+  }, 20_000);
+
+  it('keeps operation behavior when lifecycle writes reject', async () => {
+    await expect(scenario.ignoresLifecycleWriteRejections()).resolves.toMatchObject({
+      rejections: expect.any(Number),
+      ready: 'stopped',
+    });
+  });
+
+  it.each([
+    ['database', ['DATABASE_FAILED']],
+    ['readiness', ['SERVER_READINESS_FAILED']],
+    ['core', ['SERVER_CORE_FAILED']],
+    ['stop', ['SERVER_STOP_FAILED']],
+  ] as const)('records the %s owner failure in lifecycle', async (failure, codes) => {
+    await expect(scenario.recordsFailureLifecycle(failure)).resolves.toEqual(
+      expect.arrayContaining(Array.from(codes)),
+    );
+  });
+
+  it('records a rejected Core completion in lifecycle', async () => {
+    await expect(scenario.recordsRejectedCoreLifecycle()).resolves.toEqual(
+      expect.arrayContaining(['SERVER_CORE_FAILED']),
+    );
+  });
+
+  it('keeps alpha lifecycle history separate from stable history', async () => {
+    await expect(scenario.recordsAlphaLifecycle()).resolves.toEqual({ alpha: 8, stable: false });
+  });
+
+  it('records startup publication failure before releasing ownership', async () => {
+    await expect(scenario.recordsStartupFailureLifecycle()).resolves.toEqual(
+      expect.arrayContaining(['SERVER_STARTING', 'SERVER_START_FAILED']),
+    );
+  });
+
   it(
     'starts real embedded PostgreSQL and Core before publishing readiness',
     async () => {

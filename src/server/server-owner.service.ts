@@ -414,6 +414,7 @@ export class ServerOwnerResource {
         await this.core.completionState();
       } catch {
         this.retryableCloseFailure = true;
+        this.emitLifecycle('SERVER_STOP_FAILED');
         this.lifecyclePhase = 'failed';
         this.failureOwnership = 'retained';
         this.resolveFailure(this.failureCode ?? 'revo.server-owner.stop', 'retained');
@@ -454,11 +455,13 @@ export class ServerOwnerResource {
       () => {
         if (!this.controller.signal.aborted) {
           this.failureCode ??= 'revo.server-owner.core';
+          this.emitLifecycle('SERVER_CORE_FAILED');
           this.beginObservedClose();
         }
       },
       () => {
         this.failureCode ??= 'revo.server-owner.core';
+        this.emitLifecycle('SERVER_CORE_FAILED');
         this.beginObservedClose();
       },
     );
