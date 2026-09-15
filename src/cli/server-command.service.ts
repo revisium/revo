@@ -30,7 +30,12 @@ const CLEANUP: Readonly<Record<string, string>> = {
   unconfirmed: ' Cleanup could not be confirmed.',
 };
 const UNAVAILABLE = 'Server status is unavailable';
-const STOPPABLE: readonly ServerStatus['kind'][] = ['running', 'starting', 'stopping', 'failed'];
+const STOPPABLE: ReadonlySet<ServerStatus['kind']> = new Set([
+  'running',
+  'starting',
+  'stopping',
+  'failed',
+]);
 
 @Injectable()
 export class ServerCommandService {
@@ -81,7 +86,7 @@ export class ServerCommandService {
       this.output.write('Server is already stopped.');
       return;
     }
-    if (!STOPPABLE.includes(current.kind)) {
+    if (!STOPPABLE.has(current.kind)) {
       throw new Error(`${UNAVAILABLE}; stop was not performed.`);
     }
     const stopped = await this.serverStop.stop(dataDir, DEFAULT_CONTROL_LIMITS.timeoutMs);
