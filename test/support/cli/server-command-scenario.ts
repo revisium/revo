@@ -8,12 +8,17 @@ import { ServerCommand } from '../../../src/cli/commands/server.command.js';
 import { OutputService } from '../../../src/cli/output.service.js';
 import { PackageMetadataService } from '../../../src/cli/package-metadata.service.js';
 import { ServerCommandService } from '../../../src/cli/server-command.service.js';
+import {
+  SERVER_LOGS_WAIT,
+  ServerLogsCommandService,
+} from '../../../src/cli/server-logs-command.service.js';
 import { ConfigurationResolver } from '../../../src/configuration/configuration-resolver.js';
 import type {
   ConfigurationInput,
   RevoConfiguration,
 } from '../../../src/configuration/configuration.types.js';
 import { resolveRevoLayout } from '../../../src/layout.js';
+import { waitForFollowPoll } from '../../../src/server-logs/follow.js';
 import {
   ServerLauncherService,
   type ServerLaunchRequest,
@@ -137,8 +142,10 @@ class CommandRecorder {
     @Module({
       providers: [
         ServerCommandService,
+        ServerLogsCommandService,
         ...ServerCommand.registerWithSubCommands(),
         ...PORTS.map((provide) => ({ provide, useValue: this })),
+        { provide: SERVER_LOGS_WAIT, useValue: waitForFollowPoll },
       ],
     })
     // oxlint-disable-next-line typescript/no-extraneous-class -- Nest test module metadata
