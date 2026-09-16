@@ -1,7 +1,7 @@
 // oxlint-disable curly, no-await-in-loop, no-unsafe-type-assertion -- bounded receipt validation
 
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, rename } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 
 import type { PackageInstallPlan } from './package-install-plan.js';
@@ -24,6 +24,10 @@ export interface PreparedPackageReceipt {
 }
 
 const fail = (reason: string): Error => new Error(`prepared package: ${reason}`);
+const code = (error: unknown): string | undefined =>
+  error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : undefined;
 const HASH = /^[a-f0-9]{64}$/u;
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -55,9 +59,32 @@ function safePath(value: string, label: string): void {
 }
 
 async function safeDirectory(value: string, label: string): Promise<void> {
-  const info = await lstat(value).catch(() => undefined);
+  const info = await lstat(value).catch((error: unknown) => {
+    if (code(error) === 'ENOENT') return undefined;
+    throw fail(`${label} is unavailable`);
+  });
   if (info === undefined || !info.isDirectory() || info.isSymbolicLink())
     throw fail(`${label} is unsafe`);
+}
+
+async function ensureParentPart(path: string): Promise<void> {
+  let info = await lstat(path).catch((error: unknown) => {
+    if (code(error) === 'ENOENT') return undefined;
+    throw fail('target ancestor is unavailable');
+  });
+  let created = false;
+  if (info === undefined) {
+    try {
+      await mkdir(path, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      if (code(error) !== 'EEXIST') throw fail('target ancestor is unavailable');
+      info = await lstat(path).catch(() => undefined);
+    }
+  }
+  if (info !== undefined && (!info.isDirectory() || info.isSymbolicLink()))
+    throw fail('target ancestor is unsafe');
+  if (info === undefined && !created) throw fail('target ancestor is unavailable');
 }
 
 async function safeParent(root: string, parent: string): Promise<void> {
@@ -66,9 +93,22 @@ async function safeParent(root: string, parent: string): Promise<void> {
   let current = root;
   for (const part of suffix.split('/').filter(Boolean)) {
     current = join(current, part);
-    const info = await lstat(current).catch(() => undefined);
-    if (info === undefined) await mkdir(current, { mode: 0o700 });
-    else if (!info.isDirectory() || info.isSymbolicLink()) throw fail('target ancestor is unsafe');
+    await ensureParentPart(current);
+  }
+}
+
+async function existingParent(root: string, parent: string): Promise<void> {
+  const suffix = relative(root, parent);
+  if (suffix.startsWith('..') || isAbsolute(suffix)) throw fail('target escapes channelRoot');
+  let current = root;
+  for (const part of suffix.split('/').filter(Boolean)) {
+    current = join(current, part);
+    const info = await lstat(current).catch((error: unknown) => {
+      if (code(error) === 'ENOENT') return undefined;
+      throw fail('target ancestor is unavailable');
+    });
+    if (info === undefined) return;
+    if (!info.isDirectory() || info.isSymbolicLink()) throw fail('target ancestor is unsafe');
   }
 }
 
@@ -108,16 +148,28 @@ export function parsePreparedPackageReceipt(value: unknown): PreparedPackageRece
 }
 
 async function regularFile(path: string, label: string): Promise<Uint8Array> {
-  const info = await lstat(path).catch(() => undefined);
+  const info = await lstat(path).catch((error: unknown) => {
+    if (code(error) === 'ENOENT') return undefined;
+    throw fail(`${label} is unavailable`);
+  });
   if (info === undefined || !info.isFile() || info.isSymbolicLink())
     throw fail(`${label} is unsafe`);
-  return readFile(path);
+  try {
+    return await readFile(path);
+  } catch {
+    throw fail(`${label} is unavailable`);
+  }
 }
 
 async function validateContents(target: string, receipt: PreparedPackageReceipt): Promise<void> {
-  const packageJson = JSON.parse(
-    new TextDecoder().decode(await regularFile(join(target, 'package.json'), 'package.json')),
-  ) as Record<string, unknown>;
+  let packageJson: Record<string, unknown>;
+  try {
+    packageJson = JSON.parse(
+      new TextDecoder().decode(await regularFile(join(target, 'package.json'), 'package.json')),
+    ) as Record<string, unknown>;
+  } catch {
+    throw fail('package identity is invalid');
+  }
   if (
     packageJson.name !== receipt.release.npm.name ||
     packageJson.version !== receipt.release.version
@@ -144,6 +196,24 @@ async function validateContents(target: string, receipt: PreparedPackageReceipt)
   }
 }
 
+async function compatibleWinner(
+  channelRoot: string,
+  plan: PackageInstallPlan,
+): Promise<{ readonly directory: string; readonly receipt: PreparedPackageReceipt }> {
+  try {
+    const directory = await readPreparedPackage(channelRoot, plan);
+    if (directory === undefined) throw fail('existing target is incompatible');
+    return { directory, receipt: preparedPackageReceipt(plan) };
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === 'prepared package: existing target is incompatible'
+    )
+      throw error;
+    throw fail('existing target is incompatible');
+  }
+}
+
 export async function publishPreparedPackage({
   plan,
   stage,
@@ -160,11 +230,24 @@ export async function publishPreparedPackage({
   const target = preparedPackageTarget(channelRoot, plan);
   const parent = dirname(target);
   await safeParent(channelRoot, parent);
-  const existing = await lstat(target).catch(() => undefined);
-  if (existing !== undefined) throw fail('target already exists');
+  const existing = await lstat(target).catch((error: unknown) => {
+    if (code(error) === 'ENOENT') return undefined;
+    throw fail('target is unavailable');
+  });
   const receipt = preparedPackageReceipt(plan);
+  if (existing !== undefined) return compatibleWinner(channelRoot, plan);
+  try {
+    await validateContents(stage, receipt);
+  } catch {
+    throw fail('stage is invalid');
+  }
   const receiptPath = join(stage, RECEIPT_NAME);
-  const file = await open(receiptPath, 'wx', 0o600);
+  let file: Awaited<ReturnType<typeof open>>;
+  try {
+    file = await open(receiptPath, 'wx', 0o600);
+  } catch {
+    throw fail('stage receipt is unavailable');
+  }
   try {
     await file.writeFile(`${JSON.stringify(receipt)}\n`, 'utf8');
   } finally {
@@ -173,9 +256,9 @@ export async function publishPreparedPackage({
   try {
     await rename(stage, target);
   } catch (cause) {
-    await rm(stage, { recursive: true, force: true }).catch(() => undefined);
-    if (cause && typeof cause === 'object' && 'code' in cause && cause.code === 'EXDEV')
-      throw fail('atomic publication crossed filesystems');
+    if (code(cause) === 'EEXIST' || code(cause) === 'ENOTEMPTY')
+      return compatibleWinner(channelRoot, plan);
+    if (code(cause) === 'EXDEV') throw fail('atomic publication crossed filesystems');
     throw fail('atomic publication failed');
   }
   return { directory: target, receipt };
@@ -187,11 +270,18 @@ export async function readPreparedPackage(
 ): Promise<string | undefined> {
   safePath(channelRoot, 'channelRoot');
   const target = preparedPackageTarget(channelRoot, plan);
-  const info = await lstat(target).catch(() => undefined);
+  await existingParent(channelRoot, dirname(target));
+  const info = await lstat(target).catch((error: unknown) => {
+    if (code(error) === 'ENOENT') return undefined;
+    throw fail('target is unavailable');
+  });
   if (info === undefined) return undefined;
   if (!info.isDirectory() || info.isSymbolicLink()) throw fail('target is unsafe');
   const receiptPath = join(target, RECEIPT_NAME);
-  const receiptInfo = await lstat(receiptPath).catch(() => undefined);
+  const receiptInfo = await lstat(receiptPath).catch((error: unknown) => {
+    if (code(error) === 'ENOENT') return undefined;
+    throw fail('receipt is unavailable');
+  });
   if (
     receiptInfo === undefined ||
     !receiptInfo.isFile() ||
@@ -199,11 +289,19 @@ export async function readPreparedPackage(
     (receiptInfo.mode & 0o777) !== 0o600
   )
     throw fail('receipt is unsafe');
-  const found = parsePreparedPackageReceipt(JSON.parse(await readFile(receiptPath, 'utf8')));
+  let found: PreparedPackageReceipt;
+  try {
+    found = parsePreparedPackageReceipt(JSON.parse(await readFile(receiptPath, 'utf8')));
+  } catch {
+    throw fail('receipt is invalid');
+  }
   if (JSON.stringify(found) !== JSON.stringify(preparedPackageReceipt(plan)))
     throw fail('receipt does not match plan');
   await validateContents(target, found);
-  const nodeModules = await lstat(join(target, 'node_modules')).catch(() => undefined);
+  const nodeModules = await lstat(join(target, 'node_modules')).catch((error: unknown) => {
+    if (code(error) === 'ENOENT') return undefined;
+    throw fail('node_modules is unavailable');
+  });
   if (nodeModules !== undefined && !nodeModules.isDirectory()) throw fail('node_modules is unsafe');
   return target;
 }
