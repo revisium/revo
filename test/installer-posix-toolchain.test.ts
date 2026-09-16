@@ -3,6 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
+import { readActivation } from '../src/installation/activation-store.js';
 
 import {
   cleanupPortableToolchain,
@@ -19,6 +20,35 @@ const syntax = (script: string) =>
     child.stdin.end(script);
     child.once('close', (code) => resolve(code ?? 1));
   });
+
+it('real activation mode packs the compiled helper', async () => {
+  const archive = process.env.REVO_REAL_PNPM_ARCHIVE;
+  if (archive === undefined) throw new Error('real pnpm archive is required');
+  const subject = await portableToolchain('stable', undefined, false, true);
+  let failed = false;
+  try {
+    expect(subject.plan.release.version).toBe('0.0.0');
+    const exit = await subject.startInstaller().finish;
+    failed = exit !== 0;
+    expect(exit).toBe(0);
+    const current = await readActivation(join(subject.root, 'state', 'stable'));
+    expect(current.status).toBe('valid');
+    if (current.status === 'valid') {
+      expect(current.record.release.version).toBe(subject.plan.release.version);
+      expect(current.record.toolchain.nodeArchiveSha256).toBe(subject.nodeArchiveSha256);
+      expect(current.record.toolchain.pnpmArchiveSha256).toBe(subject.pnpmArchiveSha256);
+      expect(current.record.launcherProtocol).toBe('revo-activation-launcher/v2');
+      const generation = current.record.generationId;
+      expect(await subject.startInstaller().finish).toBe(0);
+      const retry = await readActivation(join(subject.root, 'state', 'stable'));
+      expect(retry.status).toBe('valid');
+      if (retry.status === 'valid') expect(retry.record.generationId).toBe(generation);
+    }
+  } finally {
+    if (!failed) await cleanupPortableToolchain(subject.root);
+    else console.error(`REAL_FAILURE_ROOT=${subject.root}`);
+  }
+}, 180_000);
 
 describe('generated POSIX toolchain installer', () => {
   it.each(['stable', 'alpha'] as const)(

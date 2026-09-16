@@ -1,7 +1,7 @@
 // oxlint-disable curly, no-unsafe-type-assertion, no-non-null-assertion -- compact bounded archive fixture
 
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
@@ -15,6 +15,16 @@ const hash = (bytes: Uint8Array, algorithm: 'sha256' | 'sha512'): string =>
   createHash(algorithm).update(bytes).digest('hex');
 const sri = (bytes: Uint8Array): string =>
   `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
+async function compiledEntries(root: string, prefix = ''): Promise<Record<string, string>> {
+  const result: Record<string, string> = {};
+  for (const name of await readdir(join(root, prefix))) {
+    const relative = join(prefix, name);
+    const info = await stat(join(root, relative));
+    if (info.isDirectory()) Object.assign(result, await compiledEntries(root, relative));
+    else result[`package/dist/${relative}`] = (await readFile(join(root, relative))).toString();
+  }
+  return result;
+}
 const header = (name: string, size: number, type: '0' | '5'): Uint8Array => {
   const value = Buffer.alloc(512);
   value.write(name, 0, 100, 'utf8');
@@ -47,17 +57,35 @@ export async function packageArtifactScenario(
     readonly version?: string;
     readonly unsafeTar?: Uint8Array;
     readonly activationProbe?: boolean;
+    readonly realActivation?: boolean;
+    readonly workspace?: string;
   } = {},
 ) {
+  const actualPackageJson = options.realActivation
+    ? await readFile(new URL('../../../package.json', import.meta.url))
+    : undefined;
+  const actualManifest = actualPackageJson === undefined ? undefined : JSON.parse(actualPackageJson.toString());
   const fixture = packageReleaseFixture(
-    options.channel === undefined && options.version === undefined
+    options.channel === undefined && options.version === undefined && actualManifest === undefined
       ? {}
       : {
           ...(options.channel === undefined ? {} : { channel: options.channel }),
-          ...(options.version === undefined ? {} : { version: options.version }),
+          version: actualManifest?.version ?? options.version,
         },
   );
   const release = fixture.manifest.release;
+  const compiledActivationHelper = options.realActivation
+    ? await readFile(new URL('../../../dist/bin/revo-install-activate.js', import.meta.url))
+    : undefined;
+  const compiledDist = options.realActivation
+    ? await compiledEntries(new URL('../../../dist', import.meta.url).pathname)
+    : {};
+  const actualLock = options.realActivation
+    ? await readFile(new URL('../../../pnpm-lock.yaml', import.meta.url))
+    : undefined;
+  const actualWorkspace = options.realActivation
+    ? await readFile(new URL('../../../pnpm-workspace.yaml', import.meta.url))
+    : undefined;
   const packageJson = JSON.stringify({
     name: '@revisium/revo',
     version: release.version,
@@ -74,18 +102,28 @@ export async function packageArtifactScenario(
       options.unsafeTar ??
       tarFixture({
         'package/': '',
-        'package/package.json': packageJson,
+        'package/package.json': (actualPackageJson ?? Buffer.from(packageJson)).toString(),
         'package/dist/index.js': 'export {}\n',
         ...(options.activationProbe
           ? {
               'package/dist/bin/revo.js':
                 "import { appendFile } from 'node:fs/promises';\nif (process.env.REVO_ACTIVATION_EXIT7) process.exit(7);\nif (process.env.REVO_ACTIVATION_TERM) process.kill(process.pid, 'SIGTERM');\nawait appendFile(process.env.REVO_ACTIVATION_OUTPUT, JSON.stringify({ execPath: process.execPath, argv: process.argv.slice(2), cwd: process.cwd() }) + '\\n');\n",
+              ...(compiledActivationHelper === undefined
+                ? {}
+                : {
+                    'package/dist/bin/revo-install-activate.js':
+                      compiledActivationHelper.toString(),
+                  }),
             }
           : {}),
+        ...compiledDist,
       }),
-    packageJson: Buffer.from(packageJson),
-    pnpmLock: Buffer.from('lockfileVersion: 9.0\n\nimporters:\n  .: {}\n'),
-    pnpmWorkspace: Buffer.from(workspace),
+    packageJson: actualPackageJson ?? Buffer.from(packageJson),
+    pnpmLock: actualLock ?? Buffer.from('lockfileVersion: 9.0\n\nimporters:\n  .: {}\n'),
+    pnpmWorkspace:
+      options.workspace === undefined
+        ? (actualWorkspace ?? Buffer.from(workspace))
+        : Buffer.from(options.workspace),
   };
   const artifacts = Object.fromEntries(
     Object.entries(bytes).map(([name, value]) => [

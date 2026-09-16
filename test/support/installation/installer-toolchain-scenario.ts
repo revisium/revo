@@ -44,6 +44,7 @@ export async function portableToolchain(
   channel: 'stable' | 'alpha' = 'stable',
   releaseVersion?: string,
   activationProbe = false,
+  realActivation = false,
 ) {
   const root = await mkdtemp(join(tmpdir(), 'revo-c3b-'));
   const tools = join(root, 'tools');
@@ -88,7 +89,11 @@ export async function portableToolchain(
   } else {
     await writeFile(nodeArchive, cachedNodeArchive);
   }
-  if (cachedPnpmArchive === undefined) {
+  const officialPnpmArchive = realActivation ? process.env.REVO_REAL_PNPM_ARCHIVE : undefined;
+  if (officialPnpmArchive !== undefined) {
+    cachedPnpmArchive = await readFile(officialPnpmArchive);
+    await writeFile(pnpmArchive, cachedPnpmArchive);
+  } else if (cachedPnpmArchive === undefined) {
     await run(tar, ['-czf', pnpmArchive, '-C', pnpmSource, '.']);
     cachedPnpmArchive = await readFile(pnpmArchive);
   } else {
@@ -106,11 +111,17 @@ export async function portableToolchain(
     channel,
     ...(releaseVersion === undefined ? {} : { version: releaseVersion }),
     ...(activationProbe ? { activationProbe: true } : {}),
+    ...(realActivation ? { realActivation: true, activationProbe: true } : {}),
   });
   const input = pnpmReleaseManifestFixture({
     channel,
     version: packages.plan.release.version,
-    versions: { core: '4.3.2', admin: '5.4.3', node: process.versions.node, pnpm: '12.4.1' },
+    versions: {
+      core: packages.plan.components.core.version,
+      admin: packages.plan.components.admin.version,
+      node: packages.plan.toolchain.node,
+      pnpm: packages.plan.toolchain.pnpm,
+    },
   });
   const manifest = {
     ...input.manifest,
