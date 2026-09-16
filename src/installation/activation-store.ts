@@ -115,15 +115,13 @@ async function readableArtifact(root: string, path: string): Promise<Uint8Array>
 }
 function declaredBin(value: Record<string, unknown>): string {
   const bins = value.bin;
-  const result =
-    typeof bins === 'string'
-      ? bins
-      : bins &&
-          typeof bins === 'object' &&
-          !Array.isArray(bins) &&
-          typeof (bins as Record<string, unknown>).revo === 'string'
-        ? ((bins as Record<string, unknown>).revo as string)
-        : '';
+  let result = '';
+  if (typeof bins === 'string') {
+    result = bins;
+  } else if (bins !== null && typeof bins === 'object' && !Array.isArray(bins)) {
+    const revo = (bins as Record<string, unknown>).revo;
+    if (typeof revo === 'string') result = revo;
+  }
   if (!safeRef(result)) throw fail('package bin is invalid');
   return result;
 }

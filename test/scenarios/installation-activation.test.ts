@@ -1,4 +1,5 @@
-import { chmod, lstat, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -22,8 +23,9 @@ describe('prepared installation activation', () => {
       expect(await data.packageBinMode()).toBe(0o600);
       const run = await data.executeCurrent(['arg with space', "apostrophe's", '']);
       expect(run).toMatchObject({ code: 0, signal: null });
+      const expectedExecPath = await realpath(join(data.candidate.nodeDirectory, 'bin', 'node'));
       expect(run.run).toEqual({
-        execPath: `${data.channelRoot}/${current.record.toolchain.nodeRef}/bin/node`,
+        execPath: expectedExecPath,
         argv: ['arg with space', "apostrophe's", ''],
         cwd: expect.stringContaining("cwd with 'quote"),
       });
