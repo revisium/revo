@@ -107,7 +107,7 @@ export async function portableToolchain(
     channel,
     ...(releaseVersion === undefined ? {} : { version: releaseVersion }),
     ...(activationProbe ? { activationProbe: true } : {}),
-    ...(realActivation ? { realActivation: true, activationProbe: true } : {}),
+    ...(realActivation ? { realActivation: true } : {}),
   });
   const input = pnpmReleaseManifestFixture({
     channel,
