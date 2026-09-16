@@ -485,6 +485,9 @@ async function commitGeneration(
   const now = reread.status === 'valid' ? reread.record.generationId : null;
   if (expected !== undefined && now !== expected)
     return { outcome: { status: 'busy' }, committed: false };
+  // The reread is asynchronous; cancellation may win while it is in flight.
+  // Never publish a pointer after that boundary has been crossed.
+  if (signal?.aborted) return { outcome: { status: 'cancelled' }, committed: false };
   try {
     await rename(stage.pointerTemp, pointer);
   } catch (error) {
