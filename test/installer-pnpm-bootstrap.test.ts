@@ -146,6 +146,27 @@ describe('managed pnpm bootstrap target', () => {
     ).rejects.toThrow(/channel|target|unsafe/iu);
     expect(await readdir(data.channelRoot)).toEqual([]);
   });
+  it('converges concurrent attempts on one compatible target', async () => {
+    const data = await fixture();
+    const outcomes = await Promise.all(
+      [0, 1].map(() =>
+        api.provisionPnpm({
+          bootstrap: data.value,
+          nodeExecutable: data.scenario.nodeExecutable,
+          channelRoot: data.channelRoot,
+          scratch: data.scenario.root,
+          platform: 'linux',
+          arch: 'x64',
+          request: request(data.archive.bytes),
+        }),
+      ),
+    );
+    expect(outcomes.map(({ reused }) => reused).sort((a, b) => Number(a) - Number(b))).toEqual([
+      false,
+      true,
+    ]);
+    expect(await stat(target(data.scenario.root))).toBeTruthy();
+  });
   it('exposes the finite progress contract', () =>
     expect(api.PNPM_PROGRESS_STAGES).toEqual([
       'validate',
