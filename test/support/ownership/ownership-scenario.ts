@@ -80,14 +80,18 @@ export class OwnerProcess {
     return this.nextReply('boot');
   }
 
-  request(action: string, dataDir?: string): Promise<Reply> {
+  request(
+    action: string,
+    dataDir?: string,
+    extra: Readonly<Record<string, unknown>> = {},
+  ): Promise<Reply> {
     const reply = this.nextReply(`request "${action}"`);
     const capturedFailPending = this.failPending;
     if (capturedFailPending === undefined) {
       return reply;
     }
     try {
-      this.child.send({ action, dataDir }, (error) => {
+      this.child.send({ action, dataDir, ...extra }, (error) => {
         if (error !== null) {
           capturedFailPending(error);
         }
