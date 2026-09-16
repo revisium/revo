@@ -1,6 +1,18 @@
+import { execFile } from 'node:child_process';
 // oxlint-disable no-explicit-any, no-unsafe-type-assertion -- compact installer scenario
-import { mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  readFile,
+  readlink,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -19,6 +31,9 @@ const api = await vi.importActual<Api>(
   new URL('../installer/node-bootstrap.mjs', import.meta.url).href,
 );
 const engine = new URL('../installer/node-bootstrap.mjs', import.meta.url).pathname;
+const execute = promisify(execFile);
+const nodePlatform = process.platform;
+const nodeArch = process.arch;
 const { buildInstaller } = await vi.importActual<{ buildInstaller: (input: unknown) => string }>(
   new URL('../installer/build-installer.mjs', import.meta.url).href,
 );
@@ -39,12 +54,12 @@ const fixture = async () => {
   await mkdir(channelRoot);
   const node = await scenario.prepareNodeStage();
   const archiveSha256 = value.archives.find(
-    (item: Data) => item.platform === 'linux' && item.arch === 'x64',
+    (item: Data) => item.platform === nodePlatform && item.arch === nodeArch,
   ).sha256;
   await api.runBootstrap({
     dataPath: scenario.dataPath,
     receiptPath: join(node.stage, 'install-receipt.json'),
-    target: 'linux-x64',
+    target: `${nodePlatform}-${nodeArch}`,
     archiveSha256,
   });
   return {
@@ -60,12 +75,14 @@ const input = (data: Data, stage = data.node.stage) => ({
   bootstrap: data.value,
   stage,
   channelRoot: data.channelRoot,
-  platform: 'linux',
-  arch: 'x64',
+  platform: nodePlatform,
+  arch: nodeArch,
   signal: undefined,
   policy: { probeTimeoutMs: 5_000 },
 });
-const target = (root: string) => join(root, 'channel', 'node', process.versions.node, 'linux-x64');
+const target = (root: string) =>
+  join(root, 'channel', 'node', process.versions.node, `${nodePlatform}-${nodeArch}`);
+const executable = (root: string) => join(target(root), 'bin', 'node');
 
 describe('managed Node bootstrap publication', () => {
   it('publishes a verified staged Node with its exact receipt', async () => {
@@ -75,7 +92,7 @@ describe('managed Node bootstrap publication', () => {
       const result = await api.publishNodeBootstrap(input(data));
       expect(result).toEqual({
         directory: target(data.scenario.root),
-        executablePath: join(target(data.scenario.root), 'node'),
+        executablePath: executable(data.scenario.root),
         reused: false,
       });
       expect(await readFile(join(target(data.scenario.root), 'install-receipt.json'), 'utf8')).toBe(
@@ -84,6 +101,15 @@ describe('managed Node bootstrap publication', () => {
       expect(
         (await stat(join(target(data.scenario.root), 'install-receipt.json'))).mode & 0o777,
       ).toBe(0o600);
+      expect((await execute(executable(data.scenario.root), ['--version'])).stdout.trim()).toBe(
+        `v${process.versions.node}`,
+      );
+      expect(await readFile(join(target(data.scenario.root), 'include', 'node.h'), 'utf8')).toBe(
+        'native node header\n',
+      );
+      expect(await readlink(join(target(data.scenario.root), 'bin', 'npm'))).toBe(
+        '../lib/node_modules/npm/bin/npm-cli.js',
+      );
     } finally {
       await data.cleanup();
     }
@@ -97,12 +123,55 @@ describe('managed Node bootstrap publication', () => {
       await api.runBootstrap({
         dataPath: data.scenario.dataPath,
         receiptPath: join(second.stage, 'install-receipt.json'),
-        target: 'linux-x64',
+        target: `${nodePlatform}-${nodeArch}`,
         archiveSha256: data.archiveSha256,
       });
       const result = await api.publishNodeBootstrap(input(data, second.stage));
       expect(result.reused).toBe(true);
+      expect(result.executablePath).toBe(executable(data.scenario.root));
       expect(await stat(second.stage)).toBeTruthy();
+    } finally {
+      await data.cleanup();
+    }
+  });
+
+  it('accepts a private stage inside the channel and keeps the archive tree', async () => {
+    const data = await fixture();
+    const inner = await data.scenario.prepareNodeStage('inner', true);
+    await api.runBootstrap({
+      dataPath: data.scenario.dataPath,
+      receiptPath: join(inner.stage, 'install-receipt.json'),
+      target: `${nodePlatform}-${nodeArch}`,
+      archiveSha256: data.archiveSha256,
+    });
+    try {
+      const result = await api.publishNodeBootstrap(input(data, inner.stage));
+      expect(result.executablePath).toBe(executable(data.scenario.root));
+      expect(await stat(join(target(data.scenario.root), 'share', 'doc', 'README'))).toBeTruthy();
+    } finally {
+      await data.cleanup();
+    }
+  });
+
+  it('rejects a reused target whose canonical Node reports a bare version', async () => {
+    const data = await fixture();
+    const second = await data.scenario.prepareNodeStage('bad-runtime');
+    await api.runBootstrap({
+      dataPath: data.scenario.dataPath,
+      receiptPath: join(second.stage, 'install-receipt.json'),
+      target: `${nodePlatform}-${nodeArch}`,
+      archiveSha256: data.archiveSha256,
+    });
+    try {
+      await api.publishNodeBootstrap(input(data));
+      await writeFile(
+        executable(data.scenario.root),
+        `#!/bin/sh\nprintf '%s\\n' '${process.versions.node}'\n`,
+      );
+      await chmod(executable(data.scenario.root), 0o755);
+      await expect(api.publishNodeBootstrap(input(data, second.stage))).rejects.toThrow(
+        /version|probe/iu,
+      );
     } finally {
       await data.cleanup();
     }
@@ -230,7 +299,7 @@ describe('managed Node bootstrap publication', () => {
         api.runBootstrap({
           dataPath: data.scenario.dataPath,
           receiptPath: join(attempt.stage, 'install-receipt.json'),
-          target: 'linux-x64',
+          target: `${nodePlatform}-${nodeArch}`,
           archiveSha256: data.archiveSha256,
         }),
       ),
