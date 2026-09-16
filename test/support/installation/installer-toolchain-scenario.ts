@@ -1,7 +1,18 @@
 // oxlint-disable no-unsafe-type-assertion, typescript/unbound-method -- dynamic builder fixture
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,37 +23,76 @@ import {
   embeddedBootstrap,
   installerBuilderScenario,
 } from './installer-builder-scenario.js';
+import { packageArtifactScenario } from './package-artifact-scenario.js';
 import { pnpmReleaseManifestFixture } from './release-manifest-fixture.js';
 
 type Builder = { buildInstaller(input: unknown): string };
 type Data = { readonly channel?: string };
+let cachedNodeArchive: Buffer | undefined;
+let cachedPnpmArchive: Buffer | undefined;
 
 const run = (command: string, args: readonly string[]) =>
   new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, { stdio: 'ignore' });
+    const child = spawn(command, args, { stdio: 'ignore', env: { ...process.env, XZ_OPT: '-0' } });
     child.once('error', reject);
     child.once('close', (code) =>
       code === 0 ? resolve() : reject(new Error(`${command} failed`)),
     );
   });
 
-export async function portableToolchain(channel: 'stable' | 'alpha' = 'stable') {
+export async function portableToolchain(
+  channel: 'stable' | 'alpha' = 'stable',
+  releaseVersion?: string,
+) {
   const root = await mkdtemp(join(tmpdir(), 'revo-c3b-'));
   const tools = join(root, 'tools');
   const nodeSource = join(root, 'node');
   const pnpmSource = join(root, 'pnpm');
   await mkdir(join(nodeSource, 'bin'), { recursive: true });
   await mkdir(join(pnpmSource, 'dist'), { recursive: true });
-  await writeFile(join(nodeSource, 'bin', 'node'), '#!/bin/sh\nexec "$REVO_TEST_NODE" "$@"\n');
+  await copyFile(process.execPath, join(nodeSource, 'bin', 'node'));
   await chmod(join(nodeSource, 'bin', 'node'), 0o755);
-  await writeFile(join(pnpmSource, 'pnpm'), "#!/bin/sh\nprintf '12.4.1\\n'\n");
+  await writeFile(
+    join(pnpmSource, 'pnpm'),
+    '#!/bin/sh\nif [ "$1" = "--version" ]; then printf \'12.4.1\\n\'; else trap \'[ -z "${REVO_PNPM_TERMINATED:-}" ] || : >"$REVO_PNPM_TERMINATED"; exit 143\' HUP INT TERM; [ -z "${REVO_PNPM_STARTED:-}" ] || : >"$REVO_PNPM_STARTED"; while [ -n "${REVO_PNPM_HOLD:-}" ] && [ -e "$REVO_PNPM_HOLD" ]; do :; done; [ -z "${REVO_PNPM_INSTALLS:-}" ] || : >>"$REVO_PNPM_INSTALLS"; [ -n "${REVO_PNPM_FAIL:-}" ] && exit 7 || :; printf \'{"name":"pnpm:install"}\\n\'; : >"$PWD/install-complete"; fi\n',
+  );
   await chmod(join(pnpmSource, 'pnpm'), 0o755);
+  await writeFile(
+    join(pnpmSource, 'pnpm'),
+    `${await readFile(join(pnpmSource, 'pnpm'), 'utf8')}printf '%s/bin/node\\n' "$REVO_PRIVATE_NODE_ROOT" >"$REVO_PNPM_NODE_RECORD"\n`,
+  );
+  await writeFile(
+    join(pnpmSource, 'pnpm'),
+    '#!/bin/sh\nexec "$REVO_PRIVATE_NODE_ROOT/bin/node" "${0%/*}/launcher.mjs" "$@"\n',
+  );
+  await chmod(join(pnpmSource, 'pnpm'), 0o755);
+  await writeFile(
+    join(pnpmSource, 'launcher.mjs'),
+    "import { appendFile, access, writeFile } from 'node:fs/promises';\nconst codes = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };\nfor (const [signal, code] of Object.entries(codes)) process.once(signal, async () => { if (process.env.REVO_PNPM_TERMINATED) await writeFile(process.env.REVO_PNPM_TERMINATED, 'ack\\n'); process.exit(code); });\nif (process.argv[2] === '--version') process.stdout.write('12.4.1\\n');\nelse { if (process.env.REVO_PNPM_STARTED) await writeFile(process.env.REVO_PNPM_STARTED, 'ready\\n'); while (process.env.REVO_PNPM_HOLD && await access(process.env.REVO_PNPM_HOLD).then(() => true, () => false)) await new Promise((resolve) => setTimeout(resolve, 10)); if (process.env.REVO_PNPM_INSTALLS) await appendFile(process.env.REVO_PNPM_INSTALLS, 'install\\n'); if (process.env.REVO_PNPM_NODE_RECORD) await writeFile(process.env.REVO_PNPM_NODE_RECORD, `${process.execPath}\\n`); if (process.env.REVO_PNPM_FAIL) process.exit(7); process.stdout.write('{\"name\":\"pnpm:install\"}\\n'); await writeFile(`${process.cwd()}/install-complete`, 'done\\n'); }\n",
+  );
   const nodeFormat = process.platform === 'darwin' ? 'tar.gz' : 'tar.xz';
   const nodeArchive = join(root, `node.${nodeFormat}`);
   const pnpmArchive = join(root, 'pnpm.tar.gz');
   const tar = process.platform === 'darwin' ? '/usr/bin/tar' : '/bin/tar';
-  await run(tar, [nodeFormat === 'tar.gz' ? '-czf' : '-cJf', nodeArchive, '-C', nodeSource, '.']);
-  await run(tar, ['-czf', pnpmArchive, '-C', pnpmSource, '.']);
+  if (cachedNodeArchive === undefined) {
+    if (nodeFormat === 'tar.gz') {
+      await run(tar, ['-czf', nodeArchive, '-C', nodeSource, '.']);
+    } else {
+      const rawArchive = `${nodeArchive}.tar`;
+      await run(tar, ['-cf', rawArchive, '-C', nodeSource, '.']);
+      await run('xz', ['-0', rawArchive]);
+      await rename(`${rawArchive}.xz`, nodeArchive);
+    }
+    cachedNodeArchive = await readFile(nodeArchive);
+  } else {
+    await writeFile(nodeArchive, cachedNodeArchive);
+  }
+  if (cachedPnpmArchive === undefined) {
+    await run(tar, ['-czf', pnpmArchive, '-C', pnpmSource, '.']);
+    cachedPnpmArchive = await readFile(pnpmArchive);
+  } else {
+    await writeFile(pnpmArchive, cachedPnpmArchive);
+  }
   const nodeSha = createHash('sha256')
     .update(await readFile(nodeArchive))
     .digest('hex');
@@ -51,13 +101,20 @@ export async function portableToolchain(channel: 'stable' | 'alpha' = 'stable') 
     .digest('hex');
   const platform = process.platform === 'darwin' ? 'darwin' : 'linux';
   const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  const packages = await packageArtifactScenario({
+    channel,
+    ...(releaseVersion === undefined ? {} : { version: releaseVersion }),
+  });
   const input = pnpmReleaseManifestFixture({
     channel,
-    version: channel === 'stable' ? '2.7.1' : '2.7.1-alpha.1',
+    version: packages.plan.release.version,
     versions: { core: '4.3.2', admin: '5.4.3', node: process.versions.node, pnpm: '12.4.1' },
   });
   const manifest = {
     ...input.manifest,
+    release: packages.plan.release,
+    components: packages.plan.components,
+    artifacts: packages.plan.artifacts,
     toolchain: {
       ...input.manifest.toolchain,
       nodeArchives: input.manifest.toolchain.nodeArchives.map((item) =>
@@ -68,10 +125,13 @@ export async function portableToolchain(channel: 'stable' | 'alpha' = 'stable') 
       ),
     },
   };
-  const payload = `import { readFile } from 'node:fs/promises';\nimport { dirname } from 'node:path';\nimport { runInstallMode } from ${JSON.stringify(new URL('../../../installer/node-bootstrap.mjs', import.meta.url).href)};\nconst archive = await readFile(process.env.REVO_TEST_PNPM_ARCHIVE);\nawait runInstallMode({ dataPath: process.argv[2], receiptPath: process.env.REVO_RECEIPT_PATH, target: process.env.REVO_NODE_TARGET, archiveSha256: process.env.REVO_NODE_ARCHIVE_SHA256, channelRoot: process.env.REVO_INSTALL_ROOT, privateNodeRoot: dirname(process.execPath), scratch: process.env.REVO_INSTALL_SCRATCH, request: async () => ({ status: 200, headers: new Headers({ 'content-length': String(archive.length) }), body: (async function* () { yield archive; })() }) });`;
   const { buildInstaller } = await vi.importActual<Builder>(
     new URL('../../../installer/build-installer.mjs', import.meta.url).href,
   );
+  const { buildPayload } = await vi.importActual<{ buildPayload: () => Promise<string> }>(
+    new URL('../../../installer/build-payload.mjs', import.meta.url).href,
+  );
+  const payload = await buildPayload();
   const script = buildInstaller({
     ...input,
     bootstrapPolicy,
@@ -80,15 +140,41 @@ export async function portableToolchain(channel: 'stable' | 'alpha' = 'stable') 
     payload,
   });
   await mkdir(tools);
+  const responses = Object.fromEntries(
+    Object.entries(packages.plan.artifacts).map(([name, descriptor]) => [
+      descriptor.url,
+      Buffer.from(packages.bytes[name as keyof typeof packages.bytes]).toString('base64'),
+    ]),
+  );
+  const pnpmDescriptor = manifest.toolchain.pnpmArchives.find(
+    (item) => item.platform === platform && item.arch === arch,
+  );
+  if (pnpmDescriptor === undefined) {
+    throw new Error('fixture omitted pnpm archive');
+  }
+  responses[pnpmDescriptor.url] = (await readFile(pnpmArchive)).toString('base64');
+  const responseMap = join(root, 'responses.json');
+  await writeFile(responseMap, JSON.stringify(responses), { mode: 0o600 });
+  const preload = join(root, 'fetch-preload.mjs');
+  await writeFile(
+    preload,
+    "import { readFileSync } from 'node:fs';\nconst map = JSON.parse(readFileSync(process.env.REVO_TEST_RESPONSES, 'utf8'));\nglobalThis.fetch = async (url) => { const encoded = map[url]; if (encoded === undefined) return new Response(null, { status: 404 }); const body = Buffer.from(encoded, 'base64'); return { status: 200, headers: new Headers({ 'content-length': String(body.length) }), body: (async function* () { yield body; })() }; };\n",
+    { mode: 0o600 },
+  );
   const calls = join(root, 'curl.calls');
+  const pnpmStarted = join(root, 'pnpm.started');
+  const pnpmTerminated = join(root, 'pnpm.terminated');
+  const pnpmInstalls = join(root, 'pnpm.installs');
+  const pnpmNodeRecord = join(root, 'pnpm.node');
   await writeFile(
     join(tools, 'curl'),
-    '#!/bin/sh\nprintf x >>"$REVO_CURL_CALLS"\nwhile [ -n "${REVO_CURL_HOLD:-}" ] && [ -e "$REVO_CURL_HOLD" ]; do sleep 0.02; done\nwhile [ "$#" -gt 0 ]; do [ "$1" = --output ] && { shift; out=$1; }; shift; done\ncp "$REVO_FIXTURE_NODE_ARCHIVE" "$out"\n',
+    '#!/bin/sh\n[ -z "${REVO_CURL_OFFLINE:-}" ] || exit 1\nprintf x >>"$REVO_CURL_CALLS"\nwhile [ -n "${REVO_CURL_HOLD:-}" ] && [ -e "$REVO_CURL_HOLD" ]; do :; done\nwhile [ "$#" -gt 0 ]; do [ "$1" = --output ] && { shift; out=$1; }; shift; done\ncp "$REVO_FIXTURE_NODE_ARCHIVE" "$out"\n',
   );
   await chmod(join(tools, 'curl'), 0o755);
   await writeFile(join(root, 'install.sh'), script, { mode: 0o700 });
   const startInstaller = (extra: Record<string, string> = {}) => {
     let child!: ChildProcess;
+    let stderr = '';
     const finish = new Promise<number>((resolve) => {
       child = spawn('/bin/sh', [join(root, 'install.sh')], {
         env: {
@@ -100,16 +186,70 @@ export async function portableToolchain(channel: 'stable' | 'alpha' = 'stable') 
           REVO_CURL_CALLS: calls,
           REVO_TEST_PNPM_ARCHIVE: pnpmArchive,
           REVO_TEST_NODE: process.execPath,
+          REVO_TEST_RESPONSES: responseMap,
+          REVO_PNPM_STARTED: pnpmStarted,
+          REVO_PNPM_TERMINATED: pnpmTerminated,
+          REVO_PNPM_INSTALLS: pnpmInstalls,
+          REVO_PNPM_NODE_RECORD: pnpmNodeRecord,
+          NODE_OPTIONS: `--import=${preload}`,
           ...extra,
         },
         stdio: ['ignore', 'ignore', 'pipe'],
       });
-      child.once('close', (code) => resolve(code ?? 1));
+      child.stderr?.setEncoding('utf8');
+      child.stderr?.on('data', (chunk: string) => {
+        if (stderr.length < 2048) {
+          stderr += chunk.slice(0, 2048 - stderr.length);
+        }
+      });
+      child.once('exit', (code) => {
+        if (code !== 0 && stderr.length > 0) {
+          console.error(stderr.replaceAll(root, '<fixture>'));
+          const identity = `${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch === 'arm64' ? 'arm64' : 'x64'}`;
+          const targetNode = join(
+            extra.REVO_INSTALL_ROOT ?? join(root, 'state'),
+            channel,
+            'node',
+            process.versions.node,
+            identity,
+            'bin',
+            'node',
+          );
+          void lstat(targetNode).then(
+            (info) => console.error(`node target mode: ${(info.mode & 0o777).toString(8)}`),
+            () => console.error('node target: missing'),
+          );
+        }
+        resolve(code ?? 1);
+      });
     });
     return { child, finish };
   };
   const runInstaller = () => startInstaller().finish;
-  return { root, script, runInstaller, startInstaller, calls, nodeArchive, pnpmArchive };
+  const attempts = async () =>
+    (await readdir(join(root, 'state', channel), { withFileTypes: true }).catch(() => []))
+      .filter((entry) => entry.name.startsWith('.attempt.') && entry.isDirectory())
+      .map((entry) => join(root, 'state', channel, entry.name));
+  const runTogether = () => {
+    const first = startInstaller();
+    const second = startInstaller();
+    return Promise.all([first.finish, second.finish]);
+  };
+  return {
+    root,
+    script,
+    runInstaller,
+    startInstaller,
+    runTogether,
+    attempts,
+    calls,
+    pnpmStarted,
+    pnpmTerminated,
+    pnpmInstalls,
+    pnpmNodeRecord,
+    nodeArchive,
+    pnpmArchive,
+  };
 }
 
 export async function cleanupPortableToolchain(root: string) {
@@ -126,10 +266,10 @@ export async function toolchainInstaller(channel: 'stable' | 'alpha' = 'stable')
     versions: { core: '4.3.2', admin: '5.4.3', node: '26.8.2', pnpm: '12.4.1' },
   });
   const template = await installerTemplateBytes();
-  const payload = await readFile(
-    new URL('../../../installer/node-bootstrap.mjs', import.meta.url),
-    'utf8',
+  const { buildPayload } = await vi.importActual<{ buildPayload: () => Promise<string> }>(
+    new URL('../../../installer/build-payload.mjs', import.meta.url).href,
   );
+  const payload = await buildPayload();
   return buildInstaller({ ...input, bootstrapPolicy, template, payload });
 }
 
