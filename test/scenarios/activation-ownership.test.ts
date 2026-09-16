@@ -1,9 +1,22 @@
-import { fork, type ChildProcess } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { execFile, fork, type ChildProcess } from 'node:child_process';
+import { renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import { describe, expect, it } from 'vitest';
 
@@ -14,6 +27,7 @@ const OWNER_PROCESS = resolve(
   dirname(fileURLToPath(import.meta.url)),
   '../support/installation/activation-owner-process.mjs',
 );
+const makeFifo = promisify(execFile);
 
 function request(
   child: ChildProcess,
@@ -39,8 +53,6 @@ async function channel(): Promise<string> {
   const stable = join(root, 'stable');
   await mkdir(stable, { mode: 0o700 });
   await chmod(stable, 0o700);
-  const lock = await open(join(stable, '.activation.lock'), 'wx', 0o600);
-  await lock.close();
   return stable;
 }
 
@@ -85,6 +97,35 @@ describe('activation ownership', () => {
     }
   });
 
+  it('cleans its owner record when cancellation wins after publication', async () => {
+    const root = await channel();
+    const controller = new AbortController();
+    let checks = 0;
+    const signal = new Proxy(controller.signal, {
+      get(target, property, receiver) {
+        if (property === 'aborted' && ++checks === 3) {
+          controller.abort();
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    try {
+      await expect(
+        acquireActivationOwnership({ channelRoot: root, channel: 'stable', signal }),
+      ).resolves.toEqual({ status: 'cancelled' });
+      await expect(readFile(join(root, '.activation-owner.json'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      const retry = await acquireActivationOwnership({ channelRoot: root, channel: 'stable' });
+      expect(retry.status).toBe('held');
+      if (retry.status === 'held') {
+        await retry.lease.release();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('uses the lease for an atomic activation and then reacquires it', async () => {
     const scenario = await activationOwnershipScenario();
     try {
@@ -111,6 +152,100 @@ describe('activation ownership', () => {
     }
   });
 
+  it('bounds owner reads and rejects a symlink without opening it', async () => {
+    const root = await channel();
+    const ownerPath = join(root, '.activation-owner.json');
+    try {
+      const oversized = 'x'.repeat(4_097);
+      await writeFile(ownerPath, oversized, { mode: 0o600 });
+      expect(await acquireActivationOwnership({ channelRoot: root, channel: 'stable' })).toEqual({
+        status: 'unavailable',
+        reason: 'activation owner unavailable',
+      });
+      await rm(ownerPath);
+      await symlink(join(root, 'missing-owner'), ownerPath);
+      expect(await acquireActivationOwnership({ channelRoot: root, channel: 'stable' })).toEqual({
+        status: 'unavailable',
+        reason: 'activation owner unavailable',
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects unsafe owner nodes without blocking or mutating them', async () => {
+    const root = await channel();
+    const ownerPath = join(root, '.activation-owner.json');
+    try {
+      await writeFile(ownerPath, 'unsafe', { mode: 0o600 });
+      await chmod(ownerPath, 0o644);
+      await expect(
+        acquireActivationOwnership({ channelRoot: root, channel: 'stable' }),
+      ).resolves.toEqual({ status: 'unavailable', reason: 'activation owner unavailable' });
+      await chmod(ownerPath, 0o600);
+      await link(ownerPath, `${ownerPath}.hardlink`);
+      await expect(
+        acquireActivationOwnership({ channelRoot: root, channel: 'stable' }),
+      ).resolves.toEqual({ status: 'unavailable', reason: 'activation owner unavailable' });
+      await rm(`${ownerPath}.hardlink`);
+      await rm(ownerPath);
+      await makeFifo('/usr/bin/mkfifo', [ownerPath]);
+      await expect(
+        acquireActivationOwnership({ channelRoot: root, channel: 'stable' }),
+      ).resolves.toEqual({ status: 'unavailable', reason: 'activation owner unavailable' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a foreign owner during cancelled claim cleanup', async () => {
+    const root = await channel();
+    const ownerPath = join(root, '.activation-owner.json');
+    const controller = new AbortController();
+    let checks = 0;
+    const signal = new Proxy(controller.signal, {
+      get(target, property, receiver) {
+        if (property === 'aborted' && ++checks === 3) {
+          controller.abort();
+          renameSync(ownerPath, `${ownerPath}.old`);
+          writeFileSync(ownerPath, 'foreign', { mode: 0o600 });
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    try {
+      await expect(
+        acquireActivationOwnership({ channelRoot: root, channel: 'stable', signal }),
+      ).resolves.toEqual({ status: 'unavailable', reason: 'activation owner unavailable' });
+      expect(await readFile(ownerPath, 'utf8')).toBe('foreign');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('treats an already absent owner as confirmed cancelled cleanup', async () => {
+    const root = await channel();
+    const ownerPath = join(root, '.activation-owner.json');
+    const controller = new AbortController();
+    let checks = 0;
+    const signal = new Proxy(controller.signal, {
+      get(target, property, receiver) {
+        if (property === 'aborted' && ++checks === 3) {
+          controller.abort();
+          unlinkSync(ownerPath);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    try {
+      await expect(
+        acquireActivationOwnership({ channelRoot: root, channel: 'stable', signal }),
+      ).resolves.toEqual({ status: 'cancelled' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('recovers a stale identity but rejects an unsafe lock', async () => {
     const root = await channel();
     const ownerPath = join(root, '.activation-owner.json');
@@ -119,7 +254,10 @@ describe('activation ownership', () => {
     if (first.status !== 'held') {
       return;
     }
-    const stale = (await readFile(ownerPath, 'utf8')).replace(/"pid":\d+/u, '"pid":1');
+    const stale = (await readFile(ownerPath, 'utf8')).replace(
+      /("(?:startTicks|microseconds)":")[^"]+/u,
+      '$10',
+    );
     await first.lease.release();
     await writeFile(ownerPath, stale, { mode: 0o600 });
     const recovered = await acquireActivationOwnership({ channelRoot: root, channel: 'stable' });

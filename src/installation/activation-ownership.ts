@@ -4,7 +4,6 @@ import {
   lstat,
   open,
   rename,
-  rm,
   realpath,
   unlink,
   writeFile,
@@ -134,14 +133,14 @@ async function readOwner(ownerPath: string): Promise<OwnerRead> {
     ) {
       return { status: 'unavailable' };
     }
-    file = await open(ownerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    file = await open(ownerPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const buffer = Buffer.alloc(ACTIVATION_OWNER_LIMIT + 1);
-    const result = await file.read(buffer, 0, buffer.length, 0);
-    if (result.bytesRead > ACTIVATION_OWNER_LIMIT) {
+    const bytesRead = await readOwnerBytes(file, buffer);
+    if (bytesRead > ACTIVATION_OWNER_LIMIT || !(await safeOwner(file, ownerPath))) {
       return { status: 'unavailable' };
     }
     const parsed = parseActivationOwnerRecord(
-      JSON.parse(buffer.subarray(0, result.bytesRead).toString('utf8')),
+      JSON.parse(buffer.subarray(0, bytesRead).toString('utf8')),
     );
     return parsed === undefined ? { status: 'unavailable' } : { status: 'valid', record: parsed };
   } catch (error) {
@@ -149,6 +148,34 @@ async function readOwner(ownerPath: string): Promise<OwnerRead> {
   } finally {
     await file?.close().catch(() => undefined);
   }
+}
+
+async function readOwnerBytes(file: FileHandle, buffer: Buffer, offset = 0): Promise<number> {
+  const result = await file.read(buffer, offset, buffer.length - offset, null);
+  const next = offset + result.bytesRead;
+  if (result.bytesRead === 0 || next === buffer.length) {
+    return next;
+  }
+  return readOwnerBytes(file, buffer, next);
+}
+
+async function safeOwner(file: FileHandle, ownerPath: string): Promise<boolean> {
+  const descriptor = await file.stat({ bigint: true });
+  const pathname = await lstat(ownerPath, { bigint: true });
+  return (
+    descriptor.isFile() &&
+    !descriptor.isSymbolicLink() &&
+    descriptor.nlink === 1n &&
+    mode(descriptor) === 0o600 &&
+    ownUid(descriptor.uid) &&
+    pathname.isFile() &&
+    !pathname.isSymbolicLink() &&
+    pathname.nlink === 1n &&
+    mode(pathname) === 0o600 &&
+    ownUid(pathname.uid) &&
+    descriptor.dev === pathname.dev &&
+    descriptor.ino === pathname.ino
+  );
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -207,22 +234,26 @@ async function identityState(
   }
 }
 
-async function writeOwner(root: string, record: ActivationOwnerRecord): Promise<string> {
+async function writeOwner(root: string, record: ActivationOwnerRecord): Promise<void> {
   const ownerPath = join(root, OWNER_FILE);
   const temporary = join(root, `.${OWNER_FILE}.${record.token}.tmp`);
+  let created = false;
   try {
     await writeFile(temporary, `${JSON.stringify(record)}\n`, {
       encoding: 'utf8',
       flag: 'wx',
       mode: 0o600,
     });
+    created = true;
     await syncFile(temporary);
     await rename(temporary, ownerPath);
     await syncDirectory(root);
-    return temporary;
-  } catch (error) {
-    await rm(temporary, { force: true }).catch(() => undefined);
-    throw error;
+  } catch {
+    if (created) {
+      // O_EXCL creation and the record token prove this private path is ours.
+      await unlink(temporary).catch(() => undefined);
+    }
+    throw new Error('activation owner write failed');
   }
 }
 
@@ -258,6 +289,27 @@ async function lockStillOwned(
 ): Promise<boolean> {
   try {
     await assertLock(file, lockPath, expected);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function cleanupClaim(
+  context: ClaimContext,
+  record: ActivationOwnerRecord,
+): Promise<boolean> {
+  try {
+    await assertLock(context.file, context.lockPath, context.lock);
+    const current = await readOwner(context.ownerPath);
+    if (current.status === 'absent') {
+      return true;
+    }
+    if (current.status !== 'valid' || !equalRecord(current.record, record)) {
+      return false;
+    }
+    await unlink(context.ownerPath);
+    await syncDirectory(context.root);
     return true;
   } catch {
     return false;
@@ -320,18 +372,37 @@ type LockResult =
     };
 
 async function openActivationLock(lockPath: string): Promise<LockResult> {
-  let file: FileHandle | undefined;
+  const adapter = new PosixFlockAdapter();
+  const base = adapter.openFlags(globalThis.process.platform);
+  const fresh = base | constants.O_EXCL | constants.O_NONBLOCK;
+  let file: FileHandle;
   try {
-    file = await open(lockPath, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const flock = new PosixFlockAdapter();
-    const native = await flock.lock(file);
+    file = await open(lockPath, fresh, 0o600);
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') {
+      return { status: 'unavailable' };
+    }
+    try {
+      file = await open(lockPath, (base & ~constants.O_CREAT) | constants.O_NONBLOCK);
+    } catch {
+      return { status: 'unavailable' };
+    }
+  }
+  let native: NativeLock | undefined;
+  try {
+    native = await adapter.lock(file);
     if (native === undefined) {
       await file.close();
       return { status: 'busy' };
     }
     return { status: 'ready', file, native, lock: await safeLock(file, lockPath) };
   } catch {
-    await file?.close().catch(() => undefined);
+    try {
+      native?.unlock();
+    } catch {
+      // The descriptor is closed below; this is an unavailable acquisition.
+    }
+    await file.close().catch(() => undefined);
     return { status: 'unavailable' };
   }
 }
@@ -376,15 +447,24 @@ async function claimOwnership(context: ClaimContext): Promise<ClaimResult> {
     return { result: { status: 'cancelled' }, transferred: false };
   }
   const record = recordFor(channel, process, lock);
-  let temporary: string | undefined;
+  const failClaim = async (cancelled: boolean): Promise<ClaimResult> => {
+    const cleaned = await cleanupClaim(context, record);
+    return {
+      result:
+        cancelled && cleaned
+          ? { status: 'cancelled' }
+          : unavailable('activation owner unavailable'),
+      transferred: false,
+    };
+  };
   try {
-    temporary = await writeOwner(root, record);
+    await writeOwner(root, record);
     if (signal?.aborted) {
-      return { result: { status: 'cancelled' }, transferred: false };
+      return failClaim(true);
     }
     const current = await readOwner(ownerPath);
     if (current.status !== 'valid' || !equalRecord(current.record, record)) {
-      return { result: unavailable('activation owner unavailable'), transferred: false };
+      return failClaim(false);
     }
     const lease = leaseFor({ ...context, record });
     if (signal?.aborted) {
@@ -392,8 +472,8 @@ async function claimOwnership(context: ClaimContext): Promise<ClaimResult> {
       return { result: { status: 'cancelled' }, transferred: true };
     }
     return { result: { status: 'held', lease }, transferred: true };
-  } finally {
-    await rm(temporary ?? '', { force: true }).catch(() => undefined);
+  } catch {
+    return failClaim(false);
   }
 }
 

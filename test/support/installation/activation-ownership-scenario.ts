@@ -1,5 +1,4 @@
-import { chmod, open } from 'node:fs/promises';
-import { join } from 'node:path';
+import { chmod } from 'node:fs/promises';
 
 import {
   acquireActivationOwnership,
@@ -11,8 +10,6 @@ import { activationScenario } from './activation-scenario.js';
 export async function activationOwnershipScenario() {
   const prepared = await activationScenario();
   await chmod(prepared.channelRoot, 0o700);
-  const lock = await open(join(prepared.channelRoot, '.activation.lock'), 'wx', 0o600);
-  await lock.close();
 
   const acquire = (): Promise<ActivationOwnership> =>
     acquireActivationOwnership({ channelRoot: prepared.channelRoot, channel: 'stable' });
