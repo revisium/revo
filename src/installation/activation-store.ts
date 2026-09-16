@@ -61,6 +61,24 @@ export type ActivationOutcome =
   | { readonly status: 'cancelled' }
   | { readonly status: 'outcome-unknown' };
 
+export async function preparedActivationGenerationId({
+  channelRoot,
+  candidate,
+  lease,
+  signal,
+}: {
+  readonly channelRoot: string;
+  readonly candidate: ActivationCandidate;
+  readonly lease: ActivationLease;
+  readonly signal?: AbortSignal;
+}): Promise<string | ActivationOutcome> {
+  const root = rootPath(channelRoot);
+  const preparation = await prepareActivation(root, candidate, undefined, lease, signal);
+  if ('status' in preparation) return preparation;
+  const seed = activationSeed(root, candidate, preparation.paths);
+  return createHash('sha256').update(JSON.stringify(seed)).digest('hex');
+}
+
 async function statSafe(path: string, label: string, mode?: number) {
   const value = await lstat(path).catch(() => undefined);
   if (value === undefined || !owner(value) || (mode !== undefined && (value.mode & 0o777) !== mode))
