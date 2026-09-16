@@ -46,6 +46,7 @@ export async function packageArtifactScenario(
     readonly channel?: 'stable' | 'alpha';
     readonly version?: string;
     readonly unsafeTar?: Uint8Array;
+    readonly activationProbe?: boolean;
   } = {},
 ) {
   const fixture = packageReleaseFixture(
@@ -61,6 +62,7 @@ export async function packageArtifactScenario(
     name: '@revisium/revo',
     version: release.version,
     packageManager: `pnpm@${fixture.request.toolchain.pnpm}`,
+    ...(options.activationProbe ? { bin: { revo: 'dist/bin/revo.js' } } : {}),
     dependencies: {
       '@revisium/revo-core': fixture.request.components.core.version,
       '@revisium/revo-admin': fixture.request.components.admin.version,
@@ -74,6 +76,12 @@ export async function packageArtifactScenario(
         'package/': '',
         'package/package.json': packageJson,
         'package/dist/index.js': 'export {}\n',
+        ...(options.activationProbe
+          ? {
+              'package/dist/bin/revo.js':
+                "import { appendFile } from 'node:fs/promises';\nif (process.env.REVO_ACTIVATION_EXIT7) process.exit(7);\nif (process.env.REVO_ACTIVATION_TERM) process.kill(process.pid, 'SIGTERM');\nawait appendFile(process.env.REVO_ACTIVATION_OUTPUT, JSON.stringify({ execPath: process.execPath, argv: process.argv.slice(2), cwd: process.cwd() }) + '\\n');\n",
+            }
+          : {}),
       }),
     packageJson: Buffer.from(packageJson),
     pnpmLock: Buffer.from('lockfileVersion: 9.0\n\nimporters:\n  .: {}\n'),

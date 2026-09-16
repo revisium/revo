@@ -43,6 +43,7 @@ const run = (command: string, args: readonly string[]) =>
 export async function portableToolchain(
   channel: 'stable' | 'alpha' = 'stable',
   releaseVersion?: string,
+  activationProbe = false,
 ) {
   const root = await mkdtemp(join(tmpdir(), 'revo-c3b-'));
   const tools = join(root, 'tools');
@@ -104,6 +105,7 @@ export async function portableToolchain(
   const packages = await packageArtifactScenario({
     channel,
     ...(releaseVersion === undefined ? {} : { version: releaseVersion }),
+    ...(activationProbe ? { activationProbe: true } : {}),
   });
   const input = pnpmReleaseManifestFixture({
     channel,
@@ -237,6 +239,7 @@ export async function portableToolchain(
   };
   return {
     root,
+    plan: packages.plan,
     script,
     runInstaller,
     startInstaller,
@@ -249,6 +252,8 @@ export async function portableToolchain(
     pnpmNodeRecord,
     nodeArchive,
     pnpmArchive,
+    nodeArchiveSha256: nodeSha,
+    pnpmArchiveSha256: pnpmSha,
   };
 }
 

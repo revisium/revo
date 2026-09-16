@@ -15,6 +15,7 @@ import {
 } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
+import { activationLauncher } from './activation-launcher.js';
 import {
   ACTIVATION_RECORD_LIMIT,
   ACTIVATION_SCHEMA,
@@ -75,11 +76,54 @@ async function regular(path: string, label: string, mode: number): Promise<void>
   if (!value.isFile() || value.isSymbolicLink() || value.nlink !== 1)
     throw fail(`${label} is unsafe`);
 }
+async function executable(path: string, label: string): Promise<void> {
+  const value = await statSafe(path, label);
+  if (
+    !value.isFile() ||
+    value.isSymbolicLink() ||
+    value.nlink !== 1 ||
+    (value.mode & 0o500) !== 0o500 ||
+    (value.mode & 0o022) !== 0 ||
+    (value.mode & 0o7000) !== 0
+  )
+    throw fail(`${label} is unsafe`);
+}
 async function regularFile(path: string, label: string): Promise<Uint8Array> {
   const value = await statSafe(path, label);
   if (!value.isFile() || value.isSymbolicLink() || value.nlink !== 1)
     throw fail(`${label} is unsafe`);
   return readFile(path);
+}
+async function readableArtifact(root: string, path: string): Promise<Uint8Array> {
+  const parts = relative(root, path).split('/').filter(Boolean);
+  let current = root;
+  for (const part of parts.slice(0, -1)) {
+    current = join(current, part);
+    await directory(current, 'package bin directory');
+  }
+  const info = await statSafe(path, 'package bin');
+  if (
+    !info.isFile() ||
+    info.isSymbolicLink() ||
+    info.nlink !== 1 ||
+    (info.mode & 0o400) === 0 ||
+    (info.mode & 0o022) !== 0 ||
+    (info.mode & 0o7000) !== 0
+  )
+    throw fail('package bin is unsafe');
+  return readFile(path);
+}
+function declaredBin(value: Record<string, unknown>): string {
+  const bins = value.bin;
+  let result = '';
+  if (typeof bins === 'string') {
+    result = bins;
+  } else if (bins !== null && typeof bins === 'object' && !Array.isArray(bins)) {
+    const revo = (bins as Record<string, unknown>).revo;
+    if (typeof revo === 'string') result = revo;
+  }
+  if (!safeRef(result)) throw fail('package bin is invalid');
+  return result;
 }
 async function sync(path: string): Promise<void> {
   const file = await open(path, 'r');
@@ -143,6 +187,7 @@ async function validateActivePackage(root: string, value: ActivationRecord): Pro
   ) as Record<string, unknown>;
   if (packageJson.name !== value.release.npm.name || packageJson.version !== value.release.version)
     throw fail('prepared package identity differs');
+  if (declaredBin(packageJson) !== value.packageBin) throw fail('package bin differs');
   for (const [name, path] of Object.entries({
     packageJson: 'package.json',
     pnpmLock: 'pnpm-lock.yaml',
@@ -177,16 +222,22 @@ async function validateCandidate(candidate: ActivationCandidate, root: string) {
     throw fail('candidate paths are incompatible');
   if ((await readPreparedPackage(root, candidate.plan)) !== packageDirectory)
     throw fail('prepared package is unavailable');
-  await regular(join(packageDirectory, candidate.packageBin), 'package bin', 0o755);
+  const packageJson = JSON.parse(
+    new TextDecoder().decode(
+      await regularFile(join(packageDirectory, 'package.json'), 'package.json'),
+    ),
+  ) as Record<string, unknown>;
+  if (declaredBin(packageJson) !== candidate.packageBin) throw fail('package bin differs');
+  await readableArtifact(root, join(packageDirectory, candidate.packageBin));
   await directory(nodeDirectory, 'Node target');
-  await regular(join(nodeDirectory, 'bin', 'node'), 'Node executable', 0o755);
+  await executable(join(nodeDirectory, 'bin', 'node'), 'Node executable');
   await receipt(join(nodeDirectory, 'install-receipt.json'), {
     version: candidate.plan.toolchain.node,
     target: `${candidate.plan.target.platform}-${candidate.plan.target.arch}`,
     archiveSha256: candidate.nodeArchiveSha256,
   });
   await directory(pnpmDirectory, 'pnpm target');
-  await regular(join(pnpmDirectory, 'pnpm'), 'pnpm executable', 0o755);
+  await executable(join(pnpmDirectory, 'pnpm'), 'pnpm executable');
   await receipt(join(pnpmDirectory, 'install-receipt.json'), {
     schemaVersion: 'revo-pnpm-bootstrap/v1',
     version: candidate.plan.toolchain.pnpm,
@@ -217,17 +268,19 @@ async function inspect(root: string, generationId: string): Promise<ActivationRe
     )
       throw fail('activation references are unsafe');
     await regular(join(directoryPath, 'revo'), 'activation entrypoint', 0o700);
+    if ((await readFile(join(directoryPath, 'revo'), 'utf8')) !== activationLauncher(root, value))
+      throw fail('activation entrypoint differs');
     await validateActivePackage(root, value);
-    await regular(join(root, value.packageRef, value.packageBin), 'package bin', 0o755);
+    await readableArtifact(root, join(root, value.packageRef, value.packageBin));
     await directory(join(root, value.toolchain.nodeRef), 'Node target');
-    await regular(join(root, value.toolchain.nodeRef, 'bin', 'node'), 'Node executable', 0o755);
+    await executable(join(root, value.toolchain.nodeRef, 'bin', 'node'), 'Node executable');
     await receipt(join(root, value.toolchain.nodeRef, 'install-receipt.json'), {
       version: value.toolchain.nodeVersion,
       target: `${value.target.platform}-${value.target.arch}`,
       archiveSha256: value.toolchain.nodeArchiveSha256,
     });
     await directory(join(root, value.toolchain.pnpmRef), 'pnpm target');
-    await regular(join(root, value.toolchain.pnpmRef, 'pnpm'), 'pnpm executable', 0o755);
+    await executable(join(root, value.toolchain.pnpmRef, 'pnpm'), 'pnpm executable');
     await receipt(join(root, value.toolchain.pnpmRef, 'install-receipt.json'), {
       schemaVersion: 'revo-pnpm-bootstrap/v1',
       version: value.toolchain.pnpmVersion,
@@ -276,10 +329,6 @@ function expectedGeneration(
   if (value.status === 'absent') return null;
   return undefined;
 }
-function entrypoint(value: ActivationRecord): string {
-  return `#!/usr/bin/env node\nimport { spawn } from 'node:child_process';\nimport { dirname, join } from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst root = dirname(dirname(fileURLToPath(import.meta.url)));\nconst node = join(root, ${JSON.stringify(value.toolchain.nodeRef)}, 'bin', 'node');\nconst bin = join(root, ${JSON.stringify(value.packageRef)}, ${JSON.stringify(value.packageBin)});\nconst child = spawn(node, [bin, ...process.argv.slice(2)], { stdio: 'inherit' });\nchild.once('error', () => process.exit(1));\nchild.once('close', (code, signal) => signal ? process.kill(process.pid, signal) : process.exit(code ?? 1));\n`;
-}
-
 type ActivationPreparation = {
   current: ActivationReadResult;
   expected: string | null | undefined;
@@ -377,7 +426,10 @@ async function stageGeneration(
     mode: 0o600,
     flag: 'wx',
   });
-  await writeFile(join(temporary, 'revo'), entrypoint(finalRecord), { mode: 0o700, flag: 'wx' });
+  await writeFile(join(temporary, 'revo'), activationLauncher(root, finalRecord), {
+    mode: 0o700,
+    flag: 'wx',
+  });
   await sync(join(temporary, 'activation.json'));
   await sync(join(temporary, 'revo'));
   await sync(temporary);
