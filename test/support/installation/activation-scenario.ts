@@ -1,5 +1,15 @@
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -91,6 +101,8 @@ export async function activationScenario() {
     next,
     activate,
     activateNext: () => activatePreparedInstallation({ channelRoot, candidate: next, lease }),
+    activateCandidate: (value: ActivationCandidate) =>
+      activatePreparedInstallation({ channelRoot, candidate: value, lease }),
     competitor: () =>
       activatePreparedInstallation({
         channelRoot,
@@ -105,13 +117,26 @@ export async function activationScenario() {
       }
       return value.record.generationId;
     },
-    currentGenerationPath: async () => {
-      const generation = await readlink(join(channelRoot, 'current'));
-      return join(channelRoot, generation);
+    currentGenerationPath: async () =>
+      join(channelRoot, await readlink(join(channelRoot, 'current'))),
+    readEntrypoint: async () =>
+      readFile(join(channelRoot, await readlink(join(channelRoot, 'current')), 'revo'), 'utf8'),
+    setPackageBinMode: (mode: number) =>
+      chmod(join(first.packageDirectory, first.packageBin), mode),
+    setNodeMode: (mode: number) => chmod(join(first.nodeDirectory, 'bin', 'node'), mode),
+    setPnpmMode: (mode: number) => chmod(join(first.pnpmDirectory, 'pnpm'), mode),
+    tamperPackageBin: async () => {
+      await rm(join(first.packageDirectory, first.packageBin));
+      await symlink(join(root, 'outside'), join(first.packageDirectory, first.packageBin));
     },
-    readEntrypoint: async () => {
+    tamperPackageBinAncestor: async () => {
+      const directory = join(first.packageDirectory, 'bin');
+      await rm(directory, { recursive: true, force: true });
+      await symlink(join(root, 'outside-directory'), directory);
+    },
+    tamperLauncher: async () => {
       const generation = await readlink(join(channelRoot, 'current'));
-      return readFile(join(channelRoot, generation, 'revo'), 'utf8');
+      await writeFile(join(channelRoot, generation, 'revo'), '#!/bin/sh\nexit 0\n');
     },
     previousTarget: () => first.packageDirectory,
     snapshot: async () => ({
