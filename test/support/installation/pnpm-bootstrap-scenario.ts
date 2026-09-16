@@ -1,8 +1,9 @@
-import { spawn } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 type ChildResult = {
   readonly code: number | null;
@@ -10,12 +11,15 @@ type ChildResult = {
   readonly stdout: string;
   readonly stderr: string;
 };
+type NodeAttempt = { readonly stage: string; readonly executable: string };
+type NodeInput = Record<string, unknown>;
 
 export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unknown) {
   const root = await mkdtemp(join(tmpdir(), 'revo-bootstrap-data-'));
   const dataPath = join(root, 'bootstrap.json');
   const receiptPath = join(root, 'install-receipt.json');
   const nodeExecutable = join(root, 'node');
+  const nodeStage = join(root, 'node-stage');
   await writeFile(nodeExecutable, '#!/bin/sh\nexit 0\n');
   await chmod(nodeExecutable, 0o755);
   const write = (value: unknown) =>
@@ -43,6 +47,38 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
     dataPath,
     receiptPath,
     nodeExecutable,
+    nodeStage,
+    prepareNodeStage: async (label = '') => {
+      const stage = label === '' ? nodeStage : join(root, `node-stage-${label}`);
+      await mkdir(stage, { recursive: true });
+      const executable = join(stage, 'node');
+      await writeFile(executable, `#!/bin/sh\nprintf '%s\\n' '${process.versions.node}'\n`);
+      await chmod(executable, 0o755);
+      return { stage, executable };
+    },
+    publishNodeTogether: async (attempts: NodeAttempt[], input: NodeInput) => {
+      const script = fileURLToPath(new URL('./node-publication-process.mjs', import.meta.url));
+      const children = attempts.map(() =>
+        fork(script, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] }),
+      );
+      await Promise.all(
+        children.map(
+          (child) => new Promise<void>((resolve) => child.once('message', () => resolve())),
+        ),
+      );
+      const outcomes = children.map(
+        (child, index) =>
+          new Promise<{ readonly ok: boolean; readonly result?: unknown }>((resolve) => {
+            const attempt = attempts[index];
+            if (attempt === undefined) {
+              throw new Error('node publication attempt is missing');
+            }
+            child.once('message', resolve);
+            child.send({ ...input, stage: attempt.stage });
+          }),
+      );
+      return Promise.all(outcomes);
+    },
     write,
     receipt: async () => readFile(receiptPath, 'utf8').catch(() => undefined),
     receiptMode: async () =>

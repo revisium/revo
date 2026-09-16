@@ -199,6 +199,9 @@ export function decodeBootstrap(value, options) {
 }
 
 const acquisitionFailure = (stage, reason) => new Error(`pnpm ${stage}: ${reason}`);
+const nodeFailure = (stage, reason) => new Error(`node ${stage}: ${reason}`);
+const errorCode = (error) =>
+  error && typeof error === 'object' && typeof error.code === 'string' ? error.code : undefined;
 const policyFor = (value = {}) => {
   if (!record(value)) throw acquisitionFailure('validate', 'policy must be an object');
   const policy = { ...DEFAULT_PNPM_POLICY, ...value };
@@ -589,10 +592,23 @@ async function targetParents(target, root) {
   let current = base;
   for (const part of suffix.split('/').filter(Boolean)) {
     current = join(current, part);
-    const info = await lstat(current).catch(() => undefined);
+    let info = await lstat(current).catch((error) => {
+      if (errorCode(error) === 'ENOENT') return undefined;
+      throw acquisitionFailure('validate', 'target ancestor is unavailable');
+    });
     if (info !== undefined && (!info.isDirectory() || info.isSymbolicLink()))
       throw acquisitionFailure('validate', 'target ancestor is unsafe');
-    if (info === undefined) await mkdir(current, { mode: 0o700 });
+    if (info === undefined) {
+      try {
+        await mkdir(current, { mode: 0o700 });
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST')
+          throw acquisitionFailure('validate', 'target ancestor is unavailable');
+        info = await lstat(current).catch(() => undefined);
+        if (info === undefined || !info.isDirectory() || info.isSymbolicLink())
+          throw acquisitionFailure('validate', 'target ancestor is unsafe');
+      }
+    }
   }
 }
 const pnpmReceipt = (bootstrap, archive, platform, arch) => ({
@@ -604,13 +620,19 @@ const pnpmReceipt = (bootstrap, archive, platform, arch) => ({
   archiveSha256: archive.sha256,
 });
 async function existingTarget(target, expected, policy, signal) {
-  const info = await lstat(target).catch(() => undefined);
+  const info = await lstat(target).catch((error) => {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw acquisitionFailure('reuse', 'target is unavailable');
+  });
   if (info === undefined) return undefined;
   if (!info.isDirectory() || info.isSymbolicLink())
     throw acquisitionFailure('reuse', 'target is unsafe');
   const executablePath = await safeLayout(target);
   const receiptPath = join(target, 'install-receipt.json');
-  const receiptInfo = await lstat(receiptPath).catch(() => undefined);
+  const receiptInfo = await lstat(receiptPath).catch((error) => {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw acquisitionFailure('reuse', 'receipt is unavailable');
+  });
   if (
     receiptInfo === undefined ||
     !receiptInfo.isFile() ||
@@ -719,13 +741,27 @@ export async function provisionPnpm({
     } finally {
       await file.close();
     }
-    const appeared = await lstat(target).catch(() => undefined);
-    if (appeared !== undefined)
-      throw acquisitionFailure('publish', 'target appeared before publication');
+    const appeared = await existingTarget(target, expected, policy, signal);
+    if (appeared !== undefined) {
+      onProgress?.('reuse');
+      return { executablePath: appeared, version: decoded.bootstrap.pnpmVersion, reused: true };
+    }
     try {
       await rename(acquired.directory, target);
     } catch (error) {
-      if (error?.code === 'EXDEV')
+      if (errorCode(error) === 'EEXIST' || errorCode(error) === 'ENOTEMPTY') {
+        const winner = await existingTarget(target, expected, policy, signal);
+        if (winner !== undefined) {
+          onProgress?.('reuse');
+          return {
+            executablePath: winner,
+            version: decoded.bootstrap.pnpmVersion,
+            reused: true,
+          };
+        }
+        throw acquisitionFailure('publish', 'existing target is incompatible');
+      }
+      if (errorCode(error) === 'EXDEV')
         throw acquisitionFailure('publish', 'atomic rename crossed filesystems');
       throw acquisitionFailure('publish', 'atomic rename failed');
     }
@@ -739,6 +775,176 @@ export async function provisionPnpm({
     version: decoded.bootstrap.pnpmVersion,
     reused: false,
   };
+}
+
+const nodeReceipt = (bootstrap, archive, platform, arch) => ({
+  version: bootstrap.nodeVersion,
+  target: `${platform}-${arch}`,
+  archiveSha256: archive.sha256,
+});
+const nodeTarget = (root, bootstrap, platform, arch) =>
+  join(root, 'node', bootstrap.nodeVersion, `${platform}-${arch}`);
+const expectedNodeReceipt = (value, platform, arch) =>
+  nodeReceipt(value.bootstrap, value.nodeArchive, platform, arch);
+
+async function stagedNode(stage, expected) {
+  const info = await lstat(stage).catch(() => undefined);
+  if (info === undefined || !info.isDirectory() || info.isSymbolicLink())
+    throw nodeFailure('validate', 'stage is unsafe');
+  const entries = (await readdir(stage)).sort();
+  if (JSON.stringify(entries) !== JSON.stringify(['install-receipt.json', 'node']))
+    throw nodeFailure('validate', 'stage contents are invalid');
+  const executable = join(stage, 'node');
+  const nodeInfo = await lstat(executable).catch(() => undefined);
+  const receiptPath = join(stage, 'install-receipt.json');
+  const receiptInfo = await lstat(receiptPath).catch(() => undefined);
+  if (
+    nodeInfo === undefined ||
+    !nodeInfo.isFile() ||
+    nodeInfo.isSymbolicLink() ||
+    (nodeInfo.mode & 0o111) === 0 ||
+    receiptInfo === undefined ||
+    !receiptInfo.isFile() ||
+    receiptInfo.isSymbolicLink() ||
+    (receiptInfo.mode & 0o777) !== 0o600
+  )
+    throw nodeFailure('validate', 'stage metadata is unsafe');
+  let found;
+  try {
+    found = JSON.parse(await readFile(receiptPath, 'utf8'));
+  } catch {
+    throw nodeFailure('validate', 'stage receipt is corrupt');
+  }
+  if (
+    !record(found) ||
+    Object.keys(found).length !== Object.keys(expected).length ||
+    JSON.stringify(found) !== JSON.stringify(expected)
+  )
+    throw nodeFailure('validate', 'stage receipt is incompatible');
+  return executable;
+}
+
+async function nodeStageBoundary(stage, root) {
+  const suffix = relative(root, stage);
+  if (suffix === '' || (!suffix.startsWith('..') && !isAbsolute(suffix)))
+    throw nodeFailure('validate', 'stage must be outside channelRoot');
+  const [stageReal, rootReal] = await Promise.all([
+    realpath(stage).catch(() => undefined),
+    realpath(root).catch(() => undefined),
+  ]);
+  if (
+    stageReal === undefined ||
+    rootReal === undefined ||
+    (!relative(rootReal, stageReal).startsWith('..') && !isAbsolute(relative(rootReal, stageReal)))
+  )
+    throw nodeFailure('validate', 'stage boundary is unsafe');
+}
+
+async function existingNodeTarget(target, expected, policy, signal) {
+  const info = await lstat(target).catch((error) => {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw nodeFailure('reuse', 'target is unavailable');
+  });
+  if (info === undefined) return undefined;
+  if (!info.isDirectory() || info.isSymbolicLink()) throw nodeFailure('reuse', 'target is unsafe');
+  const executable = join(target, 'node');
+  const nodeInfo = await lstat(executable).catch(() => undefined);
+  const receiptPath = join(target, 'install-receipt.json');
+  const receiptInfo = await lstat(receiptPath).catch(() => undefined);
+  if (
+    nodeInfo === undefined ||
+    !nodeInfo.isFile() ||
+    nodeInfo.isSymbolicLink() ||
+    (nodeInfo.mode & 0o111) === 0 ||
+    receiptInfo === undefined ||
+    !receiptInfo.isFile() ||
+    receiptInfo.isSymbolicLink() ||
+    (receiptInfo.mode & 0o777) !== 0o600
+  )
+    throw nodeFailure('reuse', 'target is unsafe');
+  let found;
+  try {
+    found = JSON.parse(await readFile(receiptPath, 'utf8'));
+  } catch {
+    throw nodeFailure('reuse', 'target receipt is corrupt');
+  }
+  if (
+    !record(found) ||
+    Object.keys(found).length !== Object.keys(expected).length ||
+    JSON.stringify(found) !== JSON.stringify(expected)
+  )
+    throw nodeFailure('reuse', 'target receipt is incompatible');
+  try {
+    const output = await runProcess(
+      executable,
+      ['--version'],
+      'probe',
+      policy.probeTimeoutMs,
+      policy,
+      signal,
+    );
+    if (output.trim() !== expected.version)
+      throw nodeFailure('probe', 'Node version does not match');
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('node ')) throw error;
+    throw nodeFailure('probe', 'Node version could not be verified');
+  }
+  return executable;
+}
+
+/** Publish or reuse a verified staged Node target; no archive verification is performed here. */
+export async function publishNodeBootstrap({
+  bootstrap,
+  stage,
+  channelRoot,
+  platform,
+  arch,
+  signal,
+  policy: inputPolicy,
+  onProgress,
+} = {}) {
+  if (platform === 'win32')
+    throw nodeFailure('validate', 'Windows Node publication is unsupported');
+  if (!TARGETS.some(([itemPlatform, itemArch]) => itemPlatform === platform && itemArch === arch))
+    throw nodeFailure('validate', 'unsupported target');
+  if (signal?.aborted) throw nodeFailure('validate', 'cancelled');
+  const policy = policyFor(inputPolicy);
+  const decoded =
+    record(bootstrap) && record(bootstrap.bootstrap) && bootstrap.nodeArchive !== undefined
+      ? bootstrap
+      : decodeBootstrap(bootstrap, { platform, arch, nodeVersion: process.versions.node });
+  const root = absolutePath(channelRoot, 'channelRoot');
+  const stagePath = absolutePath(stage, 'stage');
+  const target = nodeTarget(root, decoded.bootstrap, platform, arch);
+  await nodeStageBoundary(stagePath, root);
+  await targetParents(target, root);
+  onProgress?.('validate');
+  const expected = expectedNodeReceipt(decoded, platform, arch);
+  const reused = await existingNodeTarget(target, expected, policy, signal);
+  if (reused !== undefined) {
+    onProgress?.('probe');
+    onProgress?.('reuse');
+    return { directory: target, executablePath: reused, reused: true };
+  }
+  await stagedNode(stagePath, expected);
+  if (signal?.aborted) throw nodeFailure('validate', 'cancelled');
+  onProgress?.('probe');
+  try {
+    await rename(stagePath, target);
+  } catch (error) {
+    if (errorCode(error) === 'EEXIST' || errorCode(error) === 'ENOTEMPTY') {
+      const winner = await existingNodeTarget(target, expected, policy, signal);
+      if (winner !== undefined) {
+        onProgress?.('reuse');
+        return { directory: target, executablePath: winner, reused: true };
+      }
+    }
+    if (errorCode(error) === 'EXDEV')
+      throw nodeFailure('publish', 'atomic rename crossed filesystems');
+    throw nodeFailure('publish', 'atomic rename failed');
+  }
+  onProgress?.('publish');
+  return { directory: target, executablePath: join(target, 'node'), reused: false };
 }
 
 function targetParts(target) {
