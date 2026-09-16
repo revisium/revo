@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   cleanupPortableToolchain,
@@ -94,7 +94,12 @@ describe('generated POSIX toolchain installer', () => {
     try {
       await writeFile(hold, 'hold');
       const running = subject.startInstaller({ REVO_CURL_HOLD: hold });
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await vi.waitFor(
+        async () => {
+          expect(await readFile(subject.calls, 'utf8')).toHaveLength(1);
+        },
+        { timeout: 5000, interval: 10 },
+      );
       running.child.kill('SIGINT');
       expect(await running.finish).toBe(130);
     } finally {

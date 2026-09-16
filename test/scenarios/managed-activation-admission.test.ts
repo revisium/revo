@@ -241,4 +241,43 @@ describe('managed activation admission', () => {
       await s.release();
     }
   });
+
+  it('rejects an old child after a competing generation commits', async () => {
+    const ownership = await new OwnershipScenario().setup();
+    const s = await managedActivationScenario({ dataDir: ownership.dataDir() });
+    const child = await ownership.owner();
+    try {
+      await expect(s.activate()).resolves.toMatchObject({ status: 'activated' });
+      const oldGeneration = await s.currentGeneration();
+      const pending = child.request('start-stale-server', undefined, {
+        configuration: {
+          dataDir: s.stableData,
+          logDir: s.stableData,
+          runtimeDir: s.stableData,
+          version: '1.0.0',
+          channel: 'stable',
+          activation: { channelRoot: s.channelRoot, generationId: oldGeneration },
+        },
+      });
+      await expect(pending).resolves.toMatchObject({ phase: 'before-server-acquire' });
+      await expect(s.activateNext()).resolves.toMatchObject({ status: 'activated' });
+      await expect(child.request('continue-stale-server')).resolves.toMatchObject({
+        continued: true,
+      });
+      await expect(child.request('wait-activation')).resolves.toMatchObject({
+        outcome: { status: 'rejected', ownership: 'released' },
+      });
+      expect(await s.currentGeneration()).not.toBe(oldGeneration);
+      const released = await ownership.acquire(s.stableData);
+      expect(released.kind).toBe('held');
+      if (released.kind === 'held') {
+        await released.release();
+      }
+    } finally {
+      await child.request('continue-stale-server').catch(() => undefined);
+      await child.kill().catch(() => undefined);
+      await s.release();
+      await ownership.cleanup();
+    }
+  });
 });
