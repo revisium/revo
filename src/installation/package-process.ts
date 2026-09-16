@@ -1,7 +1,7 @@
 // oxlint-disable curly -- compact process state transitions stay bounded and explicit
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { open, rm } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 
 import type { PnpmProgressSink } from './pnpm-progress.js';
 
@@ -61,12 +61,6 @@ const groupSignal = (child: Spawned, signal: NodeJS.Signals, platform = process.
     if (code !== 'ESRCH') throw cause;
   }
 };
-const wait = (child: Spawned): Promise<{ code: number | null; signal: NodeJS.Signals | null }> =>
-  new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
-
 export async function runPackageProcess /* NOSONAR -- bounded process state machine */({
   executable,
   args,
@@ -101,98 +95,127 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
   const err = { bytes: 0, text: '' };
   let child: Spawned | undefined;
   let timer: NodeJS.Timeout | undefined;
-  let stopping = false;
+  let state: 'not-launched' | 'running' | 'stopping' | 'closed' | 'unconfirmed' = 'not-launched';
   let outputOverflow = false;
   let stopFailure: Error | undefined;
   let stopReason: string | undefined;
   let logFailure: Error | undefined;
   let progressFinished = false;
+  let cleanupListeners = (): void => undefined;
+  let abortListener: (() => void) | undefined;
+  const writes: Promise<void>[] = [];
+  let spawnError: unknown;
+  let resolveClose!: (result: { code: number | null; signal: NodeJS.Signals | null }) => void;
+  const closePromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve) => {
+      resolveClose = resolve;
+    },
+  );
+  let rejectStop!: (cause: Error) => void;
+  const stopSignal = new Promise<never>((_, reject) => {
+    rejectStop = reject;
+  });
+  void stopSignal.catch(() => undefined);
   try {
-    child = spawnProcess(executable, args, {
-      cwd,
-      env: { ...env },
-      shell: false,
-      detached: platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stopProcess: ((reason: string) => Promise<void>) | undefined;
+    if (signal?.aborted) throw failure('cancelled');
+    try {
+      child = spawnProcess(executable, args, {
+        cwd,
+        env: { ...env },
+        shell: false,
+        detached: platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      throw failure('spawn failed');
+    }
+    state = 'running';
+    const launchedChild = child;
+    if (launchedChild === undefined) throw failure('spawn failed');
+    let stopPromise: Promise<void> | undefined;
+    const stop = async (reason: string): Promise<void> => {
+      if (stopPromise !== undefined) return stopPromise;
+      if (state === 'closed' || state === 'unconfirmed') return;
+      stopReason ??= reason;
+      state = 'stopping';
+      stopPromise = (async () => {
+        groupSignal(launchedChild, 'SIGTERM', platform);
+        const exited = await Promise.race([
+          closePromise.then(() => true),
+          new Promise<boolean>((resolve) =>
+            setTimeout(() => resolve(false), policy.terminationGraceMs),
+          ),
+        ]);
+        if (exited) return;
+        groupSignal(launchedChild, 'SIGKILL', platform);
+        const killed = await Promise.race([
+          closePromise.then(() => true),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), policy.killWaitMs)),
+        ]);
+        if (!killed) {
+          state = 'unconfirmed';
+          throw failure('process completion could not be confirmed');
+        }
+      })();
+      stopPromise.catch((cause: unknown) => {
+        stopFailure = cause instanceof Error ? cause : failure('process stop failed');
+        rejectStop(stopFailure);
+      });
+      return stopPromise;
+    };
     const output = (kind: 'stdout' | 'stderr', chunk: unknown): void => {
-      const state = kind === 'stdout' ? out : err;
-      const before = state.bytes;
-      const text = append(chunk, state, policy.maxDiagnosticBytes);
+      const streamState = kind === 'stdout' ? out : err;
+      const before = streamState.bytes;
+      const text = append(chunk, streamState, policy.maxDiagnosticBytes);
       if (
-        state.bytes > policy.maxDiagnosticBytes ||
+        streamState.bytes > policy.maxDiagnosticBytes ||
         before + Buffer.from(String(chunk)).length > policy.maxDiagnosticBytes
       ) {
         outputOverflow = true;
-        void (stopProcess?.('diagnostic output exceeded its bound') ?? Promise.resolve()).catch(
-          (cause: unknown) => {
-            stopFailure = cause instanceof Error ? cause : failure('process stop failed');
-          },
-        );
+        void stop('diagnostic output exceeded its bound').catch(() => undefined);
       }
-      void file.write(`${kind}: ${text}`).catch((cause: unknown) => {
-        logFailure = cause instanceof Error ? cause : failure('diagnostic log failed');
-        void (stopProcess?.('diagnostic log failed') ?? Promise.resolve()).catch(
-          (error_: unknown) => {
-            stopFailure = error_ instanceof Error ? error_ : failure('process stop failed');
-          },
-        );
-      });
+      writes.push(
+        file
+          .write(`${kind}: ${text}`)
+          .catch((cause: unknown) => {
+            logFailure = cause instanceof Error ? cause : failure('diagnostic log failed');
+            return stop('diagnostic log failed').catch(() => undefined);
+          })
+          .then(() => undefined),
+      );
       progress?.feed(chunk instanceof Uint8Array ? chunk : String(chunk));
     };
-    child.stdout?.on('data', (chunk) => output('stdout', chunk));
-    child.stderr?.on('data', (chunk) => output('stderr', chunk));
-    const completion = wait(child);
-    const stop = async (reason: string): Promise<void> => {
-      if (stopping || child === undefined) return;
-      stopping = true;
-      stopReason = reason;
-      groupSignal(child, 'SIGTERM', platform);
-      const exited = await Promise.race([
-        completion.then(
-          () => true,
-          () => true,
-        ),
-        new Promise<boolean>((resolve) =>
-          setTimeout(() => resolve(false), policy.terminationGraceMs),
-        ),
-      ]);
-      if (!exited) {
-        groupSignal(child, 'SIGKILL', platform);
-        await Promise.race([
-          completion,
-          new Promise((_, reject) =>
-            setTimeout(
-              () => reject(failure(`${reason}; process did not drain`)),
-              policy.killWaitMs,
-            ),
-          ),
-        ]);
-      }
+    const abort = () => void stop('cancelled').catch(() => undefined);
+    const onError = (cause: unknown) => {
+      spawnError = cause;
+      void stop('spawn failed').catch(() => undefined);
     };
-    stopProcess = stop;
-    const abort = () =>
-      void stop('cancelled').catch((cause: unknown) => {
-        stopFailure = cause instanceof Error ? cause : failure('process stop failed');
-      });
+    const onClose = (code: number | null, closeSignal: NodeJS.Signals | null) => {
+      state = 'closed';
+      resolveClose({ code, signal: closeSignal });
+    };
+    abortListener = abort;
+    child.once('error', onError);
+    child.once('close', onClose);
+    const stdoutListener = (chunk: unknown) => output('stdout', chunk);
+    const stderrListener = (chunk: unknown) => output('stderr', chunk);
+    launchedChild.stdout?.on('data', stdoutListener);
+    launchedChild.stderr?.on('data', stderrListener);
+    cleanupListeners = () => {
+      launchedChild.removeListener('error', onError);
+      launchedChild.removeListener('close', onClose);
+      launchedChild.stdout?.removeListener('data', stdoutListener);
+      launchedChild.stderr?.removeListener('data', stderrListener);
+    };
     signal?.addEventListener('abort', abort, { once: true });
-    timer = setTimeout(
-      () =>
-        void stop('timed out').catch((cause: unknown) => {
-          stopFailure = cause instanceof Error ? cause : failure('process stop failed');
-        }),
-      policy.timeoutMs,
-    );
-    const result = await completion.catch((cause) => {
-      progress?.finish({ exitCode: 1, signal: null });
-      progressFinished = true;
-      throw failure(cause instanceof Error ? cause.message : 'spawn failed');
-    });
+    if (signal?.aborted) void stop('cancelled').catch(() => undefined);
+    timer = setTimeout(() => void stop('timed out').catch(() => undefined), policy.timeoutMs);
+    const result = await Promise.race([closePromise, stopSignal]);
+    await Promise.all(writes);
     progress?.finish({ exitCode: result.code, signal: result.signal });
     progressFinished = true;
-    signal?.removeEventListener('abort', abort);
     if (signal?.aborted) throw failure('cancelled');
+    if (spawnError !== undefined) throw failure('spawn failed');
     if (outputOverflow) throw failure('diagnostic output exceeded its bound');
     if (logFailure !== undefined) throw logFailure;
     if (stopFailure !== undefined) throw stopFailure;
@@ -206,9 +229,10 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
     };
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (abortListener !== undefined) signal?.removeEventListener('abort', abortListener);
     await file.close().catch(() => undefined);
     if (!progressFinished) progress?.finish({ exitCode: 1, signal: null });
-    if (child === undefined) await rm(diagnosticPath, { force: true }).catch(() => undefined);
+    cleanupListeners();
   }
 }
 
