@@ -41,10 +41,14 @@ class Owner implements ServerHostOwnerPort {
   readonly startEntered = new Deferred<void>();
   private readonly startResult = new Deferred<{ readonly kind: 'ready'; readonly url: string }>();
   private readonly ownerOutcome = new Deferred<ServerOwnerOutcome>();
+  private startError: unknown;
 
   start(_signal: AbortSignal) {
     this.startCalls += 1;
     this.startEntered.resolve();
+    if (this.startError !== undefined) {
+      return Promise.reject(this.startError);
+    }
     return this.startResult.promise;
   }
   close() {
@@ -62,6 +66,9 @@ class Owner implements ServerHostOwnerPort {
   }
   becomeReady() {
     this.startResult.resolve({ kind: 'ready', url: 'http://127.0.0.1:3210' });
+  }
+  failStart(error: unknown) {
+    this.startError = error;
   }
   complete(outcome: ServerOwnerOutcome) {
     this.ownerOutcome.resolve(outcome);

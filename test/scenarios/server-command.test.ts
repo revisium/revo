@@ -299,6 +299,11 @@ describe('server command requests and failures', () => {
   );
 
   it.each([
+    {
+      error: launchError('REVO_ACTIVATION_STATE_INCOMPATIBLE'),
+      stderr:
+        'Installation activation format is incompatible. Keep your data and reinstall into a new installation directory.\n',
+    },
     { error: launchError('START_BUSY'), stderr: 'Server start is busy.\n' },
     { error: launchError('START_CANCELLED'), stderr: CANCELLED },
     { error: new ManagedProcessError('revo.process.cancelled', 'cancelled'), stderr: CANCELLED },

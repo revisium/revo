@@ -20,6 +20,7 @@ import type {
   ProcessMessage,
   StopProcessRequest,
 } from '../../../src/processes/managed-process.types.js';
+import type { ServerOwnership } from '../../../src/processes/ownership.types.js';
 import {
   PublishedControlError,
   PublishedControlService,
@@ -66,6 +67,110 @@ export class ServerOwnerScenario {
       mkdir(join(this.root, 'xdg'), { mode: 0o700 }),
     ]);
     return this;
+  }
+
+  async rejectsStaleActivationBeforeLifecycle(): Promise<boolean> {
+    let rejected = false;
+    try {
+      await new ServerOwnerService().open({
+        configuration: {
+          dataDir: this.dataDir,
+          logDir: join(this.root, 'logs'),
+          runtimeDir: this.runtimeDir,
+          version: '1.2.3',
+          channel: 'stable',
+          host: '127.0.0.1',
+          port: 3210,
+          publicUrl: 'http://127.0.0.1:3210',
+          startupTimeout: STARTUP_MILLISECONDS,
+          activation: { channelRoot: join(this.root, 'channel'), generationId: 'a'.repeat(64) },
+        },
+        environment: {},
+        operationId: 'a'.repeat(32),
+      });
+    } catch (error) {
+      rejected = error instanceof PublishedControlError && error.ownership === 'released';
+    }
+    if (!rejected) {
+      return false;
+    }
+    const lease = await new ServerOwnershipService().acquire(this.dataDir);
+    if (lease.kind !== 'held') {
+      return false;
+    }
+    await lease.release();
+    return true;
+  }
+
+  async rejectsMissingActivationBeforeLifecycle(): Promise<boolean> {
+    const channelRoot = join(this.root, 'channel');
+    await mkdir(channelRoot, { mode: 0o700 });
+    let rejected = false;
+    try {
+      await new ServerOwnerService().open({
+        configuration: {
+          dataDir: this.dataDir,
+          logDir: join(this.root, 'logs'),
+          runtimeDir: this.runtimeDir,
+          version: '1.2.3',
+          channel: 'stable',
+          host: '127.0.0.1',
+          port: 3210,
+          publicUrl: 'http://127.0.0.1:3210',
+          startupTimeout: STARTUP_MILLISECONDS,
+          activation: { channelRoot, generationId: 'a'.repeat(64) },
+        },
+        environment: {},
+        operationId: 'a'.repeat(32),
+      });
+    } catch (error) {
+      rejected = error instanceof PublishedControlError && error.ownership === 'released';
+    }
+    if (!rejected) {
+      return false;
+    }
+    const lease = await new ServerOwnershipService().acquire(this.dataDir);
+    if (lease.kind !== 'held') {
+      return false;
+    }
+    await lease.release();
+    return true;
+  }
+
+  async reportsUnconfirmedActivationCleanup(): Promise<boolean> {
+    const channelRoot = join(this.root, 'channel-unconfirmed');
+    await mkdir(channelRoot, { mode: 0o700 });
+    const ownership = new (class extends ServerOwnershipService {
+      override async acquire(): Promise<ServerOwnership> {
+        return {
+          kind: 'held',
+          lockPath: 'test',
+          release: async () => {
+            throw new Error('release');
+          },
+        };
+      }
+    })();
+    try {
+      await new PublishedControlService(ownership).open({
+        dataDir: this.dataDir,
+        logDir: join(this.root, 'logs'),
+        runtimeDir: this.runtimeDir,
+        version: '1.2.3',
+        channel: 'stable',
+        onStop: () => undefined,
+        afterOwnershipAcquired: () => {
+          throw new Error('activation guard');
+        },
+      });
+      return false;
+    } catch (error) {
+      return (
+        error instanceof PublishedControlError &&
+        error.ownership === 'unconfirmed' &&
+        error.cleanupFailures.includes('ownership')
+      );
+    }
   }
 
   async startsEmbedded() {

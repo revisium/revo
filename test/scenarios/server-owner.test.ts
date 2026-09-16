@@ -22,6 +22,18 @@ describe('Server owner composition', () => {
     await expect(scenario.resolvesServerOwnerThroughNest()).resolves.toBe(true);
   });
 
+  it('rejects a stale activation before lifecycle resources start', async () => {
+    await expect(scenario.rejectsStaleActivationBeforeLifecycle()).resolves.toBe(true);
+  });
+
+  it('rejects a missing activation before lifecycle resources start', async () => {
+    await expect(scenario.rejectsMissingActivationBeforeLifecycle()).resolves.toBe(true);
+  });
+
+  it('reports unconfirmed ownership when activation rejection cleanup fails', async () => {
+    await expect(scenario.reportsUnconfirmedActivationCleanup()).resolves.toBe(true);
+  });
+
   it('records owner lifecycle events in order without exposing connection details', async () => {
     await expect(scenario.recordsLifecycle()).resolves.toEqual([
       'server:starting:SERVER_STARTING',

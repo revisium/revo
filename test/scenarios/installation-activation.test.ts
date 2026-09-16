@@ -1,11 +1,22 @@
-import { chmod, lstat, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { chmod, lstat, mkdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { activationIdentity } from '../../src/installation/activation-record.js';
 import { readActivation } from '../../src/installation/activation-store.js';
 import { activationLauncherScenario } from '../support/installation/activation-launcher-scenario.js';
 import { activationScenario } from '../support/installation/activation-scenario.js';
+
+const objectRecord = (value: unknown): Record<string, unknown> => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('expected object record');
+  }
+  return Object.fromEntries(Object.entries(value));
+};
 
 describe('prepared installation activation', () => {
   it('activates one package and Node selection atomically', async () => {
@@ -29,7 +40,103 @@ describe('prepared installation activation', () => {
         argv: ['arg with space', "apostrophe's", ''],
         cwd: expect.stringContaining("cwd with 'quote"),
       });
-      expect(await data.readEntrypoint()).toContain(current.record.packageBin);
+      const launcher = await data.readEntrypoint();
+      expect(launcher).toContain(current.record.packageBin);
+      expect(launcher).toContain('REVO_ACTIVATION_CHANNEL_ROOT');
+      expect(launcher).toContain(current.record.generationId);
+    } finally {
+      await data.cleanup();
+    }
+  }, 40_000);
+  it('records the strict launcher protocol revision in the generation identity', async () => {
+    const data = await activationScenario();
+    try {
+      await data.activate();
+      const current = await readActivation(data.channelRoot);
+      expect(current.status).toBe('valid');
+      if (current.status !== 'valid') {
+        throw new Error('activation was not published');
+      }
+      expect(current.record).toHaveProperty('launcherProtocol', 'revo-activation-launcher/v2');
+      const seeded = createHash('sha256').update(activationIdentity(current.record)).digest('hex');
+      const legacyIdentity = activationIdentity(current.record).replace(
+        '"launcherProtocol":"revo-activation-launcher/v2",',
+        '',
+      );
+      const legacySeed = createHash('sha256').update(legacyIdentity).digest('hex');
+      expect(current.record.generationId).toBe(seeded);
+      expect(current.record.generationId).not.toBe(legacySeed);
+    } finally {
+      await data.cleanup();
+    }
+  });
+  it('rejects legacy activation records without changing bytes or current data', async () => {
+    const data = await activationScenario();
+    try {
+      await data.activate();
+      const generation = await data.currentGeneration();
+      const recordPath = join(await data.currentGenerationPath(), 'activation.json');
+      const original = await readFile(recordPath);
+      const legacy = objectRecord(JSON.parse(original.toString()));
+      delete legacy.launcherProtocol;
+      const legacyBytes = Buffer.from(`${JSON.stringify(legacy)}\n`);
+      await writeFile(recordPath, legacyBytes, { mode: 0o600 });
+      const result = await readActivation(data.channelRoot);
+      expect(result).toMatchObject({
+        status: 'invalid',
+        code: 'REVO_ACTIVATION_STATE_INCOMPATIBLE',
+      });
+      expect(await readFile(recordPath)).toEqual(legacyBytes);
+      expect(await readlink(data.currentPath)).toBe(`activations/${generation}`);
+      expect(await readFile(data.userData, 'utf8')).toBe('keep');
+    } finally {
+      await data.cleanup();
+    }
+  });
+  it('rejects a legacy record through the compiled server CLI without starting resources', async () => {
+    const data = await activationScenario();
+    try {
+      await data.activate();
+      const generation = await data.currentGeneration();
+      const recordPath = join(await data.currentGenerationPath(), 'activation.json');
+      const record = objectRecord(JSON.parse((await readFile(recordPath)).toString()));
+      delete record.launcherProtocol;
+      const legacyBytes = Buffer.from(`${JSON.stringify(record)}\n`);
+      await writeFile(recordPath, legacyBytes, { mode: 0o600 });
+      await mkdir(join(data.root, 'home', '.local', 'share', 'revo-install', 'stable'), {
+        recursive: true,
+        mode: 0o700,
+      });
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const child = spawn(
+          process.execPath,
+          [fileURLToPath(new URL('../../dist/bin/revo.js', import.meta.url)), 'server', 'start'],
+          {
+            cwd: data.root,
+            env: {
+              HOME: join(data.root, 'home'),
+              PATH: process.env.PATH ?? '/usr/bin:/bin',
+              REVO_ACTIVATION_CHANNEL_ROOT: data.channelRoot,
+              REVO_ACTIVATION_GENERATION_ID: generation,
+              REVO_DATA_DIR: join(data.root, 'data'),
+              XDG_CONFIG_HOME: join(data.root, 'config'),
+              XDG_DATA_HOME: join(data.root, 'data-home'),
+              XDG_STATE_HOME: join(data.root, 'state'),
+            },
+            stdio: ['ignore', 'ignore', 'pipe'],
+          },
+        );
+        const stderr: Buffer[] = [];
+        child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+        child.once('close', (code) => resolve({ code, stderr: Buffer.concat(stderr).toString() }));
+      });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain(
+        'Installation activation format is incompatible. Keep your data and reinstall into a new installation directory.',
+      );
+      expect(await readFile(recordPath)).toEqual(legacyBytes);
+      expect(await readlink(data.currentPath)).toBe(`activations/${generation}`);
+      expect(await readFile(data.userData, 'utf8')).toBe('keep');
     } finally {
       await data.cleanup();
     }

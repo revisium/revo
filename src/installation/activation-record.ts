@@ -4,10 +4,28 @@ import { parseReleaseMetadata } from '../release-metadata.js';
 import type { PreparedPackageReceipt } from './prepared-package.js';
 
 export const ACTIVATION_SCHEMA = 'revo-activation/v1' as const;
+export const ACTIVATION_LAUNCHER_PROTOCOL = 'revo-activation-launcher/v2' as const;
 export const ACTIVATION_RECORD_LIMIT = 16 * 1024;
+
+export class ActivationRecordError extends Error {
+  readonly code = 'REVO_ACTIVATION_STATE_INCOMPATIBLE' as const;
+
+  constructor(
+    message = 'activation state format is incompatible; reinstall the compatible release',
+  ) {
+    super(message);
+    this.name = 'ActivationRecordError';
+  }
+}
+
+export interface ActivationBinding {
+  readonly channelRoot: string;
+  readonly generationId: string;
+}
 
 export interface ActivationRecord {
   readonly schemaVersion: typeof ACTIVATION_SCHEMA;
+  readonly launcherProtocol: typeof ACTIVATION_LAUNCHER_PROTOCOL;
   readonly generationId: string;
   readonly channel: 'stable' | 'alpha';
   readonly target: { readonly platform: string; readonly arch: string };
@@ -74,11 +92,27 @@ const components = (value: unknown): boolean => {
 
 export function parseActivationRecord(value: unknown): ActivationRecord {
   if (
+    record(value) &&
+    value.schemaVersion === ACTIVATION_SCHEMA &&
+    !Object.hasOwn(value, 'launcherProtocol')
+  ) {
+    throw new ActivationRecordError('launcher protocol revision is missing');
+  }
+  if (
+    record(value) &&
+    value.schemaVersion === ACTIVATION_SCHEMA &&
+    Object.hasOwn(value, 'launcherProtocol') &&
+    value.launcherProtocol !== ACTIVATION_LAUNCHER_PROTOCOL
+  ) {
+    throw new ActivationRecordError('launcher protocol revision is unsupported');
+  }
+  if (
     !record(value) ||
     !exact(value, [
       'channel',
       'components',
       'generationId',
+      'launcherProtocol',
       'packageBin',
       'packageDigests',
       'packageRef',
@@ -89,6 +123,7 @@ export function parseActivationRecord(value: unknown): ActivationRecord {
       'toolchain',
     ]) ||
     value.schemaVersion !== ACTIVATION_SCHEMA ||
+    value.launcherProtocol !== ACTIVATION_LAUNCHER_PROTOCOL ||
     !/^[a-f0-9]{64}$/u.test(String(value.generationId)) ||
     (value.channel !== 'stable' && value.channel !== 'alpha') ||
     !record(value.target) ||
@@ -134,6 +169,7 @@ export function parseActivationRecord(value: unknown): ActivationRecord {
 export const activationIdentity = (record: ActivationRecord): string =>
   JSON.stringify({
     channel: record.channel,
+    launcherProtocol: record.launcherProtocol,
     target: record.target,
     release: record.release,
     components: record.components,

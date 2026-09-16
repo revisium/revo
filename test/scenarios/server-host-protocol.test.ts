@@ -11,6 +11,29 @@ describe('Private server host protocol', () => {
     expect(parseServerHostParentMessage(message)).toEqual(message);
   });
 
+  it('accepts a complete activation binding and rejects partial bindings', () => {
+    const valid = validStartMessage({
+      configuration: {
+        ...validStartMessage().configuration,
+        activation: { channelRoot: '/private/channel', generationId: 'a'.repeat(64) },
+      },
+    });
+    expect(parseServerHostParentMessage(valid)).toEqual(valid);
+    for (const activation of [
+      { channelRoot: '/private/channel' },
+      { generationId: 'a'.repeat(64) },
+      { channelRoot: 'relative', generationId: 'a'.repeat(64) },
+      { channelRoot: '/private/channel', generationId: 'invalid' },
+    ]) {
+      expect(
+        parseServerHostParentMessage({
+          ...valid,
+          configuration: { ...valid.configuration, activation },
+        }),
+      ).toBeUndefined();
+    }
+  });
+
   it.each([
     ['operation', { operationId: 'ABCDEF0123456789ABCDEF0123456789' }],
     ['channel', { configuration: { ...validStartMessage().configuration, channel: 'preview' } }],

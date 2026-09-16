@@ -35,7 +35,12 @@ type AttemptState =
   | 'terminal';
 
 type Cleanup = 'completed' | 'retained' | 'unconfirmed';
-type StartErrorCode = 'START_BUSY' | 'START_CANCELLED' | 'START_FAILED' | 'START_OUTCOME_UNKNOWN';
+type StartErrorCode =
+  | 'START_BUSY'
+  | 'START_CANCELLED'
+  | 'START_FAILED'
+  | 'START_OUTCOME_UNKNOWN'
+  | 'REVO_ACTIVATION_STATE_INCOMPATIBLE';
 
 class ServerLaunchError extends Error {
   readonly code: StartErrorCode;
@@ -205,6 +210,10 @@ class AttemptOperation {
       this.failAfterFence(new ServerLaunchError('START_BUSY'));
       return;
     }
+    if (message.code === 'REVO_ACTIVATION_STATE_INCOMPATIBLE') {
+      this.failAfterFence(new ServerLaunchError(message.code, message.cleanup));
+      return;
+    }
     if (message.code === 'SERVER_HOST_FAILED' && message.cleanup === 'completed') {
       this.failAfterFence(new ServerLaunchError('START_FAILED', 'completed'));
       return;
@@ -321,6 +330,7 @@ function failedMessage(
     typeof value.operationId === 'string' &&
     [
       'SERVER_HOST_BUSY',
+      'REVO_ACTIVATION_STATE_INCOMPATIBLE',
       'SERVER_HOST_CANCELLED',
       'SERVER_HOST_FAILED',
       'SERVER_HOST_INVALID_MESSAGE',

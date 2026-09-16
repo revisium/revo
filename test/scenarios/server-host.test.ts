@@ -255,6 +255,50 @@ describe('Private server host', () => {
     expect(scenario.owner.startCalls).toBe(0);
   });
 
+  it('preserves activation incompatibility and uncertain cleanup through host failure', async () => {
+    const scenario = new ServerHostScenario();
+    scenario.start();
+    await scenario.process.bootedDelivered.promise;
+    scenario.sendStart();
+    await scenario.openEntered.promise;
+    scenario.owner.failStart(
+      Object.assign(new Error('activation rejected'), {
+        code: 'REVO_ACTIVATION_STATE_INCOMPATIBLE',
+        ownership: 'unconfirmed',
+      }),
+    );
+    scenario.allowOwner();
+    await failedMessage(scenario);
+
+    expect(scenario.messages('failed')).toContainEqual(
+      expect.objectContaining({
+        code: 'REVO_ACTIVATION_STATE_INCOMPATIBLE',
+        cleanup: 'unconfirmed',
+      }),
+    );
+    expect(await scenario.process.settled.promise).toBe(0);
+  });
+
+  it('finds the typed activation cause through a wrapped owner failure', async () => {
+    const scenario = new ServerHostScenario();
+    scenario.start();
+    await scenario.process.bootedDelivered.promise;
+    scenario.sendStart();
+    await scenario.openEntered.promise;
+    scenario.owner.failStart(
+      Object.assign(new Error('owner wrapper'), {
+        cause: { code: 'REVO_ACTIVATION_STATE_INCOMPATIBLE' },
+      }),
+    );
+    scenario.allowOwner();
+    await failedMessage(scenario);
+
+    expect(scenario.messages('failed')).toContainEqual(
+      expect.objectContaining({ code: 'REVO_ACTIVATION_STATE_INCOMPATIBLE' }),
+    );
+    expect(await scenario.process.settled.promise).toBe(0);
+  });
+
   it('delivers private IPC and closes a late owner before terminal channel exit', async () => {
     await expect(realIpcDisconnectBeforeOwnerOpens()).resolves.toEqual({
       completion: { code: 0, signal: null },

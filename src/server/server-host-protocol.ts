@@ -2,6 +2,7 @@ import net from 'node:net';
 import { isAbsolute } from 'node:path';
 
 import { MAX_STARTUP_TIMEOUT_MILLISECONDS } from '../configuration/configuration.types.js';
+import type { ActivationBinding } from '../installation/activation-record.js';
 import type { ServerOwnerConfiguration } from './server-owner.service.js';
 
 export const SERVER_HOST_PROTOCOL = 'revo-server-host/v1' as const;
@@ -35,6 +36,7 @@ export type ServerHostParentMessage =
   | ServerHostCancelMessage;
 
 export type ServerHostFailureCode =
+  | 'REVO_ACTIVATION_STATE_INCOMPATIBLE'
   | 'SERVER_HOST_BUSY'
   | 'SERVER_HOST_CANCELLED'
   | 'SERVER_HOST_FAILED'
@@ -119,7 +121,7 @@ export function parseServerHostParentMessage(value: unknown): ServerHostParentMe
 }
 
 function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefined {
-  if (!record(value) || !exact(value, CONFIGURATION_FIELDS, ['databaseUrl'])) {
+  if (!record(value) || !exact(value, CONFIGURATION_FIELDS, ['databaseUrl', 'activation'])) {
     return undefined;
   }
   if (
@@ -133,7 +135,8 @@ function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefine
     !duration(value.startupTimeout) ||
     typeof value.version !== 'string' ||
     !SEMVER.test(value.version) ||
-    (value.databaseUrl !== undefined && !postgresUrl(value.databaseUrl))
+    (value.databaseUrl !== undefined && !postgresUrl(value.databaseUrl)) ||
+    (value.activation !== undefined && !activationBinding(value.activation))
   ) {
     return undefined;
   }
@@ -142,6 +145,7 @@ function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefine
     dataDir: value.dataDir,
     logDir: value.logDir,
     ...(value.databaseUrl === undefined ? {} : { databaseUrl: value.databaseUrl }),
+    ...(value.activation === undefined ? {} : { activation: value.activation }),
     host: value.host,
     port: value.port,
     publicUrl: value.publicUrl,
@@ -150,6 +154,13 @@ function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefine
     version: value.version,
   };
 }
+
+const activationBinding = (value: unknown): value is ActivationBinding =>
+  record(value) &&
+  exact(value, ['channelRoot', 'generationId']) &&
+  absolute(value.channelRoot) &&
+  typeof value.generationId === 'string' &&
+  /^[a-f0-9]{64}$/u.test(value.generationId);
 
 function parseEnvironment(value: unknown): Readonly<Record<string, string>> | undefined {
   if (!record(value) || Object.keys(value).length > MAX_ENVIRONMENT_ENTRIES) {

@@ -17,8 +17,10 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 
 import { activationLauncher } from './activation-launcher.js';
 import {
+  ACTIVATION_LAUNCHER_PROTOCOL,
   ACTIVATION_RECORD_LIMIT,
   ACTIVATION_SCHEMA,
+  ActivationRecordError,
   type ActivationRecord,
   parseActivationRecord,
 } from './activation-record.js';
@@ -52,7 +54,11 @@ export interface ActivationLease {
 export type ActivationReadResult =
   | { readonly status: 'absent' }
   | { readonly status: 'valid'; readonly record: ActivationRecord; readonly directory: string }
-  | { readonly status: 'invalid'; readonly reason: string }
+  | {
+      readonly status: 'invalid';
+      readonly reason: string;
+      readonly code?: ActivationRecordError['code'];
+    }
   | { readonly status: 'unavailable'; readonly reason: string };
 export type ActivationOutcome =
   | { readonly status: 'activated'; readonly generationId: string }
@@ -309,9 +315,11 @@ async function inspect(root: string, generationId: string): Promise<ActivationRe
     });
     return { status: 'valid', record: value, directory: directoryPath };
   } catch (error) {
+    const reason = error instanceof Error ? error.message : 'state is invalid';
     return {
       status: 'invalid',
-      reason: error instanceof Error ? error.message : 'state is invalid',
+      reason,
+      ...(error instanceof ActivationRecordError ? { code: error.code } : {}),
     };
   }
 }
@@ -382,6 +390,7 @@ function activationSeed(
 ) {
   return {
     channel: candidate.plan.release.channel,
+    launcherProtocol: ACTIVATION_LAUNCHER_PROTOCOL,
     target: candidate.plan.target,
     release: candidate.plan.release,
     components: candidate.plan.components,
@@ -437,6 +446,7 @@ async function stageGeneration(
   const finalRecord: ActivationRecord = {
     ...seed,
     schemaVersion: ACTIVATION_SCHEMA,
+    launcherProtocol: ACTIVATION_LAUNCHER_PROTOCOL,
     generationId,
     previousGeneration,
   };

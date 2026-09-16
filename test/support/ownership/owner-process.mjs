@@ -8,7 +8,9 @@ import koffi from 'koffi';
 import { acquireActivationOwnership } from '../../../dist/installation/activation-ownership.js';
 import { ManagedActivationService } from '../../../dist/installation/managed-activation.service.js';
 import { PosixFlockAdapter } from '../../../dist/processes/adapters/posix-flock.adapter.js';
+import { PublishedControlService } from '../../../dist/processes/published-control.service.js';
 import { ServerOwnershipService } from '../../../dist/processes/server-ownership.service.js';
+import { ServerOwnerService } from '../../../dist/server/server-owner.service.js';
 
 const ownership = new ServerOwnershipService();
 let lease;
@@ -16,6 +18,8 @@ let activationLease;
 let continueGate;
 let allowContinue;
 let completion;
+let startupGate;
+let allowStartup;
 
 class BarrierServerOwnershipService extends ServerOwnershipService {
   async acquire(dataDir) {
@@ -76,6 +80,44 @@ async function respond(request) {
         process.send({ phase: 'activation-completed', outcome });
         return { outcome };
       });
+    return;
+  }
+  if (request.action === 'start-stale-server') {
+    startupGate = new Promise((resolve) => {
+      allowStartup = resolve;
+    });
+    class PausedOwnership extends ServerOwnershipService {
+      async acquire(dataDir) {
+        process.send({ phase: 'before-server-acquire' });
+        await startupGate;
+        return super.acquire(dataDir);
+      }
+    }
+    completion = new ServerOwnerService(new PublishedControlService(new PausedOwnership()))
+      .open({
+        configuration: {
+          ...request.configuration,
+          host: request.configuration.host ?? '127.0.0.1',
+          port: request.configuration.port ?? 3210,
+          publicUrl: request.configuration.publicUrl ?? 'http://127.0.0.1:3210',
+          startupTimeout: request.configuration.startupTimeout ?? 120_000,
+        },
+        environment: {},
+        operationId: 'b'.repeat(32),
+      })
+      .then(
+        () => ({ status: 'accepted' }),
+        (error) => ({ status: 'rejected', code: error?.code, ownership: error?.ownership }),
+      )
+      .then((outcome) => {
+        process.send({ phase: 'stale-server-completed', outcome });
+        return { outcome };
+      });
+    return;
+  }
+  if (request.action === 'continue-stale-server') {
+    allowStartup?.();
+    process.send({ continued: true });
     return;
   }
   if (request.action === 'identity') {
