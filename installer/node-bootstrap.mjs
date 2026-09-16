@@ -791,10 +791,9 @@ async function stagedNode(stage, expected) {
   const info = await lstat(stage).catch(() => undefined);
   if (info === undefined || !info.isDirectory() || info.isSymbolicLink())
     throw nodeFailure('validate', 'stage is unsafe');
-  const entries = (await readdir(stage)).sort();
-  if (JSON.stringify(entries) !== JSON.stringify(['install-receipt.json', 'node']))
-    throw nodeFailure('validate', 'stage contents are invalid');
-  const executable = join(stage, 'node');
+  const bin = join(stage, 'bin');
+  const binInfo = await lstat(bin).catch(() => undefined);
+  const executable = join(bin, 'node');
   const nodeInfo = await lstat(executable).catch(() => undefined);
   const receiptPath = join(stage, 'install-receipt.json');
   const receiptInfo = await lstat(receiptPath).catch(() => undefined);
@@ -803,6 +802,9 @@ async function stagedNode(stage, expected) {
     !nodeInfo.isFile() ||
     nodeInfo.isSymbolicLink() ||
     (nodeInfo.mode & 0o111) === 0 ||
+    binInfo === undefined ||
+    !binInfo.isDirectory() ||
+    binInfo.isSymbolicLink() ||
     receiptInfo === undefined ||
     !receiptInfo.isFile() ||
     receiptInfo.isSymbolicLink() ||
@@ -824,18 +826,22 @@ async function stagedNode(stage, expected) {
   return executable;
 }
 
-async function nodeStageBoundary(stage, root) {
-  const suffix = relative(root, stage);
-  if (suffix === '' || (!suffix.startsWith('..') && !isAbsolute(suffix)))
-    throw nodeFailure('validate', 'stage must be outside channelRoot');
-  const [stageReal, rootReal] = await Promise.all([
+const within = (base, candidate) => {
+  const suffix = relative(base, candidate);
+  return suffix === '' || (!suffix.startsWith('..') && !isAbsolute(suffix));
+};
+async function nodeStageBoundary(stage, root, target) {
+  const [stageReal, rootReal, targetReal] = await Promise.all([
     realpath(stage).catch(() => undefined),
     realpath(root).catch(() => undefined),
+    realpath(target).catch(() => target),
   ]);
   if (
     stageReal === undefined ||
     rootReal === undefined ||
-    (!relative(rootReal, stageReal).startsWith('..') && !isAbsolute(relative(rootReal, stageReal)))
+    targetReal === undefined ||
+    within(stageReal, targetReal) ||
+    within(targetReal, stageReal)
   )
     throw nodeFailure('validate', 'stage boundary is unsafe');
 }
@@ -847,7 +853,9 @@ async function existingNodeTarget(target, expected, policy, signal) {
   });
   if (info === undefined) return undefined;
   if (!info.isDirectory() || info.isSymbolicLink()) throw nodeFailure('reuse', 'target is unsafe');
-  const executable = join(target, 'node');
+  const bin = join(target, 'bin');
+  const binInfo = await lstat(bin).catch(() => undefined);
+  const executable = join(bin, 'node');
   const nodeInfo = await lstat(executable).catch(() => undefined);
   const receiptPath = join(target, 'install-receipt.json');
   const receiptInfo = await lstat(receiptPath).catch(() => undefined);
@@ -856,6 +864,9 @@ async function existingNodeTarget(target, expected, policy, signal) {
     !nodeInfo.isFile() ||
     nodeInfo.isSymbolicLink() ||
     (nodeInfo.mode & 0o111) === 0 ||
+    binInfo === undefined ||
+    !binInfo.isDirectory() ||
+    binInfo.isSymbolicLink() ||
     receiptInfo === undefined ||
     !receiptInfo.isFile() ||
     receiptInfo.isSymbolicLink() ||
@@ -883,7 +894,7 @@ async function existingNodeTarget(target, expected, policy, signal) {
       policy,
       signal,
     );
-    if (output.trim() !== expected.version)
+    if (output.trim() !== `v${expected.version}`)
       throw nodeFailure('probe', 'Node version does not match');
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('node ')) throw error;
@@ -916,7 +927,7 @@ export async function publishNodeBootstrap({
   const root = absolutePath(channelRoot, 'channelRoot');
   const stagePath = absolutePath(stage, 'stage');
   const target = nodeTarget(root, decoded.bootstrap, platform, arch);
-  await nodeStageBoundary(stagePath, root);
+  await nodeStageBoundary(stagePath, root, target);
   await targetParents(target, root);
   onProgress?.('validate');
   const expected = expectedNodeReceipt(decoded, platform, arch);
@@ -944,7 +955,7 @@ export async function publishNodeBootstrap({
     throw nodeFailure('publish', 'atomic rename failed');
   }
   onProgress?.('publish');
-  return { directory: target, executablePath: join(target, 'node'), reused: false };
+  return { directory: target, executablePath: join(target, 'bin', 'node'), reused: false };
 }
 
 function targetParts(target) {

@@ -1,6 +1,16 @@
 import { fork, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  copyFile,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,12 +58,26 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
     receiptPath,
     nodeExecutable,
     nodeStage,
-    prepareNodeStage: async (label = '') => {
-      const stage = label === '' ? nodeStage : join(root, `node-stage-${label}`);
+    prepareNodeStage: async (label = '', inChannel = false) => {
+      const stage =
+        label === ''
+          ? nodeStage
+          : join(inChannel ? join(root, 'channel') : root, `node-stage-${label}`);
       await mkdir(stage, { recursive: true });
-      const executable = join(stage, 'node');
-      await writeFile(executable, `#!/bin/sh\nprintf '%s\\n' '${process.versions.node}'\n`);
+      const executable = join(stage, 'bin', 'node');
+      await mkdir(join(stage, 'bin'));
+      await mkdir(join(stage, 'include'));
+      await mkdir(join(stage, 'lib', 'node_modules', 'npm', 'bin'), { recursive: true });
+      await mkdir(join(stage, 'share', 'doc'), { recursive: true });
+      await copyFile(process.execPath, executable);
       await chmod(executable, 0o755);
+      await writeFile(join(stage, 'include', 'node.h'), 'native node header\n');
+      await writeFile(
+        join(stage, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+        'export {}\n',
+      );
+      await symlink('../lib/node_modules/npm/bin/npm-cli.js', join(stage, 'bin', 'npm'));
+      await writeFile(join(stage, 'share', 'doc', 'README'), 'native node docs\n');
       return { stage, executable };
     },
     publishNodeTogether: async (attempts: NodeAttempt[], input: NodeInput) => {
