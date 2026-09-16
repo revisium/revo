@@ -1,6 +1,6 @@
 // oxlint-disable curly -- compact validation guards keep the command boundary readable
 
-import { lstat, mkdir, rm } from 'node:fs/promises';
+import { lstat, mkdir } from 'node:fs/promises';
 import { delimiter, dirname, join } from 'node:path';
 
 import type { PackageArtifactPolicy, PackageArtifactRequest } from './package-artifacts.js';
@@ -135,19 +135,14 @@ export async function acquireAndInstallPackage({
     ...(request === undefined ? {} : { request }),
     ...(onProgress === undefined ? {} : { onProgress }),
   });
-  try {
-    return await installPackage({
-      stage,
-      pnpmExecutable,
-      nodeExecutable,
-      ...(processPolicy === undefined ? {} : { policy: processPolicy }),
-      ...(signal === undefined ? {} : { signal }),
-      ...(progress === undefined ? {} : { progress }),
-    });
-  } catch (cause) {
-    await rm(stage.directory, { recursive: true, force: true }).catch(() => undefined);
-    throw cause;
-  }
+  return await installPackage({
+    stage,
+    pnpmExecutable,
+    nodeExecutable,
+    ...(processPolicy === undefined ? {} : { policy: processPolicy }),
+    ...(signal === undefined ? {} : { signal }),
+    ...(progress === undefined ? {} : { progress }),
+  });
 }
 
 export const installPackageDependencies = installPackage;

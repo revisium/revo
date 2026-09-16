@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, stat, watch, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 import { packageArtifactScenario } from './package-artifact-scenario.js';
 
@@ -66,6 +66,23 @@ if (process.env.REVO_EXIT) process.exit(Number(process.env.REVO_EXIT));
         env[key] = item;
       }
       return { argv: parsed.argv, env };
+    },
+    waitForCapture: async () => {
+      try {
+        await readFile(capture);
+        return;
+      } catch {
+        const watcher = watch(root);
+        try {
+          for await (const event of watcher) {
+            if (event.filename === basename(capture)) {
+              return;
+            }
+          }
+        } finally {
+          await watcher.return?.();
+        }
+      }
     },
     mode: async (path: string) => (await stat(path)).mode & 0o777,
     hash,
