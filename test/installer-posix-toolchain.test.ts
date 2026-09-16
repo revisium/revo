@@ -3,8 +3,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
-import { readActivation } from '../src/installation/activation-store.js';
 
+import { readActivation } from '../src/installation/activation-store.js';
 import {
   cleanupPortableToolchain,
   installerData,
@@ -22,8 +22,6 @@ const syntax = (script: string) =>
   });
 
 it('real activation mode packs the compiled helper', async () => {
-  const archive = process.env.REVO_REAL_PNPM_ARCHIVE;
-  if (archive === undefined) throw new Error('real pnpm archive is required');
   const subject = await portableToolchain('stable', undefined, false, true);
   let failed = false;
   try {

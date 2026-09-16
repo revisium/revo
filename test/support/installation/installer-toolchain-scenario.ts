@@ -89,11 +89,7 @@ export async function portableToolchain(
   } else {
     await writeFile(nodeArchive, cachedNodeArchive);
   }
-  const officialPnpmArchive = realActivation ? process.env.REVO_REAL_PNPM_ARCHIVE : undefined;
-  if (officialPnpmArchive !== undefined) {
-    cachedPnpmArchive = await readFile(officialPnpmArchive);
-    await writeFile(pnpmArchive, cachedPnpmArchive);
-  } else if (cachedPnpmArchive === undefined) {
+  if (cachedPnpmArchive === undefined) {
     await run(tar, ['-czf', pnpmArchive, '-C', pnpmSource, '.']);
     cachedPnpmArchive = await readFile(pnpmArchive);
   } else {
@@ -102,7 +98,7 @@ export async function portableToolchain(
   const nodeSha = createHash('sha256')
     .update(await readFile(nodeArchive))
     .digest('hex');
-  const pnpmSha = createHash('sha256')
+  let pnpmSha = createHash('sha256')
     .update(await readFile(pnpmArchive))
     .digest('hex');
   const platform = process.platform === 'darwin' ? 'darwin' : 'linux';
@@ -123,6 +119,19 @@ export async function portableToolchain(
       pnpm: packages.plan.toolchain.pnpm,
     },
   });
+  if (realActivation) {
+    const descriptor = input.manifest.toolchain.pnpmArchives.find(
+      (item) => item.platform === platform && item.arch === arch,
+    );
+    if (descriptor === undefined) throw new Error('fixture omitted pnpm archive');
+    const response = await fetch(descriptor.url, { signal: AbortSignal.timeout(120_000) });
+    if (!response.ok) throw new Error(`pnpm archive download failed: ${response.status}`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    if (digest !== descriptor.sha256) throw new Error('pnpm archive digest mismatch');
+    await writeFile(pnpmArchive, bytes);
+    pnpmSha = digest;
+  }
   const manifest = {
     ...input.manifest,
     release: packages.plan.release,
