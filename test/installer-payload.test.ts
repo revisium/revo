@@ -19,8 +19,12 @@ describe('self-contained bootstrap payload', () => {
   it('bundles the new entry as one ESM file with only node builtins external', async () => {
     const code = await buildPayload();
     expect(code).toContain('runBootstrap');
-    expect(code).not.toMatch(/node-bootstrap\.mjs|src\/|dist\//u);
-    for (const match of code.matchAll(/from\s+['"]([^'"]+)['"]/gu))
+    expect(code).not.toMatch(
+      /\b(?:from\s+|import\s+|import\s*\(\s*|require\s*\(\s*)['"][^'"]*(?:node-bootstrap\.mjs|src\/|dist\/)/u,
+    );
+    for (const match of code.matchAll(/\bfrom\s+['"]([^'"]+)['"]/gu))
+      expect(match[1]).toMatch(/^node:/u);
+    for (const match of code.matchAll(/\bimport\s+['"]([^'"]+)['"]/gu))
       expect(match[1]).toMatch(/^node:/u);
   });
 

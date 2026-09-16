@@ -42,10 +42,19 @@ export function tarFixture(files: Record<string, string>, gzip = true): Uint8Arr
 }
 
 export async function packageArtifactScenario(
-  options: { readonly channel?: 'stable' | 'alpha'; readonly unsafeTar?: Uint8Array } = {},
+  options: {
+    readonly channel?: 'stable' | 'alpha';
+    readonly version?: string;
+    readonly unsafeTar?: Uint8Array;
+  } = {},
 ) {
   const fixture = packageReleaseFixture(
-    options.channel === undefined ? {} : { channel: options.channel },
+    options.channel === undefined && options.version === undefined
+      ? {}
+      : {
+          ...(options.channel === undefined ? {} : { channel: options.channel }),
+          ...(options.version === undefined ? {} : { version: options.version }),
+        },
   );
   const release = fixture.manifest.release;
   const packageJson = JSON.stringify({

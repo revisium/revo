@@ -18,7 +18,7 @@ jobs:
   process-platforms:
     name: Processes (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +48,7 @@ jobs:
           node -p "'process platform=' + process.platform + ' arch=' + process.arch"
           pnpm build
           pnpm exec vitest run test/installer-posix-toolchain.test.ts
+          pnpm exec vitest run test/installer-posix-attempts.test.ts
           pnpm exec vitest run test/installer-node-publication.test.ts test/installer-pnpm-bootstrap.test.ts
           pnpm exec vitest run test/scenarios/package-install.test.ts
           pnpm exec vitest run test/scenarios/prepared-package-publication.test.ts

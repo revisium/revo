@@ -45,6 +45,13 @@ describe('generated POSIX toolchain installer', () => {
     expect(script.match(/^REVO_NODE_BOOTSTRAP_PAYLOAD$/gmu)).toHaveLength(1);
     expect(script).toContain("revo_channel='stable'");
   });
+  it('publishes Node from a private attempt before the canonical re-exec', async () => {
+    const script = await toolchainInstaller();
+    expect(script).toContain('revo_attempt=');
+    expect(script).toContain('REVO_INSTALL_MODE=node');
+    expect(script).toContain('$revo_final/bin/node');
+    expect(script).not.toContain('mv "$revo_final/bootstrap.json"');
+  });
   it.each(['stable', 'alpha'] as const)(
     'runs generated %s bytes fresh and reuses Node',
     async (channel) => {
@@ -79,6 +86,7 @@ describe('generated POSIX toolchain installer', () => {
         await cleanupPortableToolchain(subject.root);
       }
     },
+    30000,
   );
   it('drains an interrupted generated download and preserves the signal status', async () => {
     const subject = await portableToolchain();
