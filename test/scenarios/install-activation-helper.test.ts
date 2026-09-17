@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   activateInstall,
@@ -68,6 +68,39 @@ describe('activation helper boundary', () => {
       const result = await runActivationHelper(path, channelRoot, async () => outcome);
       expect(result).toBe(expected);
     } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('emits only the versioned result or fixed failure diagnostic', async () => {
+    const { channelRoot, path } = await makeRequest((root) =>
+      JSON.stringify({
+        schemaVersion: 'revo-install-activate/v1',
+        channelRoot: root,
+        nodeArchiveSha256: 'a'.repeat(64),
+        packagePlan: {},
+        pnpmArchiveSha256: 'b'.repeat(64),
+      }),
+    );
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(
+        runActivationHelper(path, channelRoot, async () => ({
+          status: 'activated',
+          generationId: 'c'.repeat(64),
+        })),
+      ).resolves.toBe(0);
+      expect(stdout).toHaveBeenCalledWith(
+        `${JSON.stringify({ schemaVersion: 'revo-install-activate/v1', status: 'activated', generationId: 'c'.repeat(64) })}\n`,
+      );
+      await expect(
+        runActivationHelper(path, channelRoot, async () => ({ status: 'busy' })),
+      ).resolves.toBe(1);
+      expect(stderr).toHaveBeenCalledWith('activation helper failed\n');
+    } finally {
+      stdout.mockRestore();
+      stderr.mockRestore();
       await rm(channelRoot, { recursive: true, force: true });
     }
   });
