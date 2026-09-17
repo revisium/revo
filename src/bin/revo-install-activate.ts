@@ -1,7 +1,7 @@
 import { constants, realpathSync } from 'node:fs';
 import { readFile, open } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ActivationCandidate } from '../installation/activation-store.js';
@@ -108,7 +108,11 @@ export async function activateInstall(requestValue: unknown) {
 }
 
 export async function readActivationRequest(path: string): Promise<unknown> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const requestPath = resolve(path);
+  if (requestPath !== path || !requestPath.endsWith('/request.json')) {
+    throw new Error('activation request path is invalid');
+  }
+  const file = await open(requestPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await file.stat();
     if (!stat.isFile() || stat.mode & 0o077 || stat.size > 64 * 1024) {

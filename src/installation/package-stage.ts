@@ -179,6 +179,15 @@ const validatePackage = (value: Record<string, unknown>, plan: PackageInstallPla
   )
     throw error('package workspace is external');
 };
+const workspaceBlock = (lines: string[], index: number): string[] => {
+  const child: string[] = [];
+  for (const line of lines.slice(index + 1)) {
+    if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
+    if (line === line.trimStart()) break;
+    child.push(line);
+  }
+  return child;
+};
 const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void => {
   const value = text(bytes);
   const lines = value.split('\n');
@@ -201,12 +210,7 @@ const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void =>
   const allowLine = lines[index];
   if (allowLine === undefined) throw error('workspace allowBuilds is missing');
   const first = allowLine.slice(allowLine.indexOf(':') + 1).trim();
-  const child: string[] = [];
-  for (const line of lines.slice(index + 1)) {
-    if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
-    if (line === line.trimStart()) break;
-    child.push(line);
-  }
+  const child = workspaceBlock(lines, index);
   const raw = first.startsWith('[') && first.endsWith(']') ? first.slice(1, -1) : child.join('\n');
   if (
     child.some((line) => line.trimStart().startsWith('-')) &&
@@ -218,10 +222,12 @@ const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void =>
     const seen = new Set<string>();
     const entries = map.flatMap((line) => {
       const match = /^\s*["']?([^"':\s]+)["']?\s*:\s*(true|false)\s*$/u.exec(line);
-      if (match === null || match[1] === undefined || match[2] === undefined || seen.has(match[1]))
+      const key = match?.[1];
+      const enabled = match?.[2];
+      if (key === undefined || enabled === undefined || seen.has(key))
         throw error('workspace allowBuilds map is invalid');
-      seen.add(match[1]);
-      return match[2] === 'true' ? [match[1]] : [];
+      seen.add(key);
+      return enabled === 'true' ? [key] : [];
     });
     if (!entries.length) throw error('workspace allowBuilds is missing');
     return validateAllowedBuilds(entries, plan);
