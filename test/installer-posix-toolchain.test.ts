@@ -145,17 +145,27 @@ it('real activation refuses during startup and succeeds after the owner closes',
     expect(started.owner.status().phase).toBe('running');
     expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).not.toBe(0);
     expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
+    const closeStarted = Date.now();
+    console.error(`[phase] owner-close-begin ${closeStarted}`);
     await started.owner.close();
+    console.error(`[phase] owner-close-end ${Date.now() - closeStarted}`);
+    const replacementStarted = Date.now();
+    console.error(`[phase] replacement-begin ${replacementStarted}`);
     expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
+    console.error(`[phase] replacement-end ${Date.now() - replacementStarted}`);
     const after = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     expect(after.record.generationId).not.toBe(before.record.generationId);
     expect(after.record.release.version).toBe('0.0.1');
     expect(await readFile(join(data, 'sentinel'), 'utf8')).toBe('sentinel\n');
   } finally {
+    console.error('[phase] scenario-cleanup-begin');
     started?.releaseReady();
     await scenario.cleanup();
+    console.error('[phase] scenario-cleanup-end');
+    console.error('[phase] fixture-cleanup-begin');
     await cleanupPortableToolchain(second.root);
     await cleanupPortableToolchain(first.root);
+    console.error('[phase] fixture-cleanup-end');
   }
 }, 360_000);
 
