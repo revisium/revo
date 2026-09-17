@@ -47,6 +47,7 @@ export async function packageArtifactScenario(
     readonly version?: string;
     readonly unsafeTar?: Uint8Array;
     readonly activationProbe?: boolean;
+    readonly workspace?: string;
   } = {},
 ) {
   const fixture = packageReleaseFixture(
@@ -85,7 +86,7 @@ export async function packageArtifactScenario(
       }),
     packageJson: Buffer.from(packageJson),
     pnpmLock: Buffer.from('lockfileVersion: 9.0\n\nimporters:\n  .: {}\n'),
-    pnpmWorkspace: Buffer.from(workspace),
+    pnpmWorkspace: Buffer.from(options.workspace ?? workspace),
   };
   const artifacts = Object.fromEntries(
     Object.entries(bytes).map(([name, value]) => [
