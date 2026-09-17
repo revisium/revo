@@ -13,8 +13,10 @@ import {
   ServerLauncherService,
   type ServerLaunchResult,
 } from '../server/server-launcher.service.js';
+import type { ServerProgressSink } from '../server/server-startup-observer.js';
 import { ServerStatusService, type ServerStatus } from '../server/server-status.service.js';
 import { ServerStopService } from '../server/server-stop.service.js';
+import { CliUsageError } from './cli-error.js';
 import { OutputService } from './output.service.js';
 import { PackageMetadataService } from './package-metadata.service.js';
 
@@ -25,6 +27,7 @@ const DIAGNOSTICS: Readonly<Record<string, string>> = {
   START_CANCELLED: 'Server start was cancelled.',
   START_FAILED: 'Server start failed.',
   START_OUTCOME_UNKNOWN: 'Server start outcome is unknown.',
+  START_PROGRESS_OUTPUT_FAILED: 'Server is running, but startup progress output failed.',
   'revo.process.cancelled': 'Server start was cancelled.',
 };
 const CLEANUP: Readonly<Record<string, string>> = {
@@ -38,6 +41,10 @@ const STOPPABLE: ReadonlySet<ServerStatus['kind']> = new Set([
   'stopping',
   'failed',
 ]);
+
+export interface ServerStartFlags extends ConfigurationFlags {
+  readonly progress?: string;
+}
 
 @Injectable()
 export class ServerCommandService {
@@ -53,12 +60,28 @@ export class ServerCommandService {
     @Inject(PackageMetadataService)
     private readonly metadata: Pick<PackageMetadataService, 'version'>,
     @Inject(OutputService)
-    private readonly output: Pick<OutputService, 'write'>,
+    private readonly output: Pick<OutputService, 'write' | 'progress'>,
   ) {}
 
-  async start(flags: Readonly<ConfigurationFlags>): Promise<void> {
-    const outcome = await this.ensureRunning(flags);
-    this.presentStartOutcome(outcome);
+  async start(flags: Readonly<ServerStartFlags>): Promise<void> {
+    const { progress, ...configuration } = flags;
+    if (progress !== undefined && progress !== 'jsonl') {
+      throw new CliUsageError('Startup progress format must be jsonl.');
+    }
+    if (progress === undefined) {
+      this.presentStartOutcome(await this.ensureRunning(configuration));
+      return;
+    }
+    const output = this.output.progress();
+    try {
+      const outcome = await this.launch(this.input(configuration), output.sink);
+      if (outcome.kind !== 'started' && outcome.kind !== 'running') {
+        this.presentStartOutcome(outcome);
+      }
+      output.assertHealthy();
+    } finally {
+      output.close();
+    }
   }
 
   async ensureRunning(flags: Readonly<ConfigurationFlags>): Promise<ServerLaunchResult> {
@@ -107,13 +130,20 @@ export class ServerCommandService {
   }
 
   /** Owns the interactive lifetime of one launch: one controller, one attempt, no retry. */
-  private async launch(input: Readonly<ConfigurationInput>): Promise<ServerLaunchResult> {
+  private async launch(
+    input: Readonly<ConfigurationInput>,
+    onProgress?: ServerProgressSink,
+  ): Promise<ServerLaunchResult> {
     const controller = new AbortController();
     const abort = (): void => controller.abort();
     process.on('SIGINT', abort);
     process.on('SIGTERM', abort);
     try {
-      return await this.launcher.launch({ ...input, signal: controller.signal });
+      return await this.launcher.launch({
+        ...input,
+        signal: controller.signal,
+        ...(onProgress ? { onProgress } : {}),
+      });
     } catch (error) {
       throw diagnose(error);
     } finally {
