@@ -41,7 +41,7 @@ const environment = (nodeExecutable: string, pnpmExecutable: string): Record<str
   const dirs = [...new Set([dirname(nodeExecutable), dirname(pnpmExecutable)])];
   return {
     ...values,
-    PATH: dirs.join(delimiter) || `/usr/bin${delimiter}/bin`,
+    PATH: [...dirs, '/usr/bin', '/bin'].join(delimiter),
     CI: '1',
     NO_COLOR: '1',
     npm_config_color: 'false',
