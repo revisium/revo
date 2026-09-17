@@ -131,9 +131,11 @@ it('real activation refuses during startup and succeeds after the owner closes',
     const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
     const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
+    const prewarmData = join(first.root, 'prewarm-data');
+    await mkdir(prewarmData, { recursive: true, mode: 0o700 });
     await writeFile(gate, 'hold\n', { mode: 0o600 });
     const prewarm = second.startInstaller({
-      REVO_DATA_DIR: data,
+      REVO_DATA_DIR: prewarmData,
       REVO_TEST_ACTIVATION_FAULT: 'cancel',
     });
     await vi.waitFor(async () => expect(await readFile(marker, 'utf8')).toContain('held'), {
