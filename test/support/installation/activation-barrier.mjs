@@ -15,9 +15,7 @@ if (mode !== null && root !== null) {
       const marker = resolve(root, 'activation-barrier.held');
       const gate = resolve(root, 'activation-barrier.gate');
       const releaseGate = () => void unlink(gate).catch(() => undefined);
-      if (mode === 'cancel' || mode === 'unknown') {
-        process.once('SIGTERM', releaseGate);
-      }
+      if (mode === 'cancel' || mode === 'unknown') process.once('SIGTERM', releaseGate);
       try {
         await appendFile(marker, 'held\n');
       } catch (error) {
