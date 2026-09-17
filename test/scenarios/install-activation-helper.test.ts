@@ -3,7 +3,11 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { readActivationRequest, runActivationHelper } from '../../src/bin/revo-install-activate.js';
+import {
+  activateInstall,
+  readActivationRequest,
+  runActivationHelper,
+} from '../../src/bin/revo-install-activate.js';
 
 const requestPath = (root: string) =>
   join(root, '.attempt.test', 'runtime', 'scratch', '.activation-request-test', 'request.json');
@@ -71,6 +75,31 @@ describe('activation helper boundary', () => {
       await expect(readActivationRequest(path, channelRoot)).rejects.toThrow(
         /activation request|ELOOP/u,
       );
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['malformed JSON', '{'],
+    ['wrong schema', JSON.stringify({ schemaVersion: 'wrong' })],
+  ])('rejects %s before activation', async (_name, contents) => {
+    const { channelRoot, path } = await makeRequest(contents);
+    try {
+      await expect(readActivationRequest(path, channelRoot)).rejects.toThrow(/activation|JSON/u);
+      await expect(activateInstall({})).rejects.toThrow(/activation request is invalid/u);
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a non-private request before parsing', async () => {
+    const { channelRoot, path } = await makeRequest(
+      (root) => JSON.stringify({ schemaVersion: 'revo-install-activate/v1', channelRoot: root }),
+      0o644,
+    );
+    try {
+      await expect(readActivationRequest(path, channelRoot)).rejects.toThrow(/unsafe/u);
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
     }
