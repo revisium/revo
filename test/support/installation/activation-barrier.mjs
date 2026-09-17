@@ -1,3 +1,4 @@
+// oxlint-disable curly, no-await-in-loop -- bounded fixture gate observation
 import { access, appendFile, unlink, watch } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 const query = new URL(import.meta.url).searchParams;
@@ -13,26 +14,39 @@ if (mode !== null && root !== null) {
     if (lease.kind === 'held') {
       const marker = resolve(root, 'activation-barrier.held');
       const gate = resolve(root, 'activation-barrier.gate');
-      await appendFile(marker, 'held\n');
+      const releaseGate = () => void unlink(gate).catch(() => undefined);
       if (mode === 'cancel' || mode === 'unknown') {
-        process.once('SIGTERM', () => void unlink(gate).catch(() => undefined));
+        process.once('SIGTERM', releaseGate);
+      }
+      try {
+        await appendFile(marker, 'held\n');
+      } catch (error) {
+        await lease.release().catch(() => undefined);
+        throw error;
+      }
+      if (mode === 'cancel' || mode === 'unknown') {
         const waitForGate = async () => {
-          const present = await access(gate).then(
-            () => true,
-            () => false,
-          );
-          if (!present) {
-            return;
-          }
           const events = watch(dirname(gate));
           try {
-            await events.next();
+            while (
+              await access(gate).then(
+                () => true,
+                () => false,
+              )
+            )
+              await events.next();
           } finally {
             await events.return();
           }
-          await waitForGate();
         };
-        await waitForGate();
+        try {
+          await waitForGate();
+        } catch (error) {
+          await lease.release().catch(() => undefined);
+          throw error;
+        } finally {
+          process.removeListener('SIGTERM', releaseGate);
+        }
       }
     }
     return lease;
