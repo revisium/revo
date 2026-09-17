@@ -58,6 +58,51 @@ it('reads bounded activation requests and rejects malformed activation input', a
   }
 });
 
+it.each(['outside', 'claimed-root', 'leaf-symlink'] as const)(
+  'rejects unsafe activation request boundary: %s',
+  async (kind) => {
+    const root = await mkdtemp(join('/tmp', 'revo-activation-boundary-'));
+    const request = join(
+      root,
+      'stable',
+      '.attempt.test',
+      'runtime',
+      'scratch',
+      '.activation-request-test',
+      'request.json',
+    );
+    try {
+      await mkdir(join(request, '..'), { recursive: true, mode: 0o700 });
+      const valid = `{"schemaVersion":"revo-install-activate/v1","channelRoot":"${root}"}\n`;
+      await writeFile(request, valid, { mode: 0o600 });
+      if (kind === 'outside') {
+        await expect(readActivationRequest(join(root, 'request.json'), root)).rejects.toThrow();
+      } else if (kind === 'claimed-root') {
+        await expect(readActivationRequest(request, join(root, 'other'))).rejects.toThrow();
+      } else {
+        await symlink(join(root, 'stable'), join(request, '..', '..', '..', 'link'));
+        await expect(
+          readActivationRequest(
+            join(
+              root,
+              'stable',
+              'link',
+              '.attempt.test',
+              'runtime',
+              'scratch',
+              '.activation-request-test',
+              'request.json',
+            ),
+            root,
+          ),
+        ).rejects.toThrow();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 it.each(['stable', 'alpha'] as const)(
   'real %s activation mode packs the compiled helper',
   async (channel) => {
