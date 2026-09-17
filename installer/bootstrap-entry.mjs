@@ -146,7 +146,7 @@ if (
   process.env.REVO_BOOTSTRAP_ENTRY = '1';
   const controller = new AbortController();
   const abort = () => controller.abort();
-  for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) process.once(signal, abort);
+  for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) process.on(signal, abort);
   try {
     if (process.env.REVO_INSTALL_MODE === 'node') {
       const decoded = await runBootstrap({
