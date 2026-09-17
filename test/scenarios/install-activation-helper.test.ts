@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -22,6 +23,11 @@ const makeRequest = async (value: string | ((root: string) => string), mode = 0o
   await writeFile(path, typeof value === 'function' ? value(channelRoot) : value, { mode });
   return { channelRoot, path };
 };
+
+const command = (name: string, args: string[]) =>
+  new Promise<void>((resolve, reject) => {
+    execFile(name, args, (error) => (error === null ? resolve() : reject(error)));
+  });
 
 describe('activation helper boundary', () => {
   it('reads a valid private request and rejects unsafe boundaries', async () => {
@@ -77,6 +83,42 @@ describe('activation helper boundary', () => {
       await symlink(target, path);
       await expect(readActivationRequest(path, channelRoot)).rejects.toThrow(
         /activation request|ELOOP/u,
+      );
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects oversized requests and FIFOs without blocking', async () => {
+    const oversized = await makeRequest('x'.repeat(64 * 1024 + 1));
+    try {
+      await expect(readActivationRequest(oversized.path, oversized.channelRoot)).rejects.toThrow(
+        /unsafe|oversized/u,
+      );
+    } finally {
+      await rm(oversized.channelRoot, { recursive: true, force: true });
+    }
+
+    const fifo = await makeRequest('ignored');
+    await rm(fifo.path);
+    await command('mkfifo', [fifo.path]);
+    try {
+      await expect(readActivationRequest(fifo.path, fifo.channelRoot)).rejects.toThrow(
+        /unsafe|request/u,
+      );
+    } finally {
+      await rm(fifo.channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an existing request outside the channel attempt root', async () => {
+    const { channelRoot } = await makeRequest('{}');
+    const outside = join(channelRoot, 'outside', 'request.json');
+    await mkdir(join(outside, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(outside, '{}\n', { mode: 0o600 });
+    try {
+      await expect(readActivationRequest(outside, channelRoot)).rejects.toThrow(
+        /activation request path/u,
       );
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
