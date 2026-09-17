@@ -8,6 +8,9 @@ import {
   readActivationRequest,
   runActivationHelper,
 } from '../../src/bin/revo-install-activate.js';
+import { createPackageInstallPlan } from '../../src/installation/package-install-plan.js';
+import { preparedPackageTarget } from '../../src/installation/prepared-package.js';
+import { packageReleaseFixture } from '../support/installation/package-release-fixture.js';
 
 const requestPath = (root: string) =>
   join(root, '.attempt.test', 'runtime', 'scratch', '.activation-request-test', 'request.json');
@@ -100,6 +103,48 @@ describe('activation helper boundary', () => {
     );
     try {
       await expect(readActivationRequest(path, channelRoot)).rejects.toThrow(/unsafe/u);
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('assembles a verified candidate and configuration for managed activation', async () => {
+    const fixture = packageReleaseFixture();
+    const plan = createPackageInstallPlan({ manifest: fixture.manifest, request: fixture.request });
+    const channelRoot = await mkdtemp(join('/tmp', 'revo-helper-candidate-'));
+    const target = preparedPackageTarget(channelRoot, plan);
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(target, 'package.json'),
+      JSON.stringify({ bin: { revo: 'dist/bin/revo.js' } }),
+      {
+        mode: 0o600,
+      },
+    );
+    let received:
+      | { candidate: { packageBin: string; nodeArchiveSha256: string }; channelRoot: string }
+      | undefined;
+    try {
+      const result = await activateInstall(
+        {
+          schemaVersion: 'revo-install-activate/v1',
+          channelRoot,
+          packagePlan: plan,
+          nodeArchiveSha256: 'a'.repeat(64),
+          pnpmArchiveSha256: 'b'.repeat(64),
+        },
+        {
+          activate: async (input) => {
+            received = { candidate: input.candidate, channelRoot: input.channelRoot };
+            return { status: 'activated', generationId: 'c'.repeat(64) };
+          },
+        },
+      );
+      expect(result).toEqual({ status: 'activated', generationId: 'c'.repeat(64) });
+      expect(received).toMatchObject({
+        channelRoot,
+        candidate: { packageBin: 'dist/bin/revo.js', nodeArchiveSha256: 'a'.repeat(64) },
+      });
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
     }

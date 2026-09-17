@@ -59,7 +59,10 @@ function request(value: unknown): InstallActivationRequest {
   };
 }
 
-export async function activateInstall(requestValue: unknown) {
+export async function activateInstall(
+  requestValue: unknown,
+  service: Pick<ManagedActivationService, 'activate'> = new ManagedActivationService(),
+) {
   const input = request(requestValue);
   const plan = parsePackageInstallPlan(input.packagePlan);
   if (process.platform !== 'linux' && process.platform !== 'darwin') {
@@ -88,7 +91,7 @@ export async function activateInstall(requestValue: unknown) {
     process.once(signal, abort);
   }
   try {
-    return await new ManagedActivationService().activate({
+    return await service.activate({
       channelRoot: input.channelRoot,
       candidate,
       configuration: {
