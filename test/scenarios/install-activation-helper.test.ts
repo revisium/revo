@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -155,6 +155,58 @@ describe('activation helper boundary', () => {
       );
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an ancestor symlink without following it', async () => {
+    const { channelRoot } = await makeRequest('{}');
+    const outside = await mkdtemp(join('/tmp', 'revo-helper-outside-'));
+    const outsideParent = join(
+      outside,
+      '.attempt-escape',
+      'runtime',
+      'scratch',
+      '.activation-request',
+    );
+    const outsidePath = join(outsideParent, 'request.json');
+    const linkedParent = join(channelRoot, '.attempt-link');
+    await mkdir(outsideParent, { recursive: true, mode: 0o700 });
+    await writeFile(outsidePath, '{}\n', { mode: 0o600 });
+    await symlink(join(outside, '.attempt-escape'), linkedParent);
+    try {
+      await expect(
+        readActivationRequest(
+          join(linkedParent, 'runtime/scratch/.activation-request/request.json'),
+          channelRoot,
+        ),
+      ).rejects.toThrow(/activation request path/u);
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('enters the compiled helper through an ancestor symlink and fails safely', async () => {
+    const { channelRoot, path } = await makeRequest('{}');
+    const dist = new URL('../../dist/bin', import.meta.url).pathname;
+    const aliasRoot = await mkdtemp(join('/tmp', 'revo-helper-alias-'));
+    const alias = join(aliasRoot, 'revo-install-activate.js');
+    await symlink(join(dist, 'revo-install-activate.js'), alias);
+    try {
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, [alias, path], {
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        let stderr = '';
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (chunk) => (stderr += chunk));
+        child.once('close', (code) => resolve({ code, stderr }));
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toBe('activation helper failed\n');
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+      await rm(aliasRoot, { recursive: true, force: true });
     }
   });
 
