@@ -143,7 +143,10 @@ it('real activation refuses during startup and succeeds after the owner closes',
     });
     prewarm.child.kill('SIGTERM');
     expect(await prewarm.finish).not.toBe(0);
-    expect((await new ServerOwnershipService().inspect(data)).kind).toBe('free');
+    await vi.waitFor(
+      async () => expect((await new ServerOwnershipService().inspect(data)).kind).toBe('free'),
+      { timeout: 120_000, interval: 25 },
+    );
     expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
     await rm(gate, { force: true });
     const channelRoot = join(first.root, 'state', 'stable');

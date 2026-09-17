@@ -2,8 +2,8 @@
 import { access, appendFile, unlink, watch } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 const query = new URL(import.meta.url).searchParams;
-const mode = query.get('mode');
-const root = query.get('root');
+const mode = query.get('mode'),
+  root = query.get('root');
 if (mode !== null && root !== null) {
   const owner = await import(
     resolve(dirname(process.argv[1]), '../processes/server-ownership.service.js')
@@ -23,7 +23,7 @@ if (mode !== null && root !== null) {
         throw error;
       }
       if (mode === 'cancel' || mode === 'unknown') {
-        const waitForGate = async () => {
+        try {
           const events = watch(dirname(gate));
           try {
             while (
@@ -36,9 +36,6 @@ if (mode !== null && root !== null) {
           } finally {
             await events.return();
           }
-        };
-        try {
-          await waitForGate();
         } catch (error) {
           await lease.release().catch(() => undefined);
           throw error;
