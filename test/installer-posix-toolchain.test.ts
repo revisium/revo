@@ -103,6 +103,26 @@ it.each(['outside', 'claimed-root', 'leaf-symlink'] as const)(
   },
 );
 
+it('rejects an oversized trusted activation request without hanging', async () => {
+  const root = await mkdtemp(join('/tmp', 'revo-activation-oversize-'));
+  const request = join(
+    root,
+    'stable',
+    '.attempt.test',
+    'runtime',
+    'scratch',
+    '.activation-request-test',
+    'request.json',
+  );
+  try {
+    await mkdir(join(request, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(request, 'x'.repeat(64 * 1024 + 1), { mode: 0o600 });
+    await expect(readActivationRequest(request, root)).rejects.toThrow(/unsafe|oversized/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it.each(['stable', 'alpha'] as const)(
   'real %s activation mode packs the compiled helper',
   async (channel) => {
