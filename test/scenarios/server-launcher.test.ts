@@ -11,6 +11,7 @@ import {
   type RevoConfiguration,
 } from '../../src/configuration/configuration.types.js';
 import type { ProcessCompletion } from '../../src/processes/managed-process.types.js';
+import type { ProgressEvent } from '../../src/progress/index.js';
 import {
   SERVER_HOST_PROTOCOL,
   type ServerHostStartMessage,
@@ -25,8 +26,13 @@ import {
   ServerLauncherService,
   type ServerLaunchRequest,
 } from '../../src/server/server-launcher.service.js';
+import {
+  ServerStartupObserver,
+  type ServerProgressSink,
+} from '../../src/server/server-startup-observer.js';
 import type { ServerStatus, ServerStatusService } from '../../src/server/server-status.service.js';
 import { ServerModule } from '../../src/server/server.module.js';
+import type { StartupProgressDiscoveryService } from '../../src/startup-progress/index.js';
 
 const attempt = vi.hoisted(() => ({
   ports: [] as ServerLaunchProcessPort[],
@@ -127,6 +133,73 @@ class LauncherConsumer {
 class LauncherConsumerModule {}
 
 describe('server launcher composition', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    attempt.ports.length = 0;
+    attempt.start.mockReset();
+  });
+
+  it('emits fresh healthy reuse with the verified public URL and no spawn or journal read', async () => {
+    const read = vi.fn<StartupProgressDiscoveryService['read']>();
+    const events: ProgressEvent[] = [];
+    const processes = processesFor(fakePort());
+    const current = {
+      kind: 'running',
+      status: {
+        phase: 'running',
+        publicUrl: 'https://verified.example',
+        operationId: 'f'.repeat(32),
+      },
+    } as const;
+    const service = new ServerLauncherService(
+      resolverFor(configuration()),
+      statusFor(current),
+      processes,
+      new ServerStartupObserver({ read }),
+    );
+    await expect(
+      service.launch(
+        request({
+          onProgress: (event) => {
+            events.push(event);
+          },
+        }),
+      ),
+    ).resolves.toBe(current);
+    expect(events).toEqual([
+      expect.objectContaining({
+        status: 'ready',
+        sequence: 1,
+        reused: true,
+        url: 'https://verified.example',
+      }),
+    ]);
+    expect(events[0]?.operationId).not.toBe(current.status.operationId);
+    expect(processes.start).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('shares the attempt operation and deadline with the journal observer', async () => {
+    const observer = new ServerStartupObserver();
+    const observe = vi.spyOn(observer, 'observe').mockImplementation(async (pending) => pending);
+    const onProgress = vi.fn<ServerProgressSink>();
+    attempt.start.mockResolvedValue({ kind: 'started', url: 'https://revo.example' });
+    const service = new ServerLauncherService(
+      resolverFor(configuration()),
+      statusFor({ kind: 'stopped' }),
+      processesFor(fakePort()),
+      observer,
+    );
+    await service.launch(request({ onProgress }));
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe.mock.calls[0]?.[1]).toMatchObject({
+      operationId: attempt.start.mock.calls[0]?.[0].operationId,
+      deadline: attempt.start.mock.calls[0]?.[1].deadline,
+      sink: onProgress,
+    });
+  });
+
   it.each([
     ['channel root only', { REVO_ACTIVATION_CHANNEL_ROOT: '/private/channel' }],
     ['generation only', { REVO_ACTIVATION_GENERATION_ID: 'a'.repeat(64) }],
@@ -152,13 +225,6 @@ describe('server launcher composition', () => {
     );
     await expect(service.launch(request({ env }))).rejects.toThrow('activation binding is invalid');
     expect(attempt.start).not.toHaveBeenCalled();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.unstubAllEnvs();
-    attempt.ports.length = 0;
-    attempt.start.mockReset();
   });
 
   it('propagates a resolver rejection beyond the maximum startup timeout without any launch work', async () => {

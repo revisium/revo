@@ -6,9 +6,11 @@ import { describe, expect, it } from 'vitest';
 
 import { ConfigurationError } from '../../src/configuration/configuration-error.js';
 import { ManagedProcessError } from '../../src/processes/managed-process-error.js';
+import { ProgressOperation, parseProgressEvent } from '../../src/progress/index.js';
 import type { ServerLaunchResult } from '../../src/server/server-launcher.service.js';
 import type { ServerStatus } from '../../src/server/server-status.service.js';
 import { CliScenario } from '../support/cli/cli-scenario.js';
+import { ProgressOutputScenario } from '../support/cli/progress-output-scenario.js';
 import {
   FIXTURE_DATA_DIR,
   ServerCommandScenario,
@@ -227,6 +229,52 @@ describe('server command presentation', () => {
 });
 
 describe('server command requests and failures', () => {
+  it.each([['--progress'], ['--progress='], ['--progress=human'], ['--progress=secret']])(
+    'rejects invalid progress arguments %s before launch',
+    async (...args) => {
+      const result = await run(['server', 'start', ...args]);
+      expect(result).toMatchObject({ exitCode: 2, stdout: '', launches: [] });
+      expect(result.stderr).not.toContain('secret');
+    },
+  );
+
+  it('streams domain JSONL without the text summary or leaking progress into configuration', async () => {
+    const operation = new ProgressOperation({ operationId: 'a'.repeat(32), now: () => 0 });
+    const events = [operation.start('server-start'), operation.ready({ url: STARTED.url })];
+    const result = await run(['server', 'start', '--progress=jsonl', '--port', '3300'], {
+      launch: async (request) => {
+        await events.reduce<Promise<void>>(
+          (pending, event) => pending.then(() => event && request.onProgress?.(event)),
+          Promise.resolve(),
+        );
+        return STARTED;
+      },
+    });
+    expect(result).toMatchObject({ exitCode: 0, stderr: '', listeners: NO_LISTENERS });
+    expect(result.launches).toHaveLength(1);
+    expect(result.launches[0]?.flags).toEqual({ port: '3300' });
+    expect(
+      result.stdout
+        .trimEnd()
+        .split('\n')
+        .map((line) => parseProgressEvent(JSON.parse(line))),
+    ).toEqual(events);
+  });
+
+  it('reports progress output failure honestly with a fixed diagnostic', async () => {
+    const result = await run(['server', 'start', '--progress=jsonl'], {
+      launch: async () => {
+        throw launchError('START_PROGRESS_OUTPUT_FAILED');
+      },
+    });
+    expect(result).toMatchObject({
+      exitCode: 1,
+      stdout: '',
+      listeners: NO_LISTENERS,
+      stderr: 'Server is running, but startup progress output failed.\n',
+    });
+  });
+
   it('resolves only the selected lifecycle log configuration', async () => {
     const result = await ServerCommandScenario.run([
       'server',
@@ -349,5 +397,71 @@ describe('server command requests and failures', () => {
     expect(result.listeners).toEqual(NO_LISTENERS);
     expect(result.launches[0]?.signal.aborted).toBe(row.aborted);
     expect(result).toMatchObject({ exitCode: 1, stderr: row.stderr, stdout: '' });
+  });
+});
+
+describe('JSONL output backpressure', () => {
+  it('waits for the write callback and drain before accepting the next event', async () => {
+    const scenario = new ProgressOutputScenario();
+    try {
+      let settled = false;
+      const pending = scenario.write().then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      scenario.drain();
+      await pending;
+      expect(scenario.lines).toHaveLength(1);
+      expect(scenario.listeners().drain).toBe(0);
+    } finally {
+      scenario.close();
+    }
+    expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
+  });
+
+  it.each(['EPIPE', 'timeout'] as const)(
+    'disables output after %s and releases listeners',
+    async (failure) => {
+      const scenario = new ProgressOutputScenario();
+      try {
+        const pending = scenario.write();
+        if (failure === 'EPIPE') {
+          scenario.fail();
+        }
+        await expect(pending).rejects.toMatchObject({ code: 'START_PROGRESS_OUTPUT_FAILED' });
+        if (failure === 'EPIPE') {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        await expect(scenario.write()).rejects.toThrow(
+          'Server is running, but startup progress output failed.',
+        );
+        expect(scenario.lines).toHaveLength(1);
+        expect(scenario.listeners().drain).toBe(0);
+      } finally {
+        scenario.close();
+      }
+      expect(scenario.listeners()).toEqual({
+        error: failure === 'EPIPE' ? 0 : 1,
+        drain: 0,
+      });
+      await scenario.destroy();
+      expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
+    },
+  );
+
+  it('handles a late EPIPE after output timeout and close', async () => {
+    const scenario = new ProgressOutputScenario();
+    try {
+      const pending = scenario.write();
+      await expect(pending).rejects.toMatchObject({ code: 'START_PROGRESS_OUTPUT_FAILED' });
+      scenario.close();
+      scenario.fail();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
+    } finally {
+      await scenario.destroy();
+    }
+    expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
   });
 });

@@ -1,5 +1,6 @@
 import { Option, SubCommand } from 'nest-commander';
 
+import { CliUsageError } from '../cli-error.js';
 import { ServerCommandService } from '../server-command.service.js';
 import { StrictCommandRunner } from './strict-command-runner.js';
 @SubCommand({ name: 'start', description: 'Start the Revo server' })
@@ -10,6 +11,14 @@ export class ServerStartCommand extends StrictCommandRunner {
 
   async run(_passedParams: string[], flags: Record<string, string> = {}): Promise<void> {
     await this.server.start(flags);
+  }
+
+  @Option({ flags: '--progress <format>', description: 'Startup progress format (jsonl)' })
+  progress(value: string): string {
+    if (value !== 'jsonl') {
+      throw new CliUsageError('Startup progress format must be jsonl.');
+    }
+    return value;
   }
 
   @Option({ flags: '--channel <channel>', description: 'Release channel to start' })

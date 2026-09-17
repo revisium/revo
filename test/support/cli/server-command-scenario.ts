@@ -1,5 +1,7 @@
 // oxlint-disable-next-line import/no-unassigned-import -- decorators require this side effect first
 import 'reflect-metadata';
+import { Writable } from 'node:stream';
+
 import { Module, type Type } from '@nestjs/common';
 import { CommandFactory } from 'nest-commander';
 
@@ -174,6 +176,17 @@ class CommandRecorder {
 
   writeError(message: string): void {
     this.errors.push(line(message));
+  }
+
+  progress() {
+    return new OutputService().progress(
+      new Writable({
+        write: (chunk: Buffer, _encoding, callback) => {
+          this.outputs.push(chunk.toString());
+          callback();
+        },
+      }),
+    );
   }
 
   async launch(request: Readonly<ServerLaunchRequest>): Promise<ServerLaunchResult> {

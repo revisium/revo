@@ -6,6 +6,7 @@ import {
   type ServerHostParentMessage,
   type ServerHostStartMessage,
 } from '../../../src/server/server-host-protocol.js';
+import type { StartedServer } from '../../../src/server/server-launch-attempt.js';
 
 const ATTEMPT_URL = new URL('../../../src/server/server-launch-attempt.js', import.meta.url).href;
 export const OPERATION_ID = '0123456789abcdef0123456789abcdef';
@@ -37,6 +38,7 @@ type SendKind = ServerHostParentMessage['type'];
 export class ServerLaunchAttemptScenario {
   readonly process = new ControlledAttemptProcess();
   readonly cancellation = new AbortController();
+  deadline = 0;
   private attempt:
     | {
         start(
@@ -45,7 +47,7 @@ export class ServerLaunchAttemptScenario {
         ): Promise<{ readonly kind: 'started'; readonly url: string }>;
       }
     | undefined;
-  private operation: Promise<unknown> | undefined;
+  private operation: Promise<StartedServer> | undefined;
 
   async load(): Promise<this> {
     const { ServerLaunchAttempt } = await vi.importActual<AttemptModule>(ATTEMPT_URL);
@@ -53,12 +55,13 @@ export class ServerLaunchAttemptScenario {
     return this;
   }
 
-  start(timeoutMs = 5_000): Promise<unknown> {
+  start(timeoutMs = 5_000): Promise<StartedServer> {
     if (!this.attempt) {
       throw new Error('Launch attempt scenario was not loaded.');
     }
+    this.deadline = Date.now() + timeoutMs;
     this.operation = this.attempt.start(startMessage(), {
-      deadline: Date.now() + timeoutMs,
+      deadline: this.deadline,
       signal: this.cancellation.signal,
     });
     return this.operation;
@@ -141,6 +144,7 @@ export class ControlledAttemptProcess implements AttemptProcessPort {
   private readonly listeners = new Set<(message: unknown) => void>();
   private readonly sends = new Map<SendKind, Deferred<void>[]>();
   private stopGate: Deferred<void> | undefined;
+  private detachGate: Deferred<void> | undefined;
   private readonly completionGate = deferred<{
     readonly exitCode: number | null;
     readonly signal: NodeJS.Signals | null;
@@ -182,6 +186,23 @@ export class ControlledAttemptProcess implements AttemptProcessPort {
 
   async detachCommitted(): Promise<void> {
     this.detachCommittedCalls += 1;
+    await this.detachGate?.promise;
+  }
+
+  holdDetach(): void {
+    this.detachGate = deferred<void>();
+  }
+
+  settleDetach(fail = false): void {
+    if (fail) {
+      this.detachGate?.reject(new Error('private detach failure'));
+    } else {
+      this.detachGate?.resolve();
+    }
+  }
+
+  listenerCount(): number {
+    return this.listeners.size;
   }
 
   async abandonUncertain(): Promise<void> {
