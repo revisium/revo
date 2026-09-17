@@ -124,6 +124,7 @@ describe('activation helper boundary', () => {
     let received:
       | { candidate: { packageBin: string; nodeArchiveSha256: string }; channelRoot: string }
       | undefined;
+    const listenersBefore = process.listenerCount('SIGTERM');
     try {
       const result = await activateInstall(
         {
@@ -136,6 +137,12 @@ describe('activation helper boundary', () => {
         {
           activate: async (input) => {
             received = { candidate: input.candidate, channelRoot: input.channelRoot };
+            if (input.signal === undefined) {
+              throw new Error('activation signal missing');
+            }
+            process.emit('SIGTERM');
+            await Promise.resolve();
+            expect(input.signal.aborted).toBe(true);
             return { status: 'activated', generationId: 'c'.repeat(64) };
           },
         },
@@ -145,6 +152,7 @@ describe('activation helper boundary', () => {
         channelRoot,
         candidate: { packageBin: 'dist/bin/revo.js', nodeArchiveSha256: 'a'.repeat(64) },
       });
+      expect(process.listenerCount('SIGTERM')).toBe(listenersBefore);
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
     }
