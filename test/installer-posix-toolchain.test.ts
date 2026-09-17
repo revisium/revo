@@ -42,7 +42,12 @@ it.each(['stable', 'alpha'] as const)(
     );
     try {
       expect(subject.plan.release.version).toMatch(/^0\.0\./u);
-      expect(await subject.startInstaller().finish).toBe(0);
+      const installation = subject.startInstaller();
+      expect(await installation.finish).toBe(0);
+      const running = await subject.status();
+      expect(running.kind).toBe('running');
+      expect(installation.stdout()).toContain('http://127.0.0.1:');
+      expect(installation.stdout()).toContain('Command now:');
       const downloads = await readFile(subject.calls, 'utf8');
       const artifactRequests = await readFile(subject.fetchCalls, 'utf8');
       const pnpmInvocations = await readFile(subject.pnpmCalls, 'utf8');
@@ -54,6 +59,7 @@ it.each(['stable', 'alpha'] as const)(
       expect(current.record.launcherProtocol).toBe('revo-activation-launcher/v2');
       const generation = current.record.generationId;
       expect(await subject.startInstaller().finish).toBe(0);
+      expect(await subject.status()).toEqual(running);
       expect(await readFile(subject.calls, 'utf8')).toBe(downloads);
       expect(await readFile(subject.fetchCalls, 'utf8')).toBe(artifactRequests);
       expect(await readFile(subject.pnpmCalls, 'utf8')).toBe(pnpmInvocations);
@@ -129,6 +135,7 @@ it('real activation refuses during startup and succeeds after the owner closes',
     await mkdir(data, { recursive: true, mode: 0o700 });
     await writeFile(join(data, 'sentinel'), 'sentinel\n');
     expect(await first.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
+    await first.stopServer(data);
     const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
     const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
@@ -186,6 +193,7 @@ it('real activation cancellation before commit preserves current and retains the
   const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
   try {
     expect(await first.startInstaller().finish).toBe(0);
+    await first.stopServer();
     const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     await writeFile(gate, 'hold\n', { mode: 0o600 });
     const running = second.startInstaller({ REVO_TEST_ACTIVATION_FAULT: 'cancel' });
@@ -217,6 +225,7 @@ it('real activation retains a committed generation when helper acknowledgement i
   const second = await portableToolchain('stable', '0.0.1', false, true, join(first.root, 'state'));
   try {
     expect(await first.startInstaller().finish).toBe(0);
+    await first.stopServer();
     const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     const running = second.startInstaller({ REVO_TEST_ACTIVATION_FAULT: 'unknown' });
     expect(await running.finish).not.toBe(0);

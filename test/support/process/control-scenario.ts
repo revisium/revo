@@ -288,6 +288,21 @@ export class ControlScenario {
     };
   }
 
+  async createsMissingPrivateRuntimeParents() {
+    const process = await new ProcessIdentityService().capture(globalThis.process.pid);
+    const root = await this.runtimeDir();
+    const runtimeDir = join(root, 'Library', 'Application Support', 'Revo', 'state', 'run');
+    const endpoint = await new ControlEndpointService().listen({
+      runtimeDir,
+      instanceId: INSTANCE,
+      token: TOKEN,
+      onStop: () => undefined,
+      identity: { version: '1', channel: 'stable', canonicalDataDir: '/data', process },
+    });
+    this.endpoints.push(endpoint);
+    return { mode: (await stat(runtimeDir)).mode & 0o777 };
+  }
+
   async rejectsPublicRuntimeDirectory() {
     const runtimeDir = await this.runtimeDir();
     await chmod(runtimeDir, 0o755);
@@ -376,7 +391,7 @@ export class ControlScenario {
     await Promise.all([...this.roots].map((root) => rm(root, { recursive: true, force: true })));
   }
   private async runtimeDir() {
-    const root = await mkdtemp(join(tmpdir(), 'r4-'));
+    const root = await mkdtemp(process.platform === 'darwin' ? '/tmp/r4-' : join(tmpdir(), 'r4-'));
     this.roots.add(root);
     return root;
   }

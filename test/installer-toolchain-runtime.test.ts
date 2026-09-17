@@ -66,6 +66,54 @@ const input = async (data: Data) => ({
 });
 
 describe('toolchain runtime handoff', () => {
+  it('keeps stage notifications separate from pnpm output and starts only after activation', async () => {
+    const data = await fixture();
+    const stages: string[] = [];
+    const order: string[] = [];
+    const progress = { feed: vi.fn<(chunk: string) => void>(), finish: vi.fn<() => void>() };
+    const receipt = { status: 'activated', generationId: 'a'.repeat(64) };
+    const packageResult = { directory: '/prepared/package' };
+    await api.runInstallMode({
+      ...(await input(data)),
+      onProgress: (stage: string) => stages.push(stage),
+      packageProgress: progress,
+      packageInstaller: async (request: Data) => {
+        expect(request.progress).toBe(progress);
+        expect(request.onProgress).toBeTypeOf('function');
+        order.push('package');
+        return packageResult;
+      },
+      activatePackage: async () => {
+        order.push('activation');
+        return receipt;
+      },
+      startPackage: async (request: Data) => {
+        expect(request.activation).toBe(receipt);
+        expect(request.packageResult).toBe(packageResult);
+        order.push('start');
+      },
+    });
+    expect(order).toEqual(['package', 'activation', 'start']);
+    expect(stages).toContain('download');
+    expect(progress.feed).not.toHaveBeenCalled();
+  });
+
+  it('never starts after activation rejection', async () => {
+    const data = await fixture();
+    const startPackage = vi.fn<() => Promise<void>>();
+    await expect(
+      api.runInstallMode({
+        ...(await input(data)),
+        packageInstaller: async () => ({ directory: '/prepared/package' }),
+        activatePackage: async () => {
+          throw new Error('activation refused');
+        },
+        startPackage,
+      }),
+    ).rejects.toThrow('activation refused');
+    expect(startPackage).not.toHaveBeenCalled();
+  });
+
   it('uses the executing private Node to publish v3 pnpm and writes the Node receipt', async () => {
     const data = await fixture();
     const options = await input(data);

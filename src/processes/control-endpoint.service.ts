@@ -258,7 +258,7 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
     throw new ControlTransportError('Invalid runtime directory');
   }
   try {
-    await mkdir(directory, { mode: 0o700 });
+    await mkdir(directory, { mode: 0o700, recursive: true });
   } catch (error) {
     if (errorCode(error) !== 'EEXIST') {
       throw new ControlTransportError();

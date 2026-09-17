@@ -18,6 +18,9 @@ import { join } from 'node:path';
 
 import { vi } from 'vitest';
 
+import { LoopbackPortAllocator } from '../../../src/postgres/loopback-port-allocator.js';
+import { ServerStatusService } from '../../../src/server/server-status.service.js';
+import { ServerStopService } from '../../../src/server/server-stop.service.js';
 import {
   bootstrapPolicy,
   embeddedBootstrap,
@@ -30,6 +33,7 @@ type Builder = { buildInstaller(input: unknown): string };
 type Data = { readonly channel?: string };
 let cachedNodeArchive: Buffer | undefined;
 let cachedPnpmArchive: Buffer | undefined;
+const installedData = new Map<string, Set<string>>();
 
 const run = (command: string, args: readonly string[]) =>
   new Promise<void>((resolve, reject) => {
@@ -47,7 +51,22 @@ export async function portableToolchain(
   realActivation = false,
   installRoot?: string,
 ) {
-  const root = await mkdtemp(join(tmpdir(), 'revo-c3b-'));
+  // macOS ignores the XDG overrides used by the fixture; keep its HOME short enough
+  // for the Unix-domain control socket limit while retaining a private temp root.
+  const root = await mkdtemp(
+    process.platform === 'darwin' ? '/tmp/r' : join(tmpdir(), 'revo-c3b-'),
+  );
+  const home = process.platform === 'darwin' ? '/tmp/r' : root;
+  await mkdir(home, { recursive: true, mode: 0o700 });
+  await Promise.all(
+    ['config', 'data', 'logs', 'cache', 'run'].map((directory) =>
+      mkdir(join(root, directory), { mode: 0o700 }),
+    ),
+  );
+  const dataDir = join(installRoot ?? join(root, 'state'), 'test-data', channel);
+  const reserved = await new LoopbackPortAllocator().reserve();
+  const port = reserved.port;
+  await reserved.release();
   const tools = join(root, 'tools');
   const nodeSource = join(root, 'node');
   const pnpmSource = join(root, 'pnpm');
@@ -211,13 +230,27 @@ export async function portableToolchain(
   await chmod(join(tools, 'curl'), 0o755);
   await writeFile(join(root, 'install.sh'), script, { mode: 0o700 });
   const startInstaller = (extra: Record<string, string> = {}) => {
+    if (realActivation) {
+      const paths = installedData.get(root) ?? new Set<string>();
+      paths.add(extra.REVO_DATA_DIR ?? dataDir);
+      installedData.set(root, paths);
+    }
     let child!: ChildProcess;
     let stderr = '';
+    let stdout = '';
     const finish = new Promise<number>((resolve) => {
       child = spawn('/bin/sh', [join(root, 'install.sh')], {
         env: {
           ...process.env,
-          HOME: root,
+          HOME: home,
+          XDG_CONFIG_HOME: join(root, 'config'),
+          XDG_DATA_HOME: join(root, 'data'),
+          XDG_STATE_HOME: join(root, 'logs'),
+          XDG_CACHE_HOME: join(root, 'cache'),
+          XDG_RUNTIME_DIR: join(root, 'run'),
+          REVO_DATA_DIR: dataDir,
+          REVO_PORT: String(port),
+          REVO_PUBLIC_URL: `http://127.0.0.1:${port}`,
           PATH: `${tools}:${process.env.PATH ?? '/usr/bin:/bin'}`,
           REVO_INSTALL_ROOT: installRoot ?? join(root, 'state'),
           REVO_FIXTURE_NODE_ARCHIVE: nodeArchive,
@@ -234,7 +267,11 @@ export async function portableToolchain(
           NODE_OPTIONS: `--import=${preload}`,
           ...extra,
         },
-        stdio: ['ignore', 'ignore', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.stdout?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk: string) => {
+        stdout += chunk.slice(0, Math.max(0, 256 * 1024 - stdout.length));
       });
       child.stderr?.setEncoding('utf8');
       child.stderr?.on('data', (chunk: string) => {
@@ -263,7 +300,7 @@ export async function portableToolchain(
         resolve(code ?? 1);
       });
     });
-    return { child, finish };
+    return { child, finish, stdout: () => stdout };
   };
   const runInstaller = () => startInstaller().finish;
   const attempts = async () =>
@@ -277,6 +314,9 @@ export async function portableToolchain(
   };
   return {
     root,
+    dataDir,
+    status: () => new ServerStatusService().read(dataDir),
+    stopServer: (directory = dataDir) => stopInstalledServer(directory),
     plan: packages.plan,
     script,
     runInstaller,
@@ -298,7 +338,19 @@ export async function portableToolchain(
 }
 
 export async function cleanupPortableToolchain(root: string) {
+  await Promise.all([...(installedData.get(root) ?? [])].map(stopInstalledServer));
+  installedData.delete(root);
   await rm(root, { recursive: true, force: true });
+}
+
+async function stopInstalledServer(dataDir: string): Promise<void> {
+  if ((await new ServerStatusService().read(dataDir)).kind === 'stopped') {
+    return;
+  }
+  const stopped = await new ServerStopService().stop(dataDir, 30_000);
+  if (stopped.kind !== 'completed') {
+    throw new Error('installed server cleanup was not confirmed; fixture retained');
+  }
 }
 
 export async function toolchainInstaller(channel: 'stable' | 'alpha' = 'stable') {

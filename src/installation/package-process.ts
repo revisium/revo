@@ -72,6 +72,7 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
   platform = process.platform,
   spawnProcess = (command, argv, options) => spawn(command, [...argv], options),
   progress,
+  onStdout,
 }: {
   readonly executable: string;
   readonly args: readonly string[];
@@ -83,6 +84,7 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
   readonly platform?: NodeJS.Platform;
   readonly spawnProcess?: SpawnRequest;
   readonly progress?: PnpmProgressSink;
+  readonly onStdout?: (chunk: Uint8Array | string) => void;
 }): Promise<PackageProcessResult> {
   if (!executable.startsWith('/') || !cwd.startsWith('/') || !diagnosticPath.startsWith('/'))
     throw failure('absolute paths are required');
@@ -183,7 +185,11 @@ export async function runPackageProcess /* NOSONAR -- bounded process state mach
           })
           .then(() => undefined),
       );
-      progress?.feed(chunk instanceof Uint8Array ? chunk : String(chunk));
+      if (kind === 'stdout') {
+        const data = chunk instanceof Uint8Array ? chunk : String(chunk);
+        progress?.feed(data);
+        onStdout?.(data);
+      }
     };
     const abort = () => void stop('cancelled').catch(() => undefined);
     const onError = (cause: unknown) => {

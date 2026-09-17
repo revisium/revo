@@ -90,6 +90,9 @@ describe('authenticated private control transport', () => {
       code: 'CONTROL_TRANSPORT_ERROR',
     });
   });
+  it('creates missing private runtime parents', async () => {
+    await expect(scenario.createsMissingPrivateRuntimeParents()).resolves.toEqual({ mode: 0o700 });
+  });
   it('runs an accepted stop after disconnect and resolves close-before-stop', async () => {
     await expect(scenario.disconnectsAfterAcceptedStop()).resolves.toBe(1);
     await expect(scenario.closesBeforeStop()).resolves.toEqual({ kind: 'not-requested' });

@@ -1004,8 +1004,10 @@ export async function runInstallMode({
   signal,
   request,
   onProgress,
+  packageProgress,
   packageInstaller,
   activatePackage,
+  startPackage,
 } = {}) {
   if (
     [dataPath, receiptPath, target, archiveSha256, channelRoot, privateNodeRoot, scratch].some(
@@ -1034,7 +1036,9 @@ export async function runInstallMode({
     request,
     onProgress,
   });
+  let startup;
   if (packageInstaller !== undefined) {
+    onProgress?.('package-prepare');
     const packageResult = await packageInstaller({
       nodeExecutable,
       pnpmExecutable: result.executablePath,
@@ -1043,10 +1047,12 @@ export async function runInstallMode({
       channelRoot,
       scratch,
       ...(signal === undefined ? {} : { signal }),
-      ...(onProgress === undefined ? {} : { progress: onProgress }),
+      ...(onProgress === undefined ? {} : { onProgress }),
+      ...(packageProgress === undefined ? {} : { progress: packageProgress }),
     });
-    if (activatePackage !== undefined)
-      await activatePackage({
+    if (activatePackage !== undefined) {
+      onProgress?.('activation');
+      const activation = await activatePackage({
         packageResult,
         nodeExecutable,
         pnpmExecutable: result.executablePath,
@@ -1056,6 +1062,17 @@ export async function runInstallMode({
         scratch,
         ...(signal === undefined ? {} : { signal }),
       });
+      if (startPackage !== undefined) {
+        startup = {
+          activation,
+          packageResult,
+          nodeExecutable,
+          channelRoot,
+          scratch,
+          ...(signal === undefined ? {} : { signal }),
+        };
+      }
+    }
   }
   const receipt = `${JSON.stringify({ version: decoded.bootstrap.nodeVersion, target, archiveSha256 })}\n`;
   const receiptInfo = await lstat(receiptPath).catch(() => undefined);
@@ -1073,6 +1090,10 @@ export async function runInstallMode({
     (await readFile(receiptPath, 'utf8')) !== receipt
   )
     throw new Error('Node install receipt is incompatible.');
+  if (startup !== undefined) {
+    onProgress?.('server');
+    await startPackage(startup);
+  }
   return { ...result, nodeExecutable };
 }
 

@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { dirname } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
@@ -63,9 +64,10 @@ export class ServerLauncherService {
     const environment = buildCoreChildEnvironment(request.env).env;
     const operationId = randomBytes(16).toString('hex');
     const deadline = Date.now() + resolved.startupTimeout;
+    process.stderr.write(`server launcher spawning ${SERVER_ENTRY}\n`);
     const launched = await this.processes.start(
       {
-        cwd: resolved.installDir,
+        cwd: dirname(SERVER_ENTRY),
         entry: SERVER_ENTRY,
         env: environment,
         executable: process.execPath,

@@ -11,6 +11,7 @@ import {
   publishPreparedPackage,
   readPreparedPackage,
 } from '../src/installation/prepared-package.js';
+import { InstallSession, installEnvironment } from './install-session.mjs';
 import { publishNodeBootstrap, runBootstrap, runInstallMode } from './node-bootstrap.mjs';
 
 const packageInstaller = (platform, arch) => {
@@ -28,9 +29,11 @@ const packageInstaller = (platform, arch) => {
     scratch,
     signal,
     progress,
+    onProgress,
   }) => {
     const reused = await readPreparedPackage(channelRoot, plan);
-    if (reused !== undefined)
+    if (reused !== undefined) {
+      onProgress?.('package-reuse');
       return {
         directory: reused,
         version: plan.release.version,
@@ -39,6 +42,7 @@ const packageInstaller = (platform, arch) => {
         pnpmArchiveSha256,
         reused: true,
       };
+    }
     const installed = await acquireAndInstallPackage({
       plan,
       nodeArchiveSha256,
@@ -48,6 +52,12 @@ const packageInstaller = (platform, arch) => {
       nodeExecutable,
       ...(signal === undefined ? {} : { signal }),
       ...(progress === undefined ? {} : { progress }),
+      ...(onProgress === undefined
+        ? {}
+        : {
+            onProgress: (stage) =>
+              onProgress(stage === 'dependencies' ? stage : `package-${stage}`),
+          }),
     });
     const published = await publishPreparedPackage({
       plan,
@@ -93,47 +103,27 @@ const activatePrepared = async ({
       executable: nodeExecutable,
       args: [helper, requestPath],
       cwd: packageResult.directory,
-      env: {
-        PATH: `${resolve(nodeExecutable, '..')}:/usr/bin:/bin`,
-        NODE_PATH: '',
-        ...Object.fromEntries(
-          [
-            'HOME',
-            'XDG_CONFIG_HOME',
-            'XDG_DATA_HOME',
-            'XDG_STATE_HOME',
-            'XDG_CACHE_HOME',
-            'XDG_RUNTIME_DIR',
-            'REVO_CONFIG',
-            'REVO_CHANNEL',
-            'REVO_DATABASE_URL',
-            'REVO_DATA_DIR',
-            'REVO_HOST',
-            'REVO_LOG_DIR',
-            'REVO_PORT',
-            'REVO_PUBLIC_URL',
-            'REVO_STARTUP_TIMEOUT',
-          ]
-            .filter((key) => process.env[key] !== undefined)
-            .map((key) => [key, process.env[key]]),
-        ),
-      },
+      env: installEnvironment(nodeExecutable, packageResult.plan.release.channel),
       diagnosticPath,
       ...(signal === undefined ? {} : { signal }),
     });
     if (result.exitCode !== 0 || result.signal !== null)
-      throw new Error('activation helper failed');
+      throw Object.assign(new Error('ACTIVATION_UNCONFIRMED'), { diagnosticPath });
     let validResult = false;
+    let receipt;
     try {
       const parsed = JSON.parse(result.stdout);
+      receipt = parsed;
       validResult =
         parsed?.schemaVersion === 'revo-install-activate/v1' &&
+        Object.keys(parsed).length === 3 &&
         (parsed.status === 'activated' || parsed.status === 'unchanged') &&
         typeof parsed.generationId === 'string' &&
         /^[a-f0-9]{64}$/u.test(parsed.generationId);
     } catch {}
-    if (!validResult) throw new Error('activation helper result is invalid');
+    if (!validResult) throw Object.assign(new Error('ACTIVATION_UNCONFIRMED'), { diagnosticPath });
     confirmed = true;
+    return receipt;
   } finally {
     if (confirmed) await rm(requestDirectory, { recursive: true, force: true });
   }
@@ -145,6 +135,20 @@ if (
 ) {
   process.env.REVO_BOOTSTRAP_ENTRY = '1';
   const controller = new AbortController();
+  const managedMode =
+    process.env.REVO_INSTALL_MODE === 'node' || process.env.REVO_INSTALL_MODE === 'pnpm';
+  const session = managedMode ? new InstallSession() : undefined;
+  if (session !== undefined) {
+    // Keep handlers for the lifetime of the entry: write errors can arrive after finish().
+    process.stdout.on('error', () => {
+      session.markOutputFailed('stdout');
+      process.exitCode = 1;
+    });
+    process.stderr.on('error', () => {
+      session.markOutputFailed('stderr');
+      process.exitCode = 1;
+    });
+  }
   const abort = () => controller.abort();
   for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) process.on(signal, abort);
   try {
@@ -162,6 +166,7 @@ if (
         platform: process.env.REVO_PLATFORM,
         arch: process.env.REVO_ARCH,
         signal: controller.signal,
+        onProgress: session.stage,
       });
     } else if (process.env.REVO_INSTALL_MODE === 'pnpm')
       await runInstallMode({
@@ -179,6 +184,9 @@ if (
           REVO_PACKAGE_INSTALL_PLAN,
         ),
         activatePackage: activatePrepared,
+        startPackage: session.start,
+        onProgress: session.stage,
+        packageProgress: session.packageProgress,
       });
     else
       await runBootstrap({
@@ -187,6 +195,15 @@ if (
         target: process.env.REVO_NODE_TARGET,
         archiveSha256: process.env.REVO_NODE_ARCHIVE_SHA256,
       });
+    if (session !== undefined) {
+      await session.finish();
+    }
+  } catch (error) {
+    if (session === undefined) {
+      throw error;
+    }
+    process.exitCode = 1;
+    await session.fail(process.env.REVO_INSTALL_SCRATCH, error);
   } finally {
     for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) process.removeListener(signal, abort);
   }
