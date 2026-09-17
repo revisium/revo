@@ -149,20 +149,34 @@ async function packageBin(directory: string): Promise<string> {
 }
 
 const path = process.argv[2];
+export async function runActivationHelper(requestPath: string, trustedRoot: string): Promise<number> {
+  try {
+    const result = await activateInstall(await readActivationRequest(requestPath, trustedRoot));
+    const valid =
+      (result.status === 'activated' || result.status === 'unchanged') &&
+      typeof result.generationId === 'string' &&
+      /^[a-f0-9]{64}$/u.test(result.generationId);
+    if (!valid) {
+      process.stderr.write('activation helper failed\n');
+      return 1;
+    }
+    process.stdout.write(
+      `${JSON.stringify({ schemaVersion: ACTIVATION_REQUEST_SCHEMA, ...result })}\n`,
+    );
+    return 0;
+  } catch {
+    process.stderr.write('activation helper failed\n');
+    return 1;
+  }
+}
+
 if (
   path !== undefined &&
   process.argv[1] !== undefined &&
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
 ) {
-  try {
-    const root = resolve(dirname(process.argv[1]), '../../../../..');
-    const result = await activateInstall(await readActivationRequest(path, root));
-    process.stdout.write(
-      `${JSON.stringify({ schemaVersion: ACTIVATION_REQUEST_SCHEMA, ...result })}\n`,
-    );
-    process.exitCode = result.status === 'activated' || result.status === 'unchanged' ? 0 : 1;
-  } catch {
-    process.stderr.write('activation helper failed\n');
-    process.exitCode = 1;
-  }
+  process.exitCode = await runActivationHelper(
+    path,
+    resolve(dirname(process.argv[1]), '../../../../..'),
+  );
 }
