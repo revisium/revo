@@ -179,6 +179,15 @@ const validatePackage = (value: Record<string, unknown>, plan: PackageInstallPla
   )
     throw error('package workspace is external');
 };
+const workspaceBlock = (lines: string[], index: number): string[] => {
+  const child: string[] = [];
+  for (const line of lines.slice(index + 1)) {
+    if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
+    if (line === line.trimStart()) break;
+    child.push(line);
+  }
+  return child;
+};
 const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void => {
   const value = text(bytes);
   const lines = value.split('\n');
@@ -194,21 +203,38 @@ const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void =>
     })
   )
     throw error('workspace contains an external path');
-  const index = lines.findIndex((line) => line.trimStart().startsWith('allowBuilds:'));
-  if (index < 0) throw error('workspace allowBuilds is missing');
+  const headers = lines.flatMap((line, i) => (/^allowBuilds:\s*$/u.test(line) ? [i] : []));
+  if (headers.length !== 1) throw error('workspace allowBuilds is missing or duplicated');
+  const index = headers[0];
+  if (index === undefined) throw error('workspace allowBuilds is missing');
   const allowLine = lines[index];
   if (allowLine === undefined) throw error('workspace allowBuilds is missing');
   const first = allowLine.slice(allowLine.indexOf(':') + 1).trim();
-  const raw =
-    first.startsWith('[') && first.endsWith(']')
-      ? first.slice(1, -1)
-      : lines
-          .slice(index + 1)
-          .filter((line) => line.trimStart().startsWith('-'))
-          .join('\n');
+  const child = workspaceBlock(lines, index);
+  const raw = first.startsWith('[') && first.endsWith(']') ? first.slice(1, -1) : child.join('\n');
+  if (
+    child.some((line) => line.trimStart().startsWith('-')) &&
+    child.some((line) => !line.trimStart().startsWith('-'))
+  )
+    throw error('workspace allowBuilds mixes map and list');
+  const map = child.filter((line) => !line.trimStart().startsWith('-'));
+  if (map.length > 0) {
+    const seen = new Set<string>();
+    const entries = map.flatMap((line) => {
+      const match = /^\s*["']?([^"':\s]+)["']?\s*:\s*(true|false)\s*$/u.exec(line);
+      const key = match?.[1];
+      const enabled = match?.[2];
+      if (key === undefined || enabled === undefined || seen.has(key))
+        throw error('workspace allowBuilds map is invalid');
+      seen.add(key);
+      return enabled === 'true' ? [key] : [];
+    });
+    if (!entries.length) throw error('workspace allowBuilds is missing');
+    return validateAllowedBuilds(entries, plan);
+  }
   const entries = raw
     .split(/[\n,]/u)
-    .map((item) => item.replace(/["'\s-]/gu, ''))
+    .map((item) => item.trim().replace(/^[-"']|["']$/gu, ''))
     .filter(Boolean);
   if (
     !entries.length ||
@@ -217,6 +243,9 @@ const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void =>
     )
   )
     throw error('workspace allowBuilds must be version-qualified');
+  validateAllowedBuilds(entries, plan);
+};
+const validateAllowedBuilds = (entries: string[], plan: PackageInstallPlan): void => {
   const versions = new Map([
     [plan.components.core.name, plan.components.core.version],
     [plan.components.admin.name, plan.components.admin.version],
@@ -225,6 +254,8 @@ const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void =>
     const at = item.lastIndexOf('@');
     if (versions.has(item.slice(0, at)) && versions.get(item.slice(0, at)) !== item.slice(at + 1))
       throw error('workspace allowBuilds version does not match plan');
+    if (at < 1 || !semver.test(item.slice(at + 1)))
+      throw error('workspace allowBuilds must be version-qualified');
   }
 };
 
