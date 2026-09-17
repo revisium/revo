@@ -197,7 +197,22 @@ describe('activation helper boundary', () => {
       },
     );
     let received:
-      | { candidate: { packageBin: string; nodeArchiveSha256: string }; channelRoot: string }
+      | {
+          candidate: {
+            packageBin: string;
+            packageDirectory: string;
+            nodeDirectory: string;
+            pnpmDirectory: string;
+            nodeArchiveSha256: string;
+            pnpmArchiveSha256: string;
+          };
+          channelRoot: string;
+          configuration: {
+            packageVersion: string;
+            wrapperChannel?: string;
+            env: NodeJS.ProcessEnv;
+          };
+        }
       | undefined;
     const listenersBefore = process.listenerCount('SIGTERM');
     try {
@@ -211,7 +226,11 @@ describe('activation helper boundary', () => {
         },
         {
           activate: async (input) => {
-            received = { candidate: input.candidate, channelRoot: input.channelRoot };
+            received = {
+              candidate: input.candidate,
+              channelRoot: input.channelRoot,
+              configuration: input.configuration,
+            };
             if (input.signal === undefined) {
               throw new Error('activation signal missing');
             }
@@ -225,9 +244,61 @@ describe('activation helper boundary', () => {
       expect(result).toEqual({ status: 'activated', generationId: 'c'.repeat(64) });
       expect(received).toMatchObject({
         channelRoot,
-        candidate: { packageBin: 'dist/bin/revo.js', nodeArchiveSha256: 'a'.repeat(64) },
+        candidate: {
+          packageBin: 'dist/bin/revo.js',
+          packageDirectory: target,
+          nodeDirectory: join(channelRoot, 'node', plan.toolchain.node, 'linux-x64'),
+          pnpmDirectory: join(
+            channelRoot,
+            'pnpm',
+            plan.toolchain.node,
+            'linux-x64',
+            plan.toolchain.pnpm,
+          ),
+          nodeArchiveSha256: 'a'.repeat(64),
+          pnpmArchiveSha256: 'b'.repeat(64),
+        },
+        configuration: {
+          packageVersion: plan.release.version,
+          wrapperChannel: plan.release.channel,
+        },
       });
       expect(process.listenerCount('SIGTERM')).toBe(listenersBefore);
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('removes signal listeners when managed activation throws', async () => {
+    const fixture = packageReleaseFixture();
+    const plan = createPackageInstallPlan({ manifest: fixture.manifest, request: fixture.request });
+    const channelRoot = await mkdtemp(join('/tmp', 'revo-helper-throw-'));
+    const target = preparedPackageTarget(channelRoot, plan);
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(target, 'package.json'),
+      JSON.stringify({ bin: { revo: 'dist/bin/revo.js' } }),
+      { mode: 0o600 },
+    );
+    const listeners = process.listenerCount('SIGTERM');
+    try {
+      await expect(
+        activateInstall(
+          {
+            schemaVersion: 'revo-install-activate/v1',
+            channelRoot,
+            packagePlan: plan,
+            nodeArchiveSha256: 'a'.repeat(64),
+            pnpmArchiveSha256: 'b'.repeat(64),
+          },
+          {
+            activate: async () => {
+              throw new Error('boom');
+            },
+          },
+        ),
+      ).rejects.toThrow('boom');
+      expect(process.listenerCount('SIGTERM')).toBe(listeners);
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
     }
