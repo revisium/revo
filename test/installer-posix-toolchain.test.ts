@@ -129,6 +129,21 @@ it('real activation refuses during startup and succeeds after the owner closes',
     await writeFile(join(data, 'sentinel'), 'sentinel\n');
     expect(await first.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
     const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+    const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
+    const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
+    await writeFile(gate, 'hold\n', { mode: 0o600 });
+    const prewarm = second.startInstaller({
+      REVO_DATA_DIR: data,
+      REVO_TEST_ACTIVATION_FAULT: 'cancel',
+    });
+    await vi.waitFor(async () => expect(await readFile(marker, 'utf8')).toContain('held'), {
+      timeout: 120_000,
+      interval: 25,
+    });
+    prewarm.child.kill('SIGTERM');
+    expect(await prewarm.finish).not.toBe(0);
+    expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
+    await rm(gate, { force: true });
     const channelRoot = join(first.root, 'state', 'stable');
     started = await scenario.openInstalledCandidate({
       channelRoot,
@@ -145,27 +160,17 @@ it('real activation refuses during startup and succeeds after the owner closes',
     expect(started.owner.status().phase).toBe('running');
     expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).not.toBe(0);
     expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
-    const closeStarted = Date.now();
-    console.error(`[phase] owner-close-begin ${closeStarted}`);
     await started.owner.close();
-    console.error(`[phase] owner-close-end ${Date.now() - closeStarted}`);
-    const replacementStarted = Date.now();
-    console.error(`[phase] replacement-begin ${replacementStarted}`);
     expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
-    console.error(`[phase] replacement-end ${Date.now() - replacementStarted}`);
     const after = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     expect(after.record.generationId).not.toBe(before.record.generationId);
     expect(after.record.release.version).toBe('0.0.1');
     expect(await readFile(join(data, 'sentinel'), 'utf8')).toBe('sentinel\n');
   } finally {
-    console.error('[phase] scenario-cleanup-begin');
     started?.releaseReady();
     await scenario.cleanup();
-    console.error('[phase] scenario-cleanup-end');
-    console.error('[phase] fixture-cleanup-begin');
     await cleanupPortableToolchain(second.root);
     await cleanupPortableToolchain(first.root);
-    console.error('[phase] fixture-cleanup-end');
   }
 }, 360_000);
 
