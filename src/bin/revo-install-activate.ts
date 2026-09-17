@@ -1,4 +1,4 @@
-import { constants } from 'node:fs';
+import { constants, realpathSync } from 'node:fs';
 import { readFile, open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -135,7 +135,11 @@ async function packageBin(directory: string): Promise<string> {
 }
 
 const path = process.argv[2];
-if (path !== undefined && process.argv[1] === fileURLToPath(import.meta.url)) {
+if (
+  path !== undefined &&
+  process.argv[1] !== undefined &&
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+) {
   try {
     const result = await activateInstall(await readActivationRequest(path));
     process.stdout.write(
