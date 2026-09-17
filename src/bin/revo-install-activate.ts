@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { ActivationCandidate } from '../installation/activation-store.js';
 import { ManagedActivationService } from '../installation/managed-activation.service.js';
+import type { ManagedActivationOutcome } from '../installation/managed-activation.service.js';
 import { parsePackageInstallPlan } from '../installation/package-install-plan.js';
 import { preparedPackageTarget } from '../installation/prepared-package.js';
 
@@ -149,9 +150,13 @@ async function packageBin(directory: string): Promise<string> {
 }
 
 const path = process.argv[2];
-export async function runActivationHelper(requestPath: string, trustedRoot: string): Promise<number> {
+export async function runActivationHelper(
+  requestPath: string,
+  trustedRoot: string,
+  activation: (value: unknown) => Promise<ManagedActivationOutcome> = activateInstall,
+): Promise<number> {
   try {
-    const result = await activateInstall(await readActivationRequest(requestPath, trustedRoot));
+    const result = await activation(await readActivationRequest(requestPath, trustedRoot));
     const valid =
       (result.status === 'activated' || result.status === 'unchanged') &&
       typeof result.generationId === 'string' &&

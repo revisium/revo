@@ -4,7 +4,11 @@ import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { activateInstall, readActivationRequest } from '../src/bin/revo-install-activate.js';
+import {
+  activateInstall,
+  readActivationRequest,
+  runActivationHelper,
+} from '../src/bin/revo-install-activate.js';
 import { readActivation, type ActivationReadResult } from '../src/installation/activation-store.js';
 import {
   cleanupPortableToolchain,
@@ -53,6 +57,39 @@ it('reads bounded activation requests and rejects malformed activation input', a
       schemaVersion: 'revo-install-activate/v1',
     });
     await expect(activateInstall({})).rejects.toThrow('activation request is invalid');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it.each([
+  ['activated', { status: 'activated', generationId: 'a'.repeat(64) }, 0],
+  ['unchanged', { status: 'unchanged', generationId: 'b'.repeat(64) }, 0],
+  ['busy', { status: 'busy' }, 1],
+  ['throw', new Error('hidden'), 1],
+] as const)('runs bounded helper outcome: %s', async (_name, outcome, expected) => {
+  const root = await mkdtemp(join('/tmp', 'revo-activation-runner-'));
+  const request = join(
+    root,
+    'stable',
+    '.attempt.test',
+    'runtime',
+    'scratch',
+    '.activation-request-test',
+    'request.json',
+  );
+  try {
+    await mkdir(join(request, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(
+      request,
+      `{"schemaVersion":"revo-install-activate/v1","channelRoot":"${root}","nodeArchiveSha256":"${'a'.repeat(64)}","packagePlan":{},"pnpmArchiveSha256":"${'b'.repeat(64)}"}\n`,
+      { mode: 0o600 },
+    );
+    const result = await runActivationHelper(request, root, async () => {
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    });
+    expect(result).toBe(expected);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
