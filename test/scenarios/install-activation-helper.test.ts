@@ -1,7 +1,8 @@
+import { execFile, spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   activateInstall,
@@ -22,6 +23,11 @@ const makeRequest = async (value: string | ((root: string) => string), mode = 0o
   await writeFile(path, typeof value === 'function' ? value(channelRoot) : value, { mode });
   return { channelRoot, path };
 };
+
+const command = (name: string, args: string[]) =>
+  new Promise<void>((resolve, reject) => {
+    execFile(name, args, (error) => (error === null ? resolve() : reject(error)));
+  });
 
 describe('activation helper boundary', () => {
   it('reads a valid private request and rejects unsafe boundaries', async () => {
@@ -66,6 +72,39 @@ describe('activation helper boundary', () => {
     }
   });
 
+  it('emits only the versioned result or fixed failure diagnostic', async () => {
+    const { channelRoot, path } = await makeRequest((root) =>
+      JSON.stringify({
+        schemaVersion: 'revo-install-activate/v1',
+        channelRoot: root,
+        nodeArchiveSha256: 'a'.repeat(64),
+        packagePlan: {},
+        pnpmArchiveSha256: 'b'.repeat(64),
+      }),
+    );
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(
+        runActivationHelper(path, channelRoot, async () => ({
+          status: 'activated',
+          generationId: 'c'.repeat(64),
+        })),
+      ).resolves.toBe(0);
+      expect(stdout).toHaveBeenCalledWith(
+        `${JSON.stringify({ schemaVersion: 'revo-install-activate/v1', status: 'activated', generationId: 'c'.repeat(64) })}\n`,
+      );
+      await expect(
+        runActivationHelper(path, channelRoot, async () => ({ status: 'busy' })),
+      ).resolves.toBe(1);
+      expect(stderr).toHaveBeenCalledWith('activation helper failed\n');
+    } finally {
+      stdout.mockRestore();
+      stderr.mockRestore();
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a request leaf symlink without following it', async () => {
     const { channelRoot, path } = await makeRequest((root) =>
       JSON.stringify({ schemaVersion: 'revo-install-activate/v1', channelRoot: root }),
@@ -80,6 +119,94 @@ describe('activation helper boundary', () => {
       );
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects oversized requests and FIFOs without blocking', async () => {
+    const oversized = await makeRequest('x'.repeat(64 * 1024 + 1));
+    try {
+      await expect(readActivationRequest(oversized.path, oversized.channelRoot)).rejects.toThrow(
+        /unsafe|oversized/u,
+      );
+    } finally {
+      await rm(oversized.channelRoot, { recursive: true, force: true });
+    }
+
+    const fifo = await makeRequest('ignored');
+    await rm(fifo.path);
+    await command('mkfifo', [fifo.path]);
+    try {
+      await expect(readActivationRequest(fifo.path, fifo.channelRoot)).rejects.toThrow(
+        /unsafe|request/u,
+      );
+    } finally {
+      await rm(fifo.channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an existing request outside the channel attempt root', async () => {
+    const { channelRoot } = await makeRequest('{}');
+    const outside = join(channelRoot, 'outside', 'request.json');
+    await mkdir(join(outside, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(outside, '{}\n', { mode: 0o600 });
+    try {
+      await expect(readActivationRequest(outside, channelRoot)).rejects.toThrow(
+        /activation request path/u,
+      );
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an ancestor symlink without following it', async () => {
+    const { channelRoot } = await makeRequest('{}');
+    const outside = await mkdtemp(join('/tmp', 'revo-helper-outside-'));
+    const outsideParent = join(
+      outside,
+      '.attempt-escape',
+      'runtime',
+      'scratch',
+      '.activation-request',
+    );
+    const outsidePath = join(outsideParent, 'request.json');
+    const linkedParent = join(channelRoot, '.attempt-link');
+    await mkdir(outsideParent, { recursive: true, mode: 0o700 });
+    await writeFile(outsidePath, '{}\n', { mode: 0o600 });
+    await symlink(join(outside, '.attempt-escape'), linkedParent);
+    try {
+      await expect(
+        readActivationRequest(
+          join(linkedParent, 'runtime/scratch/.activation-request/request.json'),
+          channelRoot,
+        ),
+      ).rejects.toThrow(/activation request path/u);
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('enters the compiled helper through an ancestor symlink and fails safely', async () => {
+    const { channelRoot, path } = await makeRequest('{}');
+    const dist = new URL('../../dist/bin', import.meta.url).pathname;
+    const aliasRoot = await mkdtemp(join('/tmp', 'revo-helper-alias-'));
+    const alias = join(aliasRoot, 'revo-install-activate.js');
+    await symlink(join(dist, 'revo-install-activate.js'), alias);
+    try {
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, [alias, path], {
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        let stderr = '';
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (chunk) => (stderr += chunk));
+        child.once('close', (code) => resolve({ code, stderr }));
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toBe('activation helper failed\n');
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+      await rm(aliasRoot, { recursive: true, force: true });
     }
   });
 
@@ -122,7 +249,22 @@ describe('activation helper boundary', () => {
       },
     );
     let received:
-      | { candidate: { packageBin: string; nodeArchiveSha256: string }; channelRoot: string }
+      | {
+          candidate: {
+            packageBin: string;
+            packageDirectory: string;
+            nodeDirectory: string;
+            pnpmDirectory: string;
+            nodeArchiveSha256: string;
+            pnpmArchiveSha256: string;
+          };
+          channelRoot: string;
+          configuration: {
+            packageVersion: string;
+            wrapperChannel?: string;
+            env: NodeJS.ProcessEnv;
+          };
+        }
       | undefined;
     const listenersBefore = process.listenerCount('SIGTERM');
     try {
@@ -136,7 +278,11 @@ describe('activation helper boundary', () => {
         },
         {
           activate: async (input) => {
-            received = { candidate: input.candidate, channelRoot: input.channelRoot };
+            received = {
+              candidate: input.candidate,
+              channelRoot: input.channelRoot,
+              configuration: input.configuration,
+            };
             if (input.signal === undefined) {
               throw new Error('activation signal missing');
             }
@@ -150,9 +296,61 @@ describe('activation helper boundary', () => {
       expect(result).toEqual({ status: 'activated', generationId: 'c'.repeat(64) });
       expect(received).toMatchObject({
         channelRoot,
-        candidate: { packageBin: 'dist/bin/revo.js', nodeArchiveSha256: 'a'.repeat(64) },
+        candidate: {
+          packageBin: 'dist/bin/revo.js',
+          packageDirectory: target,
+          nodeDirectory: join(channelRoot, 'node', plan.toolchain.node, 'linux-x64'),
+          pnpmDirectory: join(
+            channelRoot,
+            'pnpm',
+            plan.toolchain.node,
+            'linux-x64',
+            plan.toolchain.pnpm,
+          ),
+          nodeArchiveSha256: 'a'.repeat(64),
+          pnpmArchiveSha256: 'b'.repeat(64),
+        },
+        configuration: {
+          packageVersion: plan.release.version,
+          wrapperChannel: plan.release.channel,
+        },
       });
       expect(process.listenerCount('SIGTERM')).toBe(listenersBefore);
+    } finally {
+      await rm(channelRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('removes signal listeners when managed activation throws', async () => {
+    const fixture = packageReleaseFixture();
+    const plan = createPackageInstallPlan({ manifest: fixture.manifest, request: fixture.request });
+    const channelRoot = await mkdtemp(join('/tmp', 'revo-helper-throw-'));
+    const target = preparedPackageTarget(channelRoot, plan);
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(target, 'package.json'),
+      JSON.stringify({ bin: { revo: 'dist/bin/revo.js' } }),
+      { mode: 0o600 },
+    );
+    const listeners = process.listenerCount('SIGTERM');
+    try {
+      await expect(
+        activateInstall(
+          {
+            schemaVersion: 'revo-install-activate/v1',
+            channelRoot,
+            packagePlan: plan,
+            nodeArchiveSha256: 'a'.repeat(64),
+            pnpmArchiveSha256: 'b'.repeat(64),
+          },
+          {
+            activate: async () => {
+              throw new Error('boom');
+            },
+          },
+        ),
+      ).rejects.toThrow('boom');
+      expect(process.listenerCount('SIGTERM')).toBe(listeners);
     } finally {
       await rm(channelRoot, { recursive: true, force: true });
     }

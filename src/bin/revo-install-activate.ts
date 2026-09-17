@@ -188,6 +188,6 @@ if (
 ) {
   process.exitCode = await runActivationHelper(
     path,
-    resolve(dirname(process.argv[1]), '../../../../..'),
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..'),
   );
 }

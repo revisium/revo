@@ -54,19 +54,64 @@ export class ServerOwnerScenario {
   private readonly journals: OwnerJournal[] = [];
   private operation = 0;
 
-  async setup() {
+  async setup(options: { readonly dataDir?: string } = {}) {
     this.root = await mkdtemp(join(await realpath(tmpdir()), 'revo-server-owner-'));
-    this.dataDir = join(this.root, 'data');
+    this.dataDir = options.dataDir ?? join(this.root, 'data');
     if (process.platform === 'darwin') {
       this.separateRuntimeRoot = await mkdtemp('/tmp/so-');
     }
     this.runtimeDir = this.separateRuntimeRoot ?? join(this.root, 'run');
     await Promise.all([
-      mkdir(this.dataDir, { mode: 0o700 }),
+      mkdir(this.dataDir, { recursive: true, mode: 0o700 }),
       mkdir(join(this.root, 'home'), { mode: 0o700 }),
       mkdir(join(this.root, 'xdg'), { mode: 0o700 }),
     ]);
     return this;
+  }
+
+  async openInstalledCandidate(input: {
+    readonly channelRoot: string;
+    readonly generationId: string;
+    readonly version: string;
+    readonly executable?: string;
+    readonly coreEntry?: string;
+  }) {
+    const journal = new OwnerJournal();
+    journal.blockReady();
+    this.journals.push(journal);
+    const controls = new PublishedControlService(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      journal,
+    );
+    const owner = await new ServerOwnerService(controls).open({
+      configuration: {
+        channel: 'stable',
+        dataDir: this.dataDir,
+        logDir: join(this.root, 'logs'),
+        host: '127.0.0.1',
+        port: 0,
+        publicUrl: 'http://127.0.0.1:3210',
+        runtimeDir: this.runtimeDir,
+        startupTimeout: STARTUP_MILLISECONDS,
+        version: input.version,
+        activation: { channelRoot: input.channelRoot, generationId: input.generationId },
+      },
+      environment: this.environment(),
+      ...(input.executable === undefined ? {} : { executable: input.executable }),
+      ...(input.coreEntry === undefined ? {} : { coreEntry: input.coreEntry }),
+      operationId: this.nextOperation(),
+    });
+    if (owner.kind === 'busy') {
+      throw new Error('Installed candidate owner unexpectedly busy');
+    }
+    this.owners.push(owner);
+    const started = owner.start(new AbortController().signal);
+    void started.catch(() => undefined);
+    await waitBounded(journal.entered, STARTUP_MILLISECONDS);
+    return { owner, started, releaseReady: () => journal.release() };
   }
 
   async rejectsStaleActivationBeforeLifecycle(): Promise<boolean> {

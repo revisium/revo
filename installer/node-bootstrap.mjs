@@ -1005,6 +1005,7 @@ export async function runInstallMode({
   request,
   onProgress,
   packageInstaller,
+  activatePackage,
 } = {}) {
   if (
     [dataPath, receiptPath, target, archiveSha256, channelRoot, privateNodeRoot, scratch].some(
@@ -1034,14 +1035,27 @@ export async function runInstallMode({
     onProgress,
   });
   if (packageInstaller !== undefined) {
-    await packageInstaller({
+    const packageResult = await packageInstaller({
       nodeExecutable,
       pnpmExecutable: result.executablePath,
+      nodeArchiveSha256: decoded.nodeArchive.sha256,
+      pnpmArchiveSha256: decoded.pnpmArchive.sha256,
       channelRoot,
       scratch,
       ...(signal === undefined ? {} : { signal }),
       ...(onProgress === undefined ? {} : { progress: onProgress }),
     });
+    if (activatePackage !== undefined)
+      await activatePackage({
+        packageResult,
+        nodeExecutable,
+        pnpmExecutable: result.executablePath,
+        nodeArchiveSha256: decoded.nodeArchive.sha256,
+        pnpmArchiveSha256: decoded.pnpmArchive.sha256,
+        channelRoot,
+        scratch,
+        ...(signal === undefined ? {} : { signal }),
+      });
   }
   const receipt = `${JSON.stringify({ version: decoded.bootstrap.nodeVersion, target, archiveSha256 })}\n`;
   const receiptInfo = await lstat(receiptPath).catch(() => undefined);
