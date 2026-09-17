@@ -196,7 +196,8 @@ const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void =>
     throw error('workspace contains an external path');
   const headers = lines.flatMap((line, i) => (/^allowBuilds:\s*$/u.test(line) ? [i] : []));
   if (headers.length !== 1) throw error('workspace allowBuilds is missing or duplicated');
-  const index = headers[0]!;
+  const index = headers[0];
+  if (index === undefined) throw error('workspace allowBuilds is missing');
   const allowLine = lines[index];
   if (allowLine === undefined) throw error('workspace allowBuilds is missing');
   const first = allowLine.slice(allowLine.indexOf(':') + 1).trim();
@@ -207,17 +208,20 @@ const validateWorkspace = (bytes: Uint8Array, plan: PackageInstallPlan): void =>
     child.push(line);
   }
   const raw = first.startsWith('[') && first.endsWith(']') ? first.slice(1, -1) : child.join('\n');
-  if (child.some((line) => line.trimStart().startsWith('-')) && child.some((line) => !line.trimStart().startsWith('-')))
+  if (
+    child.some((line) => line.trimStart().startsWith('-')) &&
+    child.some((line) => !line.trimStart().startsWith('-'))
+  )
     throw error('workspace allowBuilds mixes map and list');
   const map = child.filter((line) => !line.trimStart().startsWith('-'));
   if (map.length > 0) {
     const seen = new Set<string>();
     const entries = map.flatMap((line) => {
       const match = /^\s*["']?([^"':\s]+)["']?\s*:\s*(true|false)\s*$/u.exec(line);
-      if (match === null || seen.has(match[1]!))
+      if (match === null || match[1] === undefined || match[2] === undefined || seen.has(match[1]))
         throw error('workspace allowBuilds map is invalid');
-      seen.add(match[1]!);
-      return match[2] === 'true' ? [match[1]!] : [];
+      seen.add(match[1]);
+      return match[2] === 'true' ? [match[1]] : [];
     });
     if (!entries.length) throw error('workspace allowBuilds is missing');
     return validateAllowedBuilds(entries, plan);

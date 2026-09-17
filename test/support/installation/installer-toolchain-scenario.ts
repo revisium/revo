@@ -45,6 +45,7 @@ export async function portableToolchain(
   releaseVersion?: string,
   activationProbe = false,
   realActivation = false,
+  installRoot?: string,
 ) {
   const root = await mkdtemp(join(tmpdir(), 'revo-c3b-'));
   const tools = join(root, 'tools');
@@ -123,12 +124,18 @@ export async function portableToolchain(
     const descriptor = input.manifest.toolchain.pnpmArchives.find(
       (item) => item.platform === platform && item.arch === arch,
     );
-    if (descriptor === undefined) throw new Error('fixture omitted pnpm archive');
+    if (descriptor === undefined) {
+      throw new Error('fixture omitted pnpm archive');
+    }
     const response = await fetch(descriptor.url, { signal: AbortSignal.timeout(120_000) });
-    if (!response.ok) throw new Error(`pnpm archive download failed: ${response.status}`);
+    if (!response.ok) {
+      throw new Error(`pnpm archive download failed: ${response.status}`);
+    }
     const bytes = new Uint8Array(await response.arrayBuffer());
     const digest = createHash('sha256').update(bytes).digest('hex');
-    if (digest !== descriptor.sha256) throw new Error('pnpm archive digest mismatch');
+    if (digest !== descriptor.sha256) {
+      throw new Error('pnpm archive digest mismatch');
+    }
     await writeFile(pnpmArchive, bytes);
     pnpmSha = digest;
   }
@@ -150,10 +157,14 @@ export async function portableToolchain(
   const { buildInstaller } = await vi.importActual<Builder>(
     new URL('../../../installer/build-installer.mjs', import.meta.url).href,
   );
-  const { buildPayload } = await vi.importActual<{ buildPayload: () => Promise<string> }>(
-    new URL('../../../installer/build-payload.mjs', import.meta.url).href,
-  );
-  const payload = await buildPayload();
+  const { buildPayload } = await vi.importActual<{
+    buildPayload: (options?: { entry?: string | undefined }) => Promise<string>;
+  }>(new URL('../../../installer/build-payload.mjs', import.meta.url).href);
+  const payload = await buildPayload({
+    entry: !realActivation
+      ? new URL('./preparation-driver.mjs', import.meta.url).pathname
+      : undefined,
+  });
   const script = buildInstaller({
     ...input,
     bootstrapPolicy,
@@ -178,15 +189,20 @@ export async function portableToolchain(
   const responseMap = join(root, 'responses.json');
   await writeFile(responseMap, JSON.stringify(responses), { mode: 0o600 });
   const preload = join(root, 'fetch-preload.mjs');
+  const hookUrl = new URL('./activation-barrier.mjs', import.meta.url).href;
   await writeFile(
     preload,
-    "import { readFileSync } from 'node:fs';\nconst map = JSON.parse(readFileSync(process.env.REVO_TEST_RESPONSES, 'utf8'));\nglobalThis.fetch = async (url) => { const encoded = map[url]; if (encoded === undefined) return new Response(null, { status: 404 }); const body = Buffer.from(encoded, 'base64'); return { status: 200, headers: new Headers({ 'content-length': String(body.length) }), body: (async function* () { yield body; })() }; };\n",
+    `import cp from 'node:child_process';\nimport { syncBuiltinESMExports } from 'node:module';\nimport { appendFileSync, readFileSync } from 'node:fs';\nimport { resolve } from 'node:path';\nconst originalSpawn = cp.spawn;\ncp.spawn = (command, args, options) => { const mode = process.env.REVO_TEST_ACTIVATION_FAULT; const text = [String(command), ...(args ?? [])].join(' '); if (text.includes('pnpm') && text.includes(' install')) appendFileSync(process.env.REVO_PNPM_CALLS, JSON.stringify({ command: 'pnpm', args: (args ?? []).filter((arg) => /install|frozen|prod/.test(String(arg))).length }) + '\\n'); const match = mode && args?.length === 2 && typeof options?.cwd === 'string' && args[0] === resolve(options.cwd, 'dist/bin/revo-install-activate.js'); if (match) { const hook = new URL(${JSON.stringify(hookUrl)}); hook.searchParams.set('mode', mode); hook.searchParams.set('root', process.env.REVO_INSTALL_ROOT); return originalSpawn(command, ['--import', hook.href, ...args], options); } return originalSpawn(command, args, options); };\nsyncBuiltinESMExports();\nconst map = JSON.parse(readFileSync(process.env.REVO_TEST_RESPONSES, 'utf8'));\nglobalThis.fetch = async (url) => { appendFileSync(process.env.REVO_FETCH_CALLS, \`\${url}\\n\`); const encoded = map[url]; if (encoded === undefined) return new Response(null, { status: 404 }); const body = Buffer.from(encoded, 'base64'); return { status: 200, headers: new Headers({ 'content-length': String(body.length) }), body: (async function* () { yield body; })() }; };\n`,
     { mode: 0o600 },
   );
   const calls = join(root, 'curl.calls');
+  const fetchCalls = join(root, 'fetch.calls');
+  await writeFile(fetchCalls, '', { mode: 0o600 });
   const pnpmStarted = join(root, 'pnpm.started');
   const pnpmTerminated = join(root, 'pnpm.terminated');
   const pnpmInstalls = join(root, 'pnpm.installs');
+  const pnpmCalls = join(root, 'pnpm.calls');
+  await writeFile(pnpmCalls, '', { mode: 0o600 });
   const pnpmNodeRecord = join(root, 'pnpm.node');
   await writeFile(
     join(tools, 'curl'),
@@ -203,15 +219,17 @@ export async function portableToolchain(
           ...process.env,
           HOME: root,
           PATH: `${tools}:${process.env.PATH ?? '/usr/bin:/bin'}`,
-          REVO_INSTALL_ROOT: join(root, 'state'),
+          REVO_INSTALL_ROOT: installRoot ?? join(root, 'state'),
           REVO_FIXTURE_NODE_ARCHIVE: nodeArchive,
           REVO_CURL_CALLS: calls,
           REVO_TEST_PNPM_ARCHIVE: pnpmArchive,
           REVO_TEST_NODE: process.execPath,
           REVO_TEST_RESPONSES: responseMap,
+          REVO_FETCH_CALLS: fetchCalls,
           REVO_PNPM_STARTED: pnpmStarted,
           REVO_PNPM_TERMINATED: pnpmTerminated,
           REVO_PNPM_INSTALLS: pnpmInstalls,
+          REVO_PNPM_CALLS: pnpmCalls,
           REVO_PNPM_NODE_RECORD: pnpmNodeRecord,
           NODE_OPTIONS: `--import=${preload}`,
           ...extra,
@@ -269,7 +287,9 @@ export async function portableToolchain(
     pnpmStarted,
     pnpmTerminated,
     pnpmInstalls,
+    pnpmCalls,
     pnpmNodeRecord,
+    fetchCalls,
     nodeArchive,
     pnpmArchive,
     nodeArchiveSha256: nodeSha,

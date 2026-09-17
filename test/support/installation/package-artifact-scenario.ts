@@ -17,12 +17,15 @@ const sri = (bytes: Uint8Array): string =>
   `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
 async function compiledEntries(root: string, prefix = ''): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
-  for (const name of await readdir(join(root, prefix))) {
-    const relative = join(prefix, name);
-    const info = await stat(join(root, relative));
-    if (info.isDirectory()) Object.assign(result, await compiledEntries(root, relative));
-    else result[`package/dist/${relative}`] = (await readFile(join(root, relative))).toString();
-  }
+  const entries = await Promise.all(
+    (await readdir(join(root, prefix))).map(async (name) => {
+      const relative = join(prefix, name);
+      const info = await stat(join(root, relative));
+      if (info.isDirectory()) return compiledEntries(root, relative);
+      return { [`package/dist/${relative}`]: (await readFile(join(root, relative))).toString() };
+    }),
+  );
+  for (const entry of entries) Object.assign(result, entry);
   return result;
 }
 const header = (name: string, size: number, type: '0' | '5'): Uint8Array => {
@@ -64,19 +67,17 @@ export async function packageArtifactScenario(
   const actualPackageJson = options.realActivation
     ? await readFile(new URL('../../../package.json', import.meta.url))
     : undefined;
-  const actualManifest = actualPackageJson === undefined ? undefined : JSON.parse(actualPackageJson.toString());
+  const actualManifest =
+    actualPackageJson === undefined ? undefined : JSON.parse(actualPackageJson.toString());
   const fixture = packageReleaseFixture(
     options.channel === undefined && options.version === undefined && actualManifest === undefined
       ? {}
       : {
           ...(options.channel === undefined ? {} : { channel: options.channel }),
-          version: actualManifest?.version ?? options.version,
+          version: options.version ?? actualManifest?.version,
         },
   );
   const release = fixture.manifest.release;
-  const compiledActivationHelper = options.realActivation
-    ? await readFile(new URL('../../../dist/bin/revo-install-activate.js', import.meta.url))
-    : undefined;
   const compiledDist = options.realActivation
     ? await compiledEntries(new URL('../../../dist', import.meta.url).pathname)
     : {};
@@ -97,28 +98,26 @@ export async function packageArtifactScenario(
     },
   });
   const workspace = `packages:\n  - packages/*\nallowBuilds:\n  - @revisium/revo-core@${fixture.request.components.core.version}\n`;
+  const packedPackageJson =
+    actualPackageJson !== undefined && options.version !== undefined
+      ? Buffer.from(JSON.stringify({ ...actualManifest, version: release.version }))
+      : actualPackageJson;
   const bytes = {
     package:
       options.unsafeTar ??
       tarFixture({
         'package/': '',
-        'package/package.json': (actualPackageJson ?? Buffer.from(packageJson)).toString(),
+        'package/package.json': (packedPackageJson ?? Buffer.from(packageJson)).toString(),
         'package/dist/index.js': 'export {}\n',
         ...(options.activationProbe
           ? {
               'package/dist/bin/revo.js':
                 "import { appendFile } from 'node:fs/promises';\nif (process.env.REVO_ACTIVATION_EXIT7) process.exit(7);\nif (process.env.REVO_ACTIVATION_TERM) process.kill(process.pid, 'SIGTERM');\nawait appendFile(process.env.REVO_ACTIVATION_OUTPUT, JSON.stringify({ execPath: process.execPath, argv: process.argv.slice(2), cwd: process.cwd() }) + '\\n');\n",
-              ...(compiledActivationHelper === undefined
-                ? {}
-                : {
-                    'package/dist/bin/revo-install-activate.js':
-                      compiledActivationHelper.toString(),
-                  }),
             }
           : {}),
         ...compiledDist,
       }),
-    packageJson: actualPackageJson ?? Buffer.from(packageJson),
+    packageJson: packedPackageJson ?? Buffer.from(packageJson),
     pnpmLock: actualLock ?? Buffer.from('lockfileVersion: 9.0\n\nimporters:\n  .: {}\n'),
     pnpmWorkspace:
       options.workspace === undefined

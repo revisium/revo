@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 // oxlint-disable curly -- the entry keeps its direct-execution guard compact
 import { fileURLToPath } from 'node:url';
@@ -65,14 +65,6 @@ const packageInstaller = (platform, arch) => {
   };
 };
 
-const packageBin = async (directory) => {
-  const value = JSON.parse(await readFile(resolve(directory, 'package.json'), 'utf8'));
-  const bin = typeof value.bin === 'string' ? value.bin : value.bin?.revo;
-  if (typeof bin !== 'string' || bin.startsWith('/') || bin.includes('..'))
-    throw new Error('package bin is invalid');
-  return bin;
-};
-
 const activatePrepared = async ({
   packageResult,
   nodeExecutable,
@@ -105,7 +97,23 @@ const activatePrepared = async ({
         PATH: `${resolve(nodeExecutable, '..')}:/usr/bin:/bin`,
         NODE_PATH: '',
         ...Object.fromEntries(
-          ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'REVO_CONFIG', 'REVO_CHANNEL', 'REVO_DATABASE_URL', 'REVO_DATA_DIR', 'REVO_HOST', 'REVO_LOG_DIR', 'REVO_PORT', 'REVO_PUBLIC_URL', 'REVO_STARTUP_TIMEOUT']
+          [
+            'HOME',
+            'XDG_CONFIG_HOME',
+            'XDG_DATA_HOME',
+            'XDG_STATE_HOME',
+            'XDG_CACHE_HOME',
+            'XDG_RUNTIME_DIR',
+            'REVO_CONFIG',
+            'REVO_CHANNEL',
+            'REVO_DATABASE_URL',
+            'REVO_DATA_DIR',
+            'REVO_HOST',
+            'REVO_LOG_DIR',
+            'REVO_PORT',
+            'REVO_PUBLIC_URL',
+            'REVO_STARTUP_TIMEOUT',
+          ]
             .filter((key) => process.env[key] !== undefined)
             .map((key) => [key, process.env[key]]),
         ),
@@ -165,7 +173,11 @@ if (
         privateNodeRoot: process.env.REVO_PRIVATE_NODE_ROOT,
         scratch: process.env.REVO_INSTALL_SCRATCH,
         signal: controller.signal,
-        packageInstaller: packageInstaller(process.env.REVO_PLATFORM, process.env.REVO_ARCH),
+        packageInstaller: packageInstaller(
+          process.env.REVO_PLATFORM,
+          process.env.REVO_ARCH,
+          REVO_PACKAGE_INSTALL_PLAN,
+        ),
         activatePackage: activatePrepared,
       });
     else
