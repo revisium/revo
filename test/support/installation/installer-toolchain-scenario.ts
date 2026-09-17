@@ -245,6 +245,38 @@ export async function portableToolchain(
       child.once('exit', (code) => {
         if (code !== 0 && stderr.length > 0) {
           console.error(stderr.replaceAll(root, '<fixture>'));
+          void readdir(join(extra.REVO_INSTALL_ROOT ?? join(root, 'state'), channel), {
+            withFileTypes: true,
+          })
+            .then(async (entries) => {
+              const logs = [];
+              for (const entry of entries.filter((item) => item.name.startsWith('.attempt.'))) {
+                const scratch = join(
+                  extra.REVO_INSTALL_ROOT ?? join(root, 'state'),
+                  channel,
+                  entry.name,
+                  'runtime',
+                  'scratch',
+                );
+                for (const request of await readdir(scratch, { withFileTypes: true }).catch(
+                  () => [],
+                )) {
+                  if (!request.name.startsWith('.activation-request-')) continue;
+                  const text = await readFile(
+                    join(scratch, request.name, 'result.log'),
+                    'utf8',
+                  ).catch(() => '');
+                  if (text)
+                    logs.push({
+                      schema: text.includes('schemaVersion'),
+                      status: /"status":"(?:activated|unchanged)"/u.test(text),
+                      generation: /"generationId":"[a-f0-9]{64}"/u.test(text),
+                    });
+                }
+              }
+              console.error(JSON.stringify({ exit: code, helperResults: logs }));
+            })
+            .catch(() => undefined);
           const identity = `${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch === 'arm64' ? 'arm64' : 'x64'}`;
           const targetNode = join(
             extra.REVO_INSTALL_ROOT ?? join(root, 'state'),
