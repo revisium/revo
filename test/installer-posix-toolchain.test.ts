@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { activateInstall, readActivationRequest } from '../src/bin/revo-install-activate.js';
 import { readActivation, type ActivationReadResult } from '../src/installation/activation-store.js';
 import {
   cleanupPortableToolchain,
@@ -29,6 +30,33 @@ const validActivation = (value: ActivationReadResult) => {
   }
   return value;
 };
+
+it('reads bounded activation requests and rejects malformed activation input', async () => {
+  const root = await mkdtemp(join('/tmp', 'revo-activation-request-'));
+  const path = join(
+    root,
+    'stable',
+    '.attempt.test',
+    'runtime',
+    'scratch',
+    '.activation-request-test',
+    'request.json',
+  );
+  try {
+    await mkdir(join(path, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(
+      path,
+      `{"schemaVersion":"revo-install-activate/v1","channelRoot":"${root}"}\n`,
+      { mode: 0o600 },
+    );
+    await expect(readActivationRequest(path, root)).resolves.toMatchObject({
+      schemaVersion: 'revo-install-activate/v1',
+    });
+    await expect(activateInstall({})).rejects.toThrow('activation request is invalid');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it.each(['stable', 'alpha'] as const)(
   'real %s activation mode packs the compiled helper',

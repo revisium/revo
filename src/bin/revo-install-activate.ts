@@ -1,7 +1,7 @@
 import { constants, realpathSync } from 'node:fs';
 import { readFile, open } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ActivationCandidate } from '../installation/activation-store.js';
@@ -107,12 +107,15 @@ export async function activateInstall(requestValue: unknown) {
   }
 }
 
-export async function readActivationRequest(path: string): Promise<unknown> {
-  const requestPath = resolve(path);
-  if (requestPath !== path || !requestPath.endsWith('/request.json')) {
+export async function readActivationRequest(path: string, trustedRoot: string): Promise<unknown> {
+  const root = realpathSync(trustedRoot);
+  const parent = realpathSync(dirname(path));
+  const relation = relative(root, parent);
+  if (!/^[^/]+\/\.attempt\.[^/]+\/runtime\/scratch\/\.activation-request-[^/]+$/u.test(relation)) {
     throw new Error('activation request path is invalid');
   }
-  const file = await open(requestPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const requestPath = join(parent, 'request.json');
+  const file = await open(requestPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await file.stat();
     if (!stat.isFile() || stat.mode & 0o077 || stat.size > 64 * 1024) {
@@ -123,7 +126,14 @@ export async function readActivationRequest(path: string): Promise<unknown> {
     if (result.bytesRead > 64 * 1024) {
       throw new Error('activation request is oversized');
     }
-    return JSON.parse(buffer.subarray(0, result.bytesRead).toString('utf8'));
+    const value = JSON.parse(buffer.subarray(0, result.bytesRead).toString('utf8'));
+    if (typeof value !== 'object' || value === null || typeof value.channelRoot !== 'string') {
+      throw new Error('activation request root is invalid');
+    }
+    if (realpathSync(value.channelRoot) !== root) {
+      throw new Error('activation request root is invalid');
+    }
+    return value;
   } finally {
     await file.close();
   }
@@ -145,7 +155,8 @@ if (
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
 ) {
   try {
-    const result = await activateInstall(await readActivationRequest(path));
+    const root = resolve(dirname(process.argv[1]), '../../../../..');
+    const result = await activateInstall(await readActivationRequest(path, root));
     process.stdout.write(
       `${JSON.stringify({ schemaVersion: ACTIVATION_REQUEST_SCHEMA, ...result })}\n`,
     );
