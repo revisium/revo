@@ -261,17 +261,20 @@ export async function portableToolchain(
                 for (const request of await readdir(scratch, { withFileTypes: true }).catch(
                   () => [],
                 )) {
-                  if (!request.name.startsWith('.activation-request-')) continue;
+                  if (!request.name.startsWith('.activation-request-')) {
+                    continue;
+                  }
                   const text = await readFile(
                     join(scratch, request.name, 'result.log'),
                     'utf8',
                   ).catch(() => '');
-                  if (text)
+                  if (text) {
                     logs.push({
                       schema: text.includes('schemaVersion'),
                       status: /"status":"(?:activated|unchanged)"/u.test(text),
                       generation: /"generationId":"[a-f0-9]{64}"/u.test(text),
                     });
+                  }
                 }
               }
               console.error(JSON.stringify({ exit: code, helperResults: logs }));
