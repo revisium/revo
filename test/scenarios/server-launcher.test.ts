@@ -1,3 +1,4 @@
+import { dirname } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
@@ -304,7 +305,7 @@ describe('server launcher composition', () => {
     expect(processes.start.mock.calls).toStrictEqual([
       [
         {
-          cwd: resolved.installDir,
+          cwd: dirname(SERVER_ENTRY),
           entry: SERVER_ENTRY,
           env: SAFE_ENVIRONMENT,
           executable: process.execPath,

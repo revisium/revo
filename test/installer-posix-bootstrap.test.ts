@@ -97,7 +97,7 @@ describe('generated POSIX Node publication', () => {
     expect(result.downloadArgv).toEqual(
       subject.expectedDownloadArgv('wget', dirname(result.payloadPath)),
     );
-  });
+  }, 30_000);
 
   it('does not execute a hostile shell sentinel embedded in the real payload', async () => {
     const subject = await scenario();

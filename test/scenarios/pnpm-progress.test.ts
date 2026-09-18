@@ -59,8 +59,20 @@ describe('pnpm NDJSON progress', () => {
     expect(events[0]).toMatchObject({
       stage: 'install',
       status: 'progress',
-      activity: 'checking…',
+      activity: 'activity',
     });
+  });
+
+  it('distinguishes actual store reuse from importing a downloaded package', () => {
+    const events = pnpmProgressScenario(
+      [
+        '{"name":"pnpm:progress","status":"imported","packageId":"downloaded@1"}',
+        '{"name":"pnpm:progress","status":"found_in_store","packageId":"cached@1"}',
+        '{"name":"pnpm:progress","status":"found_in_store","packageId":"cached@1"}',
+      ].join('\n'),
+    );
+    expect(events[0]?.reused).toBeUndefined();
+    expect(events.at(-1)?.reused).toBe(1);
   });
 
   it('renders throttled non-TTY snapshots and one cleared TTY line with a final newline', () => {
@@ -103,19 +115,25 @@ describe('pnpm NDJSON progress', () => {
   it('streams pnpm stdout into the progress sink and reports process failure', async () => {
     const root = await mkdtemp(join(tmpdir(), 'revo-pnpm-progress-'));
     const events: string[] = [];
+    const observed: string[] = [];
     const sink = createPnpmProgressSink({ onEvent: (event) => events.push(event.status) });
     await runPackageProcess({
       executable: process.execPath,
       args: [
         '-e',
-        "console.log(JSON.stringify({time:100,name:'pnpm:progress',status:'resolved',packageId:'demo@1'}))",
+        "console.log(JSON.stringify({time:100,name:'pnpm:progress',status:'resolved',packageId:'demo@1'})); console.error(JSON.stringify({name:'pnpm:progress',status:'resolved',packageId:'stderr-secret@1'}))",
       ],
       cwd: root,
       env: { PATH: root },
       diagnosticPath: `${root}/progress.log`,
       progress: sink,
+      onStdout: (chunk) => {
+        observed.push(Buffer.from(chunk).toString());
+      },
     });
-    expect(events).toContain('progress');
+    expect(events).toEqual(['progress']);
+    expect(observed.join('')).toContain('demo@1');
+    expect(observed.join('')).not.toContain('stderr-secret');
     await rm(root, { recursive: true, force: true });
   });
 });

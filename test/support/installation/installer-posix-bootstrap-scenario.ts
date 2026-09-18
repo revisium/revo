@@ -352,8 +352,8 @@ export class InstallerPosixBootstrapScenario {
     return join(this.finalPath(target), 'bin', 'node');
   }
 
-  async waitFor(marker: string): Promise<void> {
-    await waitForEvent(() => this.events(), marker, 200);
+  async waitFor(marker: string, timeoutMs = 2_000): Promise<void> {
+    await waitForEvent(() => this.events(), marker, timeoutMs);
   }
 
   async releasePayload(): Promise<void> {

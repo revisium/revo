@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 umask 077
+revo_phase=runtime-prepare
+revo_notice() {
+  revo_phase=$1
+  printf '%s: started\n' "$revo_phase" >&2
+}
 
 revo_root=${REVO_INSTALL_ROOT:-"${HOME}/.local/share/revo"}
 revo_channel=
@@ -202,6 +207,7 @@ revo_cleanup() {
 }
 trap revo_cleanup EXIT
 revo_fail() {
+  printf 'Installation did not complete during %s.\n' "$revo_phase" >&2
   [ -z "$revo_signal_status" ] || exit "$revo_signal_status"
   exit 1
 }
@@ -243,6 +249,7 @@ else
 fi
 
   if [ -e "$revo_final" ] || [ -L "$revo_final" ]; then
+  revo_notice runtime-reuse
   [ -d "$revo_final" ] && [ ! -L "$revo_final" ] || exit 1
   [ -f "$revo_final/install-receipt.json" ] && [ ! -L "$revo_final/install-receipt.json" ] || exit 1
   [ "$(LC_ALL=C ls -ld "$revo_final/install-receipt.json" | cut -c 1-10)" = '-rw-------' ] || exit 1
@@ -291,6 +298,7 @@ revo_probe_file=$revo_runtime_root/node-version
 revo_receipt=$revo_stage/install-receipt.json
 revo_write_runtime
 
+revo_notice runtime-download
 if command -v curl >/dev/null 2>&1; then
   revo_run_staged_bounded "$revo_download_timeout" curl --fail --silent --show-error --output "$revo_archive" "$revo_url" || revo_fail
 elif command -v wget >/dev/null 2>&1; then
@@ -299,22 +307,25 @@ else
   exit 1
 fi
 
+revo_notice runtime-verify
 if command -v sha256sum >/dev/null 2>&1; then
   revo_digest=$(sha256sum "$revo_archive") || exit 1
 else
   revo_digest=$(shasum -a 256 "$revo_archive") || exit 1
 fi
 revo_actual=$(printf '%s\n' "$revo_digest" | awk '{print $1}') || exit 1
-[ "$revo_actual" = "$revo_sha256" ] || exit 1
+[ "$revo_actual" = "$revo_sha256" ] || revo_fail
 
+revo_notice runtime-extract
 case "$revo_format" in
   tar.gz) tar -xzf "$revo_archive" -C "$revo_stage" --strip-components=1 ;;
   tar.xz) tar -xJf "$revo_archive" -C "$revo_stage" --strip-components=1 ;;
   *) exit 1 ;;
 esac
 revo_node=$revo_stage/bin/node
+revo_notice runtime-probe
 revo_run_staged_bounded "$revo_probe_timeout" "$revo_node" --version >"$revo_probe_file" || revo_fail
-[ "$(cat "$revo_probe_file")" = "v$revo_version" ] || exit 1
+[ "$(cat "$revo_probe_file")" = "v$revo_version" ] || revo_fail
 if [ "$revo_v3" -eq 1 ] && [ "${revo_package_enabled:-0}" -eq 1 ]; then
   rm -f "$revo_archive" "$revo_probe_file"
   REVO_BOOTSTRAP_ENTRY=1 REVO_INSTALL_MODE=node REVO_INSTALL_ROOT=$revo_channel_root REVO_NODE_STAGE=$revo_stage \

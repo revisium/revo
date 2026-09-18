@@ -135,6 +135,7 @@ export async function acquireAndInstallPackage({
     ...(request === undefined ? {} : { request }),
     ...(onProgress === undefined ? {} : { onProgress }),
   });
+  onProgress?.('dependencies');
   return await installPackage({
     stage,
     pnpmExecutable,

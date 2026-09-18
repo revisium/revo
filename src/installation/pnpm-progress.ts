@@ -138,14 +138,15 @@ export class PnpmProgressParser {
     status: string,
     at: number,
   ): PnpmProgressEvent | null {
-    if (!['resolved', 'fetched', 'imported'].includes(status)) return this.unknown(value, at);
+    if (!['resolved', 'fetched', 'found_in_store', 'imported'].includes(status))
+      return this.unknown(value, at);
     const packageId = text(value.packageId) ? value.packageId : '';
     const key = `${status}:${packageId || JSON.stringify(value)}`;
     if (this.seen.has(key)) return null;
     this.seen.add(key);
     if (status === 'resolved') this.resolved += 1;
     if (status === 'fetched') this.downloaded += 1;
-    if (status === 'imported') this.reused += 1;
+    if (status === 'found_in_store') this.reused += 1;
     return this.make('install', 'progress', at, status);
   }
 
@@ -157,11 +158,8 @@ export class PnpmProgressParser {
     return this.make('install', 'progress', at, 'added');
   }
 
-  private unknown(value: Record<string, unknown>, at: number): PnpmProgressEvent {
-    let activity = 'activity';
-    if (text(value.message)) activity = value.message;
-    else if (text(value.status)) activity = value.status;
-    return this.make('install', 'progress', at, activity);
+  private unknown(_value: Record<string, unknown>, at: number): PnpmProgressEvent {
+    return this.make('install', 'progress', at, 'activity');
   }
 
   private make(
@@ -199,8 +197,12 @@ export function createPnpmProgressSink(
   const parser =
     options.parser ??
     new PnpmProgressParser(options.onRaw === undefined ? {} : { onRaw: options.onRaw });
+  let lastElapsed = 0;
   const emit = (events: readonly PnpmProgressEvent[]) =>
-    events.forEach((event) => options.onEvent?.(event));
+    events.forEach((event) => {
+      lastElapsed = event.elapsedMs;
+      options.onEvent?.(event);
+    });
   return {
     feed: (chunk) => emit(parser.feed(chunk)),
     finish: (result) => {
@@ -210,7 +212,7 @@ export function createPnpmProgressSink(
           schemaVersion: PNPM_PROGRESS_SCHEMA,
           stage: 'install',
           status: 'failed',
-          elapsedMs: 0,
+          elapsedMs: lastElapsed,
           activity: `pnpm exited with ${result.exitCode ?? result.signal}`,
         });
     },
