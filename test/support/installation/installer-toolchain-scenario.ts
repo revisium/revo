@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rename,
   rm,
@@ -1684,14 +1685,15 @@ export async function portableToolchain(
   realActivation = false,
   installRoot?: string,
 ) {
-  // macOS ignores the XDG overrides used by the fixture; keep its HOME short enough
-  // for the Unix-domain control socket limit while retaining a private temp root.
+  // macOS ignores the XDG overrides used by the fixture. Keep HOME short and
+  // canonical so its default lifecycle log path has no /tmp symlink ancestor.
   const root = await mkdtemp(
     process.platform === 'darwin' ? '/tmp/r' : join(tmpdir(), 'revo-c3b-'),
   );
-  const home = process.platform === 'darwin' ? '/tmp/r' : root;
+  const requestedHome = process.platform === 'darwin' ? '/tmp/r' : root;
   const effectiveInstallRoot = installRoot ?? join(root, 'state');
-  await mkdir(home, { recursive: true, mode: 0o700 });
+  await mkdir(requestedHome, { recursive: true, mode: 0o700 });
+  const home = await resolveToolchainFixtureHome(requestedHome);
   await Promise.all(
     ['config', 'data', 'logs', 'cache', 'run'].map((directory) =>
       mkdir(join(root, directory), { mode: 0o700 }),
@@ -2135,6 +2137,10 @@ export async function portableToolchain(
     pnpmArchiveSha256: pnpmSha,
     diagnosticContext: diagnosticContextFor(),
   };
+}
+
+export async function resolveToolchainFixtureHome(requestedHome: string): Promise<string> {
+  return realpath(requestedHome);
 }
 
 export async function cleanupPortableToolchain(root: string) {

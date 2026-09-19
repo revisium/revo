@@ -1,5 +1,16 @@
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 
@@ -7,6 +18,8 @@ import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { readActivation, type ActivationReadResult } from '../src/installation/activation-store.js';
 import { ServerOwnershipService } from '../src/processes/server-ownership.service.js';
+import { parseLifecycleDocument } from '../src/server-logs/document.js';
+import { ServerLifecycleStore, serverLifecyclePath } from '../src/server-logs/store.service.js';
 import {
   captureIntelSnapshot as captureIntelSnapshotUnsafe,
   cleanupPortableToolchain,
@@ -17,6 +30,7 @@ import {
   portableToolchain,
   prepareIntelInvocation,
   recordIntelCollectorIssue,
+  resolveToolchainFixtureHome,
   runWithPortableToolchainCleanup,
   toolchainInstaller,
   writeIntelDiagnosticSummary,
@@ -34,6 +48,68 @@ const extractWorkflowBlock = (source: string, startMarker: string, endMarker: st
 
 let intelDiagnosticsBlock = '';
 let intelOmissionsValidatorBlock = '';
+
+it('resolves an aliased portable fixture HOME to its canonical directory', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'revo-toolchain-home-'));
+  const physicalHome = join(root, 'home');
+  const requestedHome = join(root, 'home-alias');
+  await mkdir(physicalHome, { mode: 0o700 });
+  await symlink(physicalHome, requestedHome);
+  try {
+    expect(await resolveToolchainFixtureHome(requestedHome)).toBe(await realpath(physicalHome));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it.skipIf(process.platform !== 'darwin')(
+  'writes lifecycle evidence through the canonical macOS fixture HOME',
+  async () => {
+    expect((await lstat('/tmp')).isSymbolicLink()).toBe(true);
+    expect(await realpath('/tmp')).toBe('/private/tmp');
+
+    const aliasRoot = await mkdtemp('/tmp/revo-lifecycle-home-');
+    try {
+      const canonicalRoot = await realpath(aliasRoot);
+      const canonicalDataDir = join(canonicalRoot, 'data');
+      await mkdir(canonicalDataDir, { mode: 0o700 });
+      const aliasConfiguration = {
+        logDir: join(aliasRoot, 'alias-logs'),
+        canonicalDataDir,
+        channel: 'stable' as const,
+      };
+      await expect(ServerLifecycleStore.open(aliasConfiguration)).rejects.toMatchObject({
+        code: 'SERVER_LIFECYCLE_ERROR',
+        reason: 'unsafe',
+      });
+
+      const requestedHome = join(aliasRoot, 'home');
+      await mkdir(requestedHome, { mode: 0o700 });
+      const home = await resolveToolchainFixtureHome(requestedHome);
+      expect(home).toBe(join(canonicalRoot, 'home'));
+      const configuration = {
+        logDir: join(home, 'Library', 'Application Support', 'Revo', 'state', 'logs'),
+        canonicalDataDir,
+        channel: 'stable' as const,
+      };
+      const store = await ServerLifecycleStore.open(configuration);
+      try {
+        await store.emit('SERVER_STARTING');
+      } finally {
+        await store.close();
+      }
+
+      const document = parseLifecycleDocument(
+        await readFile(serverLifecyclePath(configuration), 'utf8'),
+      );
+      expect(document?.events).toEqual([
+        expect.objectContaining({ code: 'SERVER_STARTING', phase: 'server', state: 'starting' }),
+      ]);
+    } finally {
+      await rm(aliasRoot, { recursive: true, force: true });
+    }
+  },
+);
 
 interface OmissionDiagnostic {
   readonly artifact: string;
