@@ -320,6 +320,45 @@ jobs:
           const bundleLimit = 2_097_152;
           const attemptLabels = new Set(['initial', 'cancel-before-commit', 'retry-after-cancel']);
           const snapshotLabels = new Set(['after-initial', 'after-cancellation', 'after-retry', 'before-cleanup']);
+          const validationCodes = new Set([
+            'EVIDENCE_PATH_UNSAFE',
+            'EVIDENCE_FILE_BOUNDS',
+            'EVIDENCE_FILE_INTEGRITY',
+            'EVIDENCE_JSON_INVALID',
+            'EVIDENCE_SCHEMA_INVALID',
+            'EVIDENCE_PRIVACY_REJECTED',
+            'EVIDENCE_PROVENANCE_MISMATCH',
+            'EVIDENCE_SUMMARY_INVALID',
+            'EVIDENCE_CLEANUP_INCOMPLETE',
+            'EVIDENCE_SNAPSHOT_INVALID',
+            'EVIDENCE_OMISSION_INVALID',
+            'EVIDENCE_CANDIDATE_MISMATCH',
+            'EVIDENCE_REQUIRED_FILE_MISSING',
+            'EVIDENCE_UNEXPECTED_ERROR',
+          ]);
+          const validationPhases = new Set([
+            'root',
+            'tree',
+            'parsing',
+            'provenance',
+            'summary',
+            'snapshots',
+            'omissions',
+            'attempts',
+            'final',
+          ]);
+          let validationPhase = 'root';
+          class EvidenceValidationError extends Error {
+            constructor(code) {
+              super(code);
+              this.name = 'EvidenceValidationError';
+              this.code = code;
+            }
+          }
+          const fail = (code) => {
+            if (!validationCodes.has(code)) throw new Error('unclassified validation error');
+            throw new EvidenceValidationError(code);
+          };
           const expectedFiles = [
             '.github/workflows/ci.yml',
             'test/installer-posix-toolchain.test.ts',
@@ -329,16 +368,13 @@ jobs:
             const rel = path.relative(root, candidate);
             return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
           };
-          const fail = (message) => {
-            throw new Error(message);
-          };
           const assertKeys = (value, expected, label) => {
             if (
               !value ||
               typeof value !== 'object' ||
               Array.isArray(value) ||
               JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...expected].sort())
-            ) fail('invalid ' + label + ' schema');
+            ) fail('EVIDENCE_SCHEMA_INVALID');
           };
           const assertTrustedAncestors = (target) => {
             const absolute = path.resolve(target);
@@ -348,13 +384,13 @@ jobs:
             for (const component of components) {
               current = path.join(current, component);
               const metadata = fs.lstatSync(current);
-              if (metadata.isSymbolicLink() || !metadata.isDirectory()) fail('unsafe evidence ancestor');
-              if (fs.realpathSync(current) !== current) fail('non-canonical evidence ancestor');
-              if (metadata.uid !== uid && metadata.uid !== 0) fail('untrusted evidence ancestor owner');
+              if (metadata.isSymbolicLink() || !metadata.isDirectory()) fail('EVIDENCE_PATH_UNSAFE');
+              if (fs.realpathSync(current) !== current) fail('EVIDENCE_PATH_UNSAFE');
+              if (metadata.uid !== uid && metadata.uid !== 0) fail('EVIDENCE_PATH_UNSAFE');
               if ((metadata.mode & 0o0022) !== 0) {
                 const trustedTemp = process.platform === 'darwin' ? '/private/tmp' : '/tmp';
                 if (current !== trustedTemp || metadata.uid !== 0 || (metadata.mode & 0o1777) !== 0o1777) {
-                  fail('writable evidence ancestor');
+                  fail('EVIDENCE_PATH_UNSAFE');
                 }
               }
             }
@@ -367,7 +403,7 @@ jobs:
               metadata.uid !== uid ||
               (metadata.mode & 0o7777) !== 0o700 ||
               fs.realpathSync(target) !== target
-            ) fail('evidence directory is not private');
+            ) fail('EVIDENCE_PATH_UNSAFE');
           };
           const allowedDirectory = (relativePath) => {
             const parts = relativePath.split(path.sep);
@@ -418,7 +454,7 @@ jobs:
             if (!value || typeof value !== 'object') return;
             for (const [key, child] of Object.entries(value)) {
               if (/(password|secret|token|authorization|cookie|credential)/i.test(key)) {
-                fail('evidence contains a sensitive field');
+                fail('EVIDENCE_PRIVACY_REJECTED');
               }
               assertNoSensitiveKeys(child);
             }
@@ -439,7 +475,7 @@ jobs:
                 opened.nlink !== 1 ||
                 !Number.isSafeInteger(opened.size) ||
                 opened.size !== before.size
-              ) fail('evidence file identity changed');
+              ) fail('EVIDENCE_FILE_INTEGRITY');
               const bytes = fs.readFileSync(descriptor);
               const after = fs.fstatSync(descriptor);
               const current = fs.lstatSync(absolutePath);
@@ -452,7 +488,7 @@ jobs:
                 after.ino !== opened.ino ||
                 after.size !== opened.size ||
                 bytes.length !== opened.size
-              ) fail('evidence file changed while reading');
+              ) fail('EVIDENCE_FILE_INTEGRITY');
               return bytes;
             } finally {
               fs.closeSync(descriptor);
@@ -460,7 +496,7 @@ jobs:
           };
           const run = (command, args) => {
             const result = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-            if (result.error || result.status !== 0) fail('Intel evidence provenance check failed');
+            if (result.error || result.status !== 0) fail('EVIDENCE_PROVENANCE_MISMATCH');
             return result.stdout.trim();
           };
           const parseJsonObject = (bytes, label) => {
@@ -468,9 +504,9 @@ jobs:
             try {
               value = JSON.parse(bytes.toString('utf8'));
             } catch {
-              fail('invalid JSON in ' + label);
+              fail('EVIDENCE_JSON_INVALID');
             }
-            if (!value || typeof value !== 'object' || Array.isArray(value)) fail('invalid JSON object in ' + label);
+            if (!value || typeof value !== 'object' || Array.isArray(value)) fail('EVIDENCE_JSON_INVALID');
             assertNoSensitiveKeys(value);
             return value;
           };
@@ -490,7 +526,7 @@ jobs:
               !/^[0-9a-f]{40}$/.test(expectedBase) ||
               root !== expectedRoot ||
               !isInside(runnerTemp, root)
-            ) fail('unexpected Intel evidence root');
+            ) fail('EVIDENCE_PATH_UNSAFE');
             assertTrustedAncestors(runnerTemp);
             assertDirectory(path.dirname(root));
             assertDirectory(root);
@@ -499,27 +535,28 @@ jobs:
             const directories = new Set();
             let entryCount = 0;
             let totalBytes = 0;
+            validationPhase = 'tree';
             const visit = (directory, relativeDirectory, depth) => {
-              if (depth > 8) fail('evidence tree exceeds depth bound');
+              if (depth > 8) fail('EVIDENCE_FILE_BOUNDS');
               for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
                 entryCount += 1;
-                if (entryCount > 512) fail('evidence tree exceeds entry bound');
+                if (entryCount > 512) fail('EVIDENCE_FILE_BOUNDS');
                 const relativePath = relativeDirectory ? path.join(relativeDirectory, entry.name) : entry.name;
                 if (entry.name === '.' || entry.name === '..' || entry.name.endsWith('.tmp')) {
-                  fail('evidence tree contains an unsafe entry');
+                  fail('EVIDENCE_PATH_UNSAFE');
                 }
                 const absolutePath = path.join(directory, entry.name);
                 const metadata = fs.lstatSync(absolutePath);
-                if (metadata.isSymbolicLink()) fail('evidence tree contains a symbolic link');
+                if (metadata.isSymbolicLink()) fail('EVIDENCE_PATH_UNSAFE');
                 if (metadata.isDirectory()) {
-                  if (!allowedDirectory(relativePath)) fail('evidence tree contains an unknown directory');
+                  if (!allowedDirectory(relativePath)) fail('EVIDENCE_PATH_UNSAFE');
                   directories.add(relativePath);
                   assertDirectory(absolutePath);
                   visit(absolutePath, relativePath, depth + 1);
                   continue;
                 }
                 if (!metadata.isFile() || !allowedFile(relativePath)) {
-                  fail('evidence tree contains an unknown or special file');
+                  fail('EVIDENCE_PATH_UNSAFE');
                 }
                 if (
                   metadata.uid !== uid ||
@@ -529,9 +566,9 @@ jobs:
                   metadata.size < 0 ||
                   metadata.size > fileLimit ||
                   !Number.isSafeInteger(totalBytes + metadata.size)
-                ) fail('evidence file violates owner, mode, or size bounds');
+                ) fail('EVIDENCE_FILE_BOUNDS');
                 totalBytes += metadata.size;
-                if (totalBytes > bundleLimit) fail('evidence bundle exceeds size bound');
+                if (totalBytes > bundleLimit) fail('EVIDENCE_FILE_BOUNDS');
                 const bytes = readPrivateFile(absolutePath, metadata);
                 const text = bytes.toString('utf8');
                 if (
@@ -549,39 +586,41 @@ jobs:
                   /\bBearer\s+(?!\[redacted\])/i.test(text) ||
                   /\bpostgres(?:ql)?:\/\/[^\s/@]+@/i.test(text) ||
                   /\b(password|secret|token|authorization|cookie|credential)\s*[:=]\s*(?!\[redacted\])\S+/i.test(text)
-                ) fail('evidence contains a private path or credential');
+                ) fail('EVIDENCE_PRIVACY_REJECTED');
                 files.set(relativePath, bytes);
               }
             };
             visit(root, '', 0);
             if (!files.has('manifest.json') || !files.has('summary.json') || !files.has('omissions.json')) {
-              fail('Intel evidence is incomplete');
+              fail('EVIDENCE_REQUIRED_FILE_MISSING');
             }
 
             const documents = new Map();
+            validationPhase = 'parsing';
             for (const [relativePath, bytes] of files) {
               if (relativePath.endsWith('.json')) {
                 documents.set(relativePath, parseJsonObject(bytes, relativePath));
               } else if (relativePath.endsWith('.jsonl')) {
                 const lines = bytes.toString('utf8').split('\n');
                 if (lines.at(-1) === '') lines.pop();
-                if (lines.length === 0) fail('empty JSONL evidence');
+                if (lines.length === 0) fail('EVIDENCE_JSON_INVALID');
                 for (const line of lines) parseJsonObject(Buffer.from(line), relativePath);
               }
             }
 
+            validationPhase = 'provenance';
             const headSha = run('git', ['rev-parse', 'HEAD']);
             const treeSha = run('git', ['rev-parse', 'HEAD^{tree}']);
-            if (headSha !== expectedHead) fail('evidence HEAD does not match checkout');
+            if (headSha !== expectedHead) fail('EVIDENCE_PROVENANCE_MISMATCH');
             execFileSync('git', ['cat-file', '-e', expectedBase + '^{commit}']);
             const ancestry = spawnSync('git', ['merge-base', '--is-ancestor', expectedBase, headSha], { stdio: 'ignore' });
-            if (ancestry.status !== 0) fail('evidence base is not an ancestor of checkout');
+            if (ancestry.status !== 0) fail('EVIDENCE_PROVENANCE_MISMATCH');
             const changedFiles = run('git', ['diff', '--no-renames', '--name-only', expectedBase, headSha])
               .split('\n')
               .filter(Boolean)
               .sort();
             if (JSON.stringify(changedFiles) !== JSON.stringify(expectedFiles)) {
-              fail('evidence changed-file set does not match reviewed scope');
+              fail('EVIDENCE_PROVENANCE_MISMATCH');
             }
 
             const manifest = documents.get('manifest.json');
@@ -604,8 +643,9 @@ jobs:
               manifest.pnpmVersion !== run('pnpm', ['--version']) ||
               manifest.osRelease !== os.release() ||
               manifest.testCommand !== 'pnpm exec vitest run test/installer-posix-toolchain.test.ts test/scenarios/install-activation-helper.test.ts'
-            ) fail('manifest does not match exact checkout and runner');
+            ) fail('EVIDENCE_PROVENANCE_MISMATCH');
 
+            validationPhase = 'summary';
             const summary = documents.get('summary.json');
             assertKeys(
               summary,
@@ -623,7 +663,7 @@ jobs:
               summary.collectorBytes > totalBytes ||
               typeof summary.capturedAt !== 'string' ||
               Number.isNaN(Date.parse(summary.capturedAt))
-            ) fail('summary contains issues or invalid completeness data');
+            ) fail('EVIDENCE_SUMMARY_INVALID');
             assertKeys(
               summary.cleanupOutcome,
               ['beforeCleanupSnapshot', 'gate', 'secondFixture', 'firstFixture'],
@@ -634,13 +674,15 @@ jobs:
               summary.cleanupOutcome.gate !== 'complete' ||
               summary.cleanupOutcome.secondFixture !== 'complete' ||
               summary.cleanupOutcome.firstFixture !== 'complete'
-            ) fail('diagnostic cleanup was incomplete');
+            ) fail('EVIDENCE_CLEANUP_INCOMPLETE');
 
+            validationPhase = 'omissions';
             const omissionsDocument = documents.get('omissions.json');
             assertKeys(omissionsDocument, ['omissions'], 'omissions');
             if (!Array.isArray(omissionsDocument.omissions) || omissionsDocument.omissions.length > 100) {
-              fail('invalid omission list');
+              fail('EVIDENCE_OMISSION_INVALID');
             }
+            validationPhase = 'snapshots';
             const snapshots = new Map();
             for (const label of snapshotLabels) {
               const snapshot = documents.get('snapshots/' + label + '.json');
@@ -652,7 +694,7 @@ jobs:
                 !Array.isArray(snapshot.fixtures) ||
                 snapshot.fixtures.length < 1 ||
                 snapshot.fixtures.length > 2
-              ) fail('invalid snapshot');
+              ) fail('EVIDENCE_SNAPSHOT_INVALID');
               const ids = new Set();
               for (const fixture of snapshot.fixtures) {
                 if (
@@ -663,17 +705,18 @@ jobs:
                   !fixture.serverStatus ||
                   fixture.serverStatus.kind !== 'unavailable' ||
                   fixture.serverStatus.reason !== 'active-status-not-queried-in-isolated-collector'
-                ) fail('invalid snapshot fixture attribution');
+                ) fail('EVIDENCE_SNAPSHOT_INVALID');
                 assertKeys(fixture.serverStatus, ['kind', 'reason'], 'server status');
                 ids.add(fixture.contextId);
                 const lifecyclePath = 'snapshots/' + label + '/' + fixture.contextId + '.lifecycle.jsonl';
                 if (fixture.lifecycle && fixture.lifecycle.status === 'captured' && fixture.lifecycle.eventCount > 0 && !files.has(lifecyclePath)) {
-                  fail('captured lifecycle evidence is missing');
+                  fail('EVIDENCE_REQUIRED_FILE_MISSING');
                 }
               }
               snapshots.set(label, snapshot);
             }
             const omissionKeys = new Set();
+            validationPhase = 'omissions';
             for (const item of omissionsDocument.omissions) {
               assertKeys(item, ['invocationId', 'contextId', 'artifact', 'reason', 'required'], 'omission');
               if (
@@ -685,13 +728,13 @@ jobs:
                 typeof item.contextId !== 'string' ||
                 !snapshotLabels.has(item.invocationId) ||
                 !snapshots.has(item.invocationId)
-              ) fail('unexpected diagnostic omission');
+              ) fail('EVIDENCE_OMISSION_INVALID');
               const snapshot = snapshots.get(item.invocationId);
               if (!snapshot.fixtures.some((fixture) => fixture.contextId === item.contextId)) {
-                fail('omission attribution does not match snapshot');
+                fail('EVIDENCE_OMISSION_INVALID');
               }
               const key = item.invocationId + ':' + item.contextId;
-              if (omissionKeys.has(key)) fail('duplicate diagnostic omission');
+              if (omissionKeys.has(key)) fail('EVIDENCE_OMISSION_INVALID');
               omissionKeys.add(key);
             }
             const observedStatusOmissions = new Set();
@@ -704,7 +747,7 @@ jobs:
               omissionKeys.size !== observedStatusOmissions.size ||
               [...observedStatusOmissions].some((key) => !omissionKeys.has(key)) ||
               summary.collectorComplete !== (omissionKeys.size === 0)
-            ) fail('collector completeness does not match approved limitations');
+            ) fail('EVIDENCE_SUMMARY_INVALID');
 
             const phaseFiles = [
               'attempts/initial/preparation.json',
@@ -717,13 +760,14 @@ jobs:
               'attempts/retry-after-cancel/result.json',
               'snapshots/after-retry.json',
             ];
+            validationPhase = 'attempts';
             const candidateIdsByLabel = new Map(
               [...attemptLabels].map((label) => [label, new Set()]),
             );
-            if (!files.has(phaseFiles[0])) fail('initial attempt evidence is missing');
+            if (!files.has(phaseFiles[0])) fail('EVIDENCE_REQUIRED_FILE_MISSING');
             for (let index = 1; index < phaseFiles.length; index += 1) {
               if (files.has(phaseFiles[index]) && !files.has(phaseFiles[index - 1])) {
-                fail('diagnostic phases are not a valid scenario prefix');
+                fail('EVIDENCE_REQUIRED_FILE_MISSING');
               }
             }
             for (const label of attemptLabels) {
@@ -736,16 +780,16 @@ jobs:
                   !Array.isArray(preparation.inventories) ||
                   preparation.inventories.length < 1 ||
                   preparation.inventories.length > 2
-                ) fail('invalid attempt preparation');
+                ) fail('EVIDENCE_CANDIDATE_MISMATCH');
                 for (const inventory of preparation.inventories) {
                   assertKeys(inventory, ['contextId', 'inventory'], 'persisted inventory');
                   if (typeof inventory.contextId !== 'string' || !/^context-[0-9]{1,2}$/.test(inventory.contextId)) {
-                    fail('invalid persisted context attribution');
+                    fail('EVIDENCE_CANDIDATE_MISMATCH');
                   }
                 }
               }
               if (result) {
-                if (!preparation) fail('attempt result has no preparation');
+                if (!preparation) fail('EVIDENCE_REQUIRED_FILE_MISSING');
                 if (
                   result.label !== label ||
                   (result.exitCode !== null && !Number.isInteger(result.exitCode)) ||
@@ -759,13 +803,13 @@ jobs:
                   result.candidateCount !== result.candidates.length ||
                   result.snapshotStatus !== 'complete' ||
                   result.pipesIncomplete !== false
-                ) fail('invalid attempt result');
+                ) fail('EVIDENCE_CANDIDATE_MISMATCH');
                 if (
                   (result.attemptAssociation === 'unique-observed-candidate' && result.candidates.length !== 1) ||
                   (result.attemptAssociation === 'not-retained-after-success' &&
                     (result.candidates.length !== 0 || result.exitCode !== 0 || result.signal !== null)) ||
                   !['unique-observed-candidate', 'not-retained-after-success'].includes(result.attemptAssociation)
-                ) fail('attempt result association is inconsistent');
+                ) fail('EVIDENCE_CANDIDATE_MISMATCH');
                 const candidateIds = candidateIdsByLabel.get(label);
                 for (let index = 0; index < result.candidates.length; index += 1) {
                   const candidate = result.candidates[index];
@@ -784,7 +828,7 @@ jobs:
                     /[\\/\u0000]/.test(candidate.observedName) ||
                     !['new-directory', 'changed-directory-or-scratch-log-facts'].includes(candidate.basis) ||
                     candidate.association !== result.attemptAssociation
-                  ) fail('invalid attempt candidate attribution');
+                  ) fail('EVIDENCE_CANDIDATE_MISMATCH');
                   candidateIds.add(candidateId);
                   assertKeys(
                     candidate.logs,
@@ -793,7 +837,7 @@ jobs:
                   );
                   const factsPath = 'attempts/' + label + '/candidates/' + candidateId + '/facts.json';
                   const candidateFacts = documents.get(factsPath);
-                  if (!candidateFacts) fail('attempt candidate facts are missing');
+                  if (!candidateFacts) fail('EVIDENCE_REQUIRED_FILE_MISSING');
                   assertKeys(
                     candidateFacts,
                     ['candidateId', 'observedName', 'basis', 'association', 'logs'],
@@ -802,7 +846,7 @@ jobs:
                   if (
                     !isDeepStrictEqual(candidateFacts, candidate) ||
                     candidateFacts.association !== result.attemptAssociation
-                  ) fail('attempt candidate facts do not match the result');
+                  ) fail('EVIDENCE_CANDIDATE_MISMATCH');
                   const tailNames = {
                     'server-start.log': 'server-start.tail.txt',
                     'install-session.log': 'install-session.tail.txt',
@@ -827,7 +871,7 @@ jobs:
                         !/^[0-9]+$/.test(log.facts.ctimeNs) ||
                         !/^[0-9a-f]{64}$/.test(log.facts.boundedDigest) ||
                         !files.has(tailPath)
-                      ) fail('captured candidate log tail is missing or invalid');
+                      ) fail('EVIDENCE_CANDIDATE_MISMATCH');
                     } else if (
                       log.status === 'expected-absent' &&
                       label === 'cancel-before-commit' &&
@@ -835,18 +879,18 @@ jobs:
                       log.reason === 'cancelled-before-commit-before-autostart'
                     ) {
                       assertKeys(log, ['status', 'reason'], 'expected-absent candidate log');
-                      if (files.has(tailPath)) fail('unexpected tail exists for an absent candidate log');
+                      if (files.has(tailPath)) fail('EVIDENCE_CANDIDATE_MISMATCH');
                     } else {
-                      fail('candidate log status is not admissible');
+                      fail('EVIDENCE_CANDIDATE_MISMATCH');
                     }
                   }
                 }
                 for (const suffix of ['stdout.tail.txt', 'stderr.tail.txt']) {
-                  if (!files.has('attempts/' + label + '/' + suffix)) fail('attempt result pipe evidence is missing');
+                  if (!files.has('attempts/' + label + '/' + suffix)) fail('EVIDENCE_REQUIRED_FILE_MISSING');
                 }
                 const lifecyclePath = 'attempts/' + label + '/lifecycle.sanitized.jsonl';
                 if (result.lifecycle && result.lifecycle.status === 'captured' && result.lifecycle.eventCount > 0 && !files.has(lifecyclePath)) {
-                  fail('attempt lifecycle evidence is missing');
+                  fail('EVIDENCE_REQUIRED_FILE_MISSING');
                 }
               }
             }
@@ -858,11 +902,12 @@ jobs:
                 !candidateIds ||
                 (parts.length === 3 && candidateIds.size === 0) ||
                 (parts.length >= 4 && !candidateIds.has(parts[3]))
-              ) fail('orphan attempt candidate evidence');
+              ) fail('EVIDENCE_CANDIDATE_MISMATCH');
             }
+            validationPhase = 'final';
             if (summary.testOutcome === 'passed') {
               for (const phase of phaseFiles) {
-                if (!files.has(phase)) fail('successful test is missing a required phase');
+                if (!files.has(phase)) fail('EVIDENCE_REQUIRED_FILE_MISSING');
               }
               const initial = documents.get('attempts/initial/result.json');
               const cancelled = documents.get('attempts/cancel-before-commit/result.json');
@@ -877,20 +922,24 @@ jobs:
                 retry.exitCode !== 0 ||
                 retry.signal !== null ||
                 !['not-retained-after-success', 'unique-observed-candidate'].includes(retry.attemptAssociation)
-              ) fail('successful cancellation scenario has inconsistent evidence');
+              ) fail('EVIDENCE_CANDIDATE_MISMATCH');
             }
             if (process.env.EVIDENCE_TARGET_OUTCOME === 'success' && summary.testOutcome !== 'passed') {
-              fail('targeted diagnostic outcome contradicts the test step');
+              fail('EVIDENCE_SUMMARY_INVALID');
             }
             if (process.env.EVIDENCE_TARGET_OUTCOME === 'failure' && !['passed', 'failed'].includes(summary.testOutcome)) {
-              fail('failed test step has no valid targeted outcome');
+              fail('EVIDENCE_SUMMARY_INVALID');
             }
             if (!['success', 'failure'].includes(process.env.EVIDENCE_TARGET_OUTCOME)) {
-              fail('installer activation step did not complete');
+              fail('EVIDENCE_SUMMARY_INVALID');
             }
             console.log('Intel evidence validated; active server status remains an explicit limitation.');
-          } catch {
-            console.error('Intel diagnostic evidence validation failed');
+          } catch (error) {
+            const code = error instanceof EvidenceValidationError && validationCodes.has(error.code)
+              ? error.code
+              : 'EVIDENCE_UNEXPECTED_ERROR';
+            const phase = validationPhases.has(validationPhase) ? validationPhase : 'root';
+            console.error(('Intel evidence validation failed: ' + code + '; phase=' + phase).slice(0, 256));
             process.exitCode = 1;
           }
           NODE
