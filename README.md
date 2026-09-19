@@ -48,13 +48,21 @@ node dist/bin/revo.js version
 node dist/bin/revo.js doctor
 node dist/bin/revo.js
 node dist/bin/revo.js --web
+node dist/bin/revo.js tui
+node dist/bin/revo.js tui --channel alpha
 node dist/bin/revo.js server start
 node dist/bin/revo.js server status
 node dist/bin/revo.js server stop
 ```
 
 Running `revo` without arguments ensures the server is running and prints one verified URL. `--web`
-also opens that URL in the default browser. Unknown root arguments and options fail with exit code 2. The package manifest remains private during the foundation stage.
+also opens that URL in the default browser. `revo tui` starts or reuses the selected local server,
+then opens the terminal client against its verified GraphQL endpoint. It requires an interactive
+stdin/stdout; exiting the TUI leaves the server running. `--channel`, `--config`, `--data-dir`, and
+`--startup-timeout` select the same Revo configuration used by the server commands. Other server
+settings, including host, port, public URL, database URL, and log directory, come from the selected
+configuration file or environment. Unknown arguments and options fail with exit code 2. The package
+manifest remains private during the foundation stage.
 
 ## Development
 
