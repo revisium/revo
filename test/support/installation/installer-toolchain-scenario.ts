@@ -125,6 +125,11 @@ function appendDiagnosticTail(previous: string, chunk: string): string {
     : bytes.subarray(bytes.length - INTEL_FILE_LIMIT).toString('utf8');
 }
 
+function safeFailureSummary(error: unknown, roots: readonly string[]): string {
+  const message = error instanceof Error ? error.message : 'non-error failure';
+  return redactDiagnosticText(message, roots).replace(/\s+/gu, ' ').slice(-1024);
+}
+
 const INTEL_COLLECTOR_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
@@ -1902,10 +1907,12 @@ export async function portableToolchain(
     const diagnosticsEnabled = Boolean(diagnosticLabel && intelDiagnosticsDirectory());
     const diagnosticContext = diagnosticContextFor(extra);
     let child!: ChildProcess;
-    let stderr = '';
     let stdout = '';
     let stderrTail = '';
     let stdoutTail = '';
+    let observedExit:
+      | { readonly code: number | null; readonly signal: NodeJS.Signals | null }
+      | undefined;
     const finish = new Promise<number>((resolveFinish) => {
       const installerEnvironment: NodeJS.ProcessEnv = {
         ...process.env,
@@ -1948,12 +1955,7 @@ export async function portableToolchain(
         }
       };
       const onStderrData = (chunk: string) => {
-        if (stderr.length < 2048) {
-          stderr += chunk.slice(0, 2048 - stderr.length);
-        }
-        if (diagnosticsEnabled) {
-          stderrTail = appendDiagnosticTail(stderrTail, chunk);
-        }
+        stderrTail = appendDiagnosticTail(stderrTail, chunk);
       };
       child.stdout?.setEncoding('utf8');
       child.stdout?.on('data', onStdoutData);
@@ -2050,8 +2052,13 @@ export async function portableToolchain(
         return complete;
       };
       const settle = async (code: number | null, signal: NodeJS.Signals | null) => {
-        if (code !== 0 && stderr.length > 0) {
-          console.error(stderr.replaceAll(root, '<fixture>'));
+        observedExit = { code, signal };
+        if (code !== 0 || signal !== null) {
+          console.error(`Installer child exit: code=${code ?? 'null'}; signal=${signal ?? 'none'}`);
+          const failureTail = redactDiagnosticText(stderrTail, [root]).slice(-4096);
+          if (failureTail) {
+            console.error(`Installer stderr tail: ${failureTail}`);
+          }
         }
         if (diagnosticsEnabled && diagnosticLabel) {
           try {
@@ -2086,7 +2093,13 @@ export async function portableToolchain(
         child.once('exit', (code, signal) => void settle(code, signal));
       }
     });
-    return { child, finish, stdout: () => stdout };
+    return {
+      child,
+      finish,
+      stdout: () => stdout,
+      outcome: () => observedExit,
+      stderrTail: () => redactDiagnosticText(stderrTail, [root]).slice(-4096),
+    };
   };
   const runInstaller = () => startInstaller().finish;
   const attempts = async () =>
@@ -2130,13 +2143,58 @@ export async function cleanupPortableToolchain(root: string) {
   await rm(root, { recursive: true, force: true });
 }
 
+export async function runWithPortableToolchainCleanup<T>(
+  root: string,
+  scenario: () => Promise<T>,
+  cleanup: () => Promise<void> = () => cleanupPortableToolchain(root),
+): Promise<T> {
+  let value!: T;
+  let scenarioFailure: unknown;
+  let hasScenarioFailure = false;
+  try {
+    value = await scenario();
+  } catch (error) {
+    scenarioFailure = error;
+    hasScenarioFailure = true;
+  }
+
+  let cleanupFailure: unknown;
+  let hasCleanupFailure = false;
+  try {
+    await cleanup();
+  } catch (error) {
+    cleanupFailure = error;
+    hasCleanupFailure = true;
+  }
+
+  if (hasScenarioFailure && hasCleanupFailure) {
+    throw new AggregateError(
+      [scenarioFailure, cleanupFailure],
+      `Installer scenario failed: ${safeFailureSummary(scenarioFailure, [root])}; ` +
+        `fixture cleanup failed: ${safeFailureSummary(cleanupFailure, [root])}`,
+    );
+  }
+  if (hasScenarioFailure) {
+    throw scenarioFailure;
+  }
+  if (hasCleanupFailure) {
+    throw cleanupFailure;
+  }
+  return value;
+}
+
 async function stopInstalledServer(dataDir: string): Promise<void> {
-  if ((await new ServerStatusService().read(dataDir)).kind === 'stopped') {
+  const status = await new ServerStatusService().read(dataDir);
+  if (status.kind === 'stopped') {
     return;
   }
   const stopped = await new ServerStopService().stop(dataDir, 30_000);
   if (stopped.kind !== 'completed') {
-    throw new Error('installed server cleanup was not confirmed; fixture retained');
+    const ownership = stopped.ownership ? `; ownership=${stopped.ownership}` : '';
+    throw new Error(
+      `installed server cleanup was not confirmed; fixture retained; ` +
+        `status=${status.kind}; stop=${stopped.kind}${ownership}`,
+    );
   }
 }
 

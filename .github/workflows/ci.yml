@@ -332,6 +332,12 @@ jobs:
             'EVIDENCE_CLEANUP_INCOMPLETE',
             'EVIDENCE_SNAPSHOT_INVALID',
             'EVIDENCE_OMISSION_INVALID',
+            'EVIDENCE_OMISSION_LIST_INVALID',
+            'EVIDENCE_OMISSION_ARTIFACT_INVALID',
+            'EVIDENCE_OMISSION_REASON_INVALID',
+            'EVIDENCE_OMISSION_SNAPSHOT_MISMATCH',
+            'EVIDENCE_OMISSION_CONTEXT_MISMATCH',
+            'EVIDENCE_OMISSION_DUPLICATE',
             'EVIDENCE_CANDIDATE_MISMATCH',
             'EVIDENCE_REQUIRED_FILE_MISSING',
             'EVIDENCE_UNEXPECTED_ERROR',
@@ -680,7 +686,7 @@ jobs:
             const omissionsDocument = documents.get('omissions.json');
             assertKeys(omissionsDocument, ['omissions'], 'omissions');
             if (!Array.isArray(omissionsDocument.omissions) || omissionsDocument.omissions.length > 100) {
-              fail('EVIDENCE_OMISSION_INVALID');
+              fail('EVIDENCE_OMISSION_LIST_INVALID');
             }
             validationPhase = 'snapshots';
             const snapshots = new Map();
@@ -719,22 +725,26 @@ jobs:
             validationPhase = 'omissions';
             for (const item of omissionsDocument.omissions) {
               assertKeys(item, ['invocationId', 'contextId', 'artifact', 'reason', 'required'], 'omission');
+              if (!item || item.artifact !== 'server-status') {
+                fail('EVIDENCE_OMISSION_ARTIFACT_INVALID');
+              }
+              if (item.reason !== 'active-status-not-queried-in-isolated-collector') {
+                fail('EVIDENCE_OMISSION_REASON_INVALID');
+              }
               if (
-                !item ||
-                item.artifact !== 'server-status' ||
-                item.reason !== 'active-status-not-queried-in-isolated-collector' ||
                 item.required !== true ||
                 typeof item.invocationId !== 'string' ||
-                typeof item.contextId !== 'string' ||
-                !snapshotLabels.has(item.invocationId) ||
-                !snapshots.has(item.invocationId)
-              ) fail('EVIDENCE_OMISSION_INVALID');
+                typeof item.contextId !== 'string'
+              ) fail('EVIDENCE_OMISSION_CONTEXT_MISMATCH');
+              if (!snapshotLabels.has(item.invocationId) || !snapshots.has(item.invocationId)) {
+                fail('EVIDENCE_OMISSION_SNAPSHOT_MISMATCH');
+              }
               const snapshot = snapshots.get(item.invocationId);
               if (!snapshot.fixtures.some((fixture) => fixture.contextId === item.contextId)) {
-                fail('EVIDENCE_OMISSION_INVALID');
+                fail('EVIDENCE_OMISSION_CONTEXT_MISMATCH');
               }
               const key = item.invocationId + ':' + item.contextId;
-              if (omissionKeys.has(key)) fail('EVIDENCE_OMISSION_INVALID');
+              if (omissionKeys.has(key)) fail('EVIDENCE_OMISSION_DUPLICATE');
               omissionKeys.add(key);
             }
             const observedStatusOmissions = new Set();

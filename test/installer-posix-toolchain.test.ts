@@ -16,6 +16,7 @@ import {
   portableToolchain,
   prepareIntelInvocation,
   recordIntelCollectorIssue,
+  runWithPortableToolchainCleanup,
   toolchainInstaller,
   writeIntelDiagnosticSummary,
 } from './support/installation/installer-toolchain-scenario.js';
@@ -35,6 +36,53 @@ const validActivation = (value: ActivationReadResult) => {
   }
   return value;
 };
+
+describe('portable installer fixture cleanup', () => {
+  it('preserves both scenario and cleanup failures', async () => {
+    const scenarioFailure = new Error('scenario failed');
+    const cleanupFailure = new Error('cleanup failed');
+    const outcome = runWithPortableToolchainCleanup(
+      '/private/fixture',
+      async () => {
+        throw scenarioFailure;
+      },
+      async () => {
+        throw cleanupFailure;
+      },
+    );
+
+    await expect(outcome).rejects.toMatchObject({
+      errors: [scenarioFailure, cleanupFailure],
+      message: expect.stringContaining('scenario failed'),
+    });
+  });
+
+  it('keeps a cleanup-only failure red', async () => {
+    const cleanupFailure = new Error('cleanup failed');
+    await expect(
+      runWithPortableToolchainCleanup(
+        '/private/fixture',
+        async () => 'done',
+        async () => {
+          throw cleanupFailure;
+        },
+      ),
+    ).rejects.toBe(cleanupFailure);
+  });
+
+  it('preserves a scenario failure when cleanup succeeds', async () => {
+    const scenarioFailure = new Error('scenario failed');
+    await expect(
+      runWithPortableToolchainCleanup(
+        '/private/fixture',
+        async () => {
+          throw scenarioFailure;
+        },
+        async () => undefined,
+      ),
+    ).rejects.toBe(scenarioFailure);
+  });
+});
 
 const captureIntelSnapshot = async (...args: Parameters<typeof captureIntelSnapshotUnsafe>) => {
   try {
@@ -59,37 +107,69 @@ it.each(['stable', 'alpha'] as const)(
       false,
       true,
     );
-    try {
-      expect(subject.plan.release.version).toMatch(/^0\.0\./u);
-      const installation = subject.startInstaller();
-      expect(await installation.finish).toBe(0);
-      const running = await subject.status();
-      expect(running.kind).toBe('running');
-      expect(installation.stdout()).toContain('http://127.0.0.1:');
-      expect(installation.stdout()).toContain('Command now:');
-      const downloads = await readFile(subject.calls, 'utf8');
-      const artifactRequests = await readFile(subject.fetchCalls, 'utf8');
-      const pnpmInvocations = await readFile(subject.pnpmCalls, 'utf8');
-      expect(pnpmInvocations.trim().length).toBeGreaterThan(0);
-      const current = validActivation(await readActivation(join(subject.root, 'state', channel)));
-      expect(current.record.release.version).toBe(subject.plan.release.version);
-      expect(current.record.toolchain.nodeArchiveSha256).toBe(subject.nodeArchiveSha256);
-      expect(current.record.toolchain.pnpmArchiveSha256).toBe(subject.pnpmArchiveSha256);
-      expect(current.record.launcherProtocol).toBe('revo-activation-launcher/v2');
-      const generation = current.record.generationId;
-      expect(await subject.startInstaller().finish).toBe(0);
-      expect(await subject.status()).toEqual(running);
-      expect(await readFile(subject.calls, 'utf8')).toBe(downloads);
-      expect(await readFile(subject.fetchCalls, 'utf8')).toBe(artifactRequests);
-      expect(await readFile(subject.pnpmCalls, 'utf8')).toBe(pnpmInvocations);
-      const retry = validActivation(await readActivation(join(subject.root, 'state', channel)));
-      expect(retry.record.generationId).toBe(generation);
-    } finally {
-      await cleanupPortableToolchain(subject.root);
-    }
+    let phase = 'initial-install';
+    let installerOutcome = 'not-started';
+    let installerStderrTail = '';
+    await runWithPortableToolchainCleanup(
+      subject.root,
+      async () => {
+        expect(subject.plan.release.version).toMatch(/^0\.0\./u);
+        const installation = subject.startInstaller();
+        const installationCode = await installation.finish;
+        installerOutcome = formatInstallerOutcome(installation.outcome());
+        installerStderrTail = installation.stderrTail();
+        expect(installationCode).toBe(0);
+        phase = 'initial-server-status';
+        const running = await subject.status();
+        expect(running.kind).toBe('running');
+        expect(installation.stdout()).toContain('http://127.0.0.1:');
+        expect(installation.stdout()).toContain('Command now:');
+        const downloads = await readFile(subject.calls, 'utf8');
+        const artifactRequests = await readFile(subject.fetchCalls, 'utf8');
+        const pnpmInvocations = await readFile(subject.pnpmCalls, 'utf8');
+        expect(pnpmInvocations.trim().length).toBeGreaterThan(0);
+        const current = validActivation(await readActivation(join(subject.root, 'state', channel)));
+        expect(current.record.release.version).toBe(subject.plan.release.version);
+        expect(current.record.toolchain.nodeArchiveSha256).toBe(subject.nodeArchiveSha256);
+        expect(current.record.toolchain.pnpmArchiveSha256).toBe(subject.pnpmArchiveSha256);
+        expect(current.record.launcherProtocol).toBe('revo-activation-launcher/v2');
+        const generation = current.record.generationId;
+        phase = 'same-version-reuse';
+        const reuse = subject.startInstaller();
+        const reuseCode = await reuse.finish;
+        installerOutcome = formatInstallerOutcome(reuse.outcome());
+        installerStderrTail = reuse.stderrTail();
+        expect(reuseCode).toBe(0);
+        expect(await subject.status()).toEqual(running);
+        expect(await readFile(subject.calls, 'utf8')).toBe(downloads);
+        expect(await readFile(subject.fetchCalls, 'utf8')).toBe(artifactRequests);
+        expect(await readFile(subject.pnpmCalls, 'utf8')).toBe(pnpmInvocations);
+        const retry = validActivation(await readActivation(join(subject.root, 'state', channel)));
+        expect(retry.record.generationId).toBe(generation);
+      },
+      async () => {
+        try {
+          await cleanupPortableToolchain(subject.root);
+        } catch (error) {
+          throw new Error(
+            `cleanup phase failed; testPhase=${phase}; installer=${installerOutcome}; ` +
+              `stderrTail=${installerStderrTail.slice(-1024)}`,
+            { cause: error },
+          );
+        }
+      },
+    );
   },
   180_000,
 );
+
+function formatInstallerOutcome(
+  outcome: { readonly code: number | null; readonly signal: NodeJS.Signals | null } | undefined,
+): string {
+  return outcome
+    ? `code=${outcome.code ?? 'null'}; signal=${outcome.signal ?? 'none'}`
+    : 'exit-not-observed';
+}
 
 it.each(['extra-key', 'oversized', 'symlink'] as const)(
   'real helper rejects an unsafe %s request without changing current state',
