@@ -7,12 +7,17 @@ import { describe, expect, it, vi } from 'vitest';
 import { readActivation, type ActivationReadResult } from '../src/installation/activation-store.js';
 import { ServerOwnershipService } from '../src/processes/server-ownership.service.js';
 import {
+  captureIntelSnapshot as captureIntelSnapshotUnsafe,
   cleanupPortableToolchain,
+  intelCollectorsQuiescent,
   installerData,
   nodeData,
   nodeInstaller,
   portableToolchain,
+  prepareIntelInvocation,
+  recordIntelCollectorIssue,
   toolchainInstaller,
+  writeIntelDiagnosticSummary,
 } from './support/installation/installer-toolchain-scenario.js';
 import { ServerOwnerScenario } from './support/server/server-owner-scenario.js';
 
@@ -29,6 +34,20 @@ const validActivation = (value: ActivationReadResult) => {
     throw new Error('activation was not valid');
   }
   return value;
+};
+
+const captureIntelSnapshot = async (...args: Parameters<typeof captureIntelSnapshotUnsafe>) => {
+  try {
+    await captureIntelSnapshotUnsafe(...args);
+    return true;
+  } catch (error) {
+    recordIntelCollectorIssue(
+      error,
+      args[1].map((fixture) => fixture.root),
+    );
+    console.error('Intel diagnostic snapshot incomplete.');
+    return false;
+  }
 };
 
 it.each(['stable', 'alpha'] as const)(
@@ -191,32 +210,207 @@ it('real activation cancellation before commit preserves current and retains the
   const second = await portableToolchain('stable', '0.0.1', false, true, join(first.root, 'state'));
   const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
   const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
+  let initialSucceeded = false;
+  let cancellationPreserved = false;
+  let retryStarted = false;
+  let testOutcome: 'passed' | 'failed' | 'incomplete' = 'incomplete';
+  let hasFailure = false;
+  let primaryFailure: unknown;
+  let cleanupAllowed = false;
+  const cleanupOutcome: Record<string, string> = {
+    beforeCleanupSnapshot: 'not-run',
+    gate: 'not-run',
+    secondFixture: 'not-run',
+    firstFixture: 'not-run',
+  };
   try {
-    expect(await first.startInstaller().finish).toBe(0);
+    await prepareIntelInvocation('initial', [first.diagnosticContext]);
+    const initial = first.startInstaller({}, 'initial');
+    const initialCode = await initial.finish;
+    initialSucceeded = initialCode === 0;
+    expect(initialCode).toBe(0);
     await first.stopServer();
+    await captureIntelSnapshot(
+      'after-initial',
+      [first.diagnosticContext],
+      [
+        {
+          root: first.root,
+          expectation: 'required',
+          reason: 'initial installation completed and server startup was exercised',
+        },
+      ],
+    );
     const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     await writeFile(gate, 'hold\n', { mode: 0o600 });
-    const running = second.startInstaller({ REVO_TEST_ACTIVATION_FAULT: 'cancel' });
+    await prepareIntelInvocation('cancel-before-commit', [second.diagnosticContext]);
+    const running = second.startInstaller(
+      { REVO_TEST_ACTIVATION_FAULT: 'cancel' },
+      'cancel-before-commit',
+    );
     await vi.waitFor(async () => expect(await readFile(marker, 'utf8')).toContain('held'), {
       timeout: 120_000,
       interval: 25,
     });
     running.child.kill('SIGTERM');
-    expect(await running.finish).not.toBe(0);
+    const cancellationCode = await running.finish;
+    expect(cancellationCode).not.toBe(0);
     expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
     expect(
       (await readdir(join(first.root, 'state', 'stable'))).some((name) =>
         name.startsWith('.attempt.'),
       ),
     ).toBe(true);
+    cancellationPreserved = true;
+    await captureIntelSnapshot(
+      'after-cancellation',
+      [first.diagnosticContext, second.diagnosticContext],
+      [
+        {
+          root: first.root,
+          expectation: 'required',
+          reason: 'first fixture previously completed initial server startup',
+        },
+        {
+          root: second.root,
+          expectation: 'absent-permitted',
+          reason: 'second fixture was cancelled before commit and before autostart',
+        },
+      ],
+    );
     await rm(gate, { force: true });
-    expect(await second.startInstaller().finish).toBe(0);
+    await prepareIntelInvocation('retry-after-cancel', [second.diagnosticContext]);
+    retryStarted = true;
+    const retry = second.startInstaller({}, 'retry-after-cancel');
+    const retryCode = await retry.finish;
+    await captureIntelSnapshot(
+      'after-retry',
+      [first.diagnosticContext, second.diagnosticContext],
+      [
+        {
+          root: first.root,
+          expectation: 'required',
+          reason: 'initial installation completed and server startup was exercised',
+        },
+        {
+          root: second.root,
+          expectation: 'required',
+          reason: 'retry reached the server-start invocation',
+        },
+      ],
+    );
+    expect(retryCode).toBe(0);
     const after = validActivation(await readActivation(join(first.root, 'state', 'stable')));
     expect(after.record.generationId).not.toBe(before.record.generationId);
+    testOutcome = 'passed';
+  } catch (error) {
+    testOutcome = 'failed';
+    hasFailure = true;
+    primaryFailure = error;
   } finally {
-    await rm(gate, { force: true });
-    await cleanupPortableToolchain(second.root);
-    await cleanupPortableToolchain(first.root);
+    if (intelCollectorsQuiescent()) {
+      cleanupOutcome.beforeCleanupSnapshot = (await captureIntelSnapshot(
+        'before-cleanup',
+        [first.diagnosticContext, second.diagnosticContext],
+        [
+          {
+            root: first.root,
+            expectation: initialSucceeded ? 'required' : 'unknown',
+            reason: initialSucceeded
+              ? 'initial installation reached server startup'
+              : 'initial phase was not confirmed',
+          },
+          {
+            root: second.root,
+            expectation: retryStarted
+              ? 'required'
+              : cancellationPreserved
+                ? 'absent-permitted'
+                : 'unknown',
+            reason: retryStarted
+              ? 'retry reached the server-start invocation'
+              : cancellationPreserved
+                ? 'cancellation was confirmed before commit and retry did not start'
+                : 'second fixture startup phase is unknown',
+          },
+        ],
+      ))
+        ? 'captured'
+        : 'incomplete';
+      cleanupAllowed = intelCollectorsQuiescent();
+      if (!cleanupAllowed) {
+        cleanupOutcome.gate = 'skipped-collector-stop-unconfirmed';
+        cleanupOutcome.secondFixture = 'skipped-collector-stop-unconfirmed';
+        cleanupOutcome.firstFixture = 'skipped-collector-stop-unconfirmed';
+        if (!hasFailure) {
+          hasFailure = true;
+          testOutcome = 'failed';
+          primaryFailure = new Error('diagnostic collector stop was not confirmed');
+        }
+      }
+    } else {
+      cleanupOutcome.beforeCleanupSnapshot = 'skipped-collector-stop-unconfirmed';
+      cleanupOutcome.gate = 'skipped-collector-stop-unconfirmed';
+      cleanupOutcome.secondFixture = 'skipped-collector-stop-unconfirmed';
+      cleanupOutcome.firstFixture = 'skipped-collector-stop-unconfirmed';
+      if (!hasFailure) {
+        hasFailure = true;
+        testOutcome = 'failed';
+        primaryFailure = new Error('diagnostic collector stop was not confirmed');
+      }
+    }
+    if (cleanupAllowed) {
+      try {
+        await rm(gate, { force: true });
+        cleanupOutcome.gate = 'complete';
+      } catch {
+        cleanupOutcome.gate = 'failed';
+        if (!hasFailure) {
+          hasFailure = true;
+          testOutcome = 'failed';
+          primaryFailure = new Error('activation diagnostic gate cleanup failed');
+        }
+      }
+      try {
+        await cleanupPortableToolchain(second.root);
+        cleanupOutcome.secondFixture = 'complete';
+      } catch {
+        cleanupOutcome.secondFixture = 'failed';
+        if (!hasFailure) {
+          hasFailure = true;
+          testOutcome = 'failed';
+          primaryFailure = new Error('second fixture cleanup failed');
+        }
+      }
+      try {
+        await cleanupPortableToolchain(first.root);
+        cleanupOutcome.firstFixture = 'complete';
+      } catch {
+        cleanupOutcome.firstFixture = 'failed';
+        if (!hasFailure) {
+          hasFailure = true;
+          testOutcome = 'failed';
+          primaryFailure = new Error('first fixture cleanup failed');
+        }
+      }
+    }
+    if (intelCollectorsQuiescent()) {
+      try {
+        await writeIntelDiagnosticSummary({ testOutcome, cleanupOutcome });
+      } catch {
+        if (!hasFailure) {
+          hasFailure = true;
+          testOutcome = 'failed';
+          primaryFailure = new Error('activation diagnostic summary could not be written');
+        }
+        console.error('Intel diagnostic summary could not be written.');
+      }
+    } else {
+      console.error('Intel diagnostic summary could not be written.');
+    }
+  }
+  if (hasFailure) {
+    throw primaryFailure;
   }
 }, 360_000);
 
