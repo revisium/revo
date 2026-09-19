@@ -318,6 +318,7 @@ jobs:
           const uid = process.getuid();
           const fileLimit = 65_536;
           const bundleLimit = 2_097_152;
+          // BEGIN INTEL_EVIDENCE_DIAGNOSTICS
           const attemptLabels = new Set(['initial', 'cancel-before-commit', 'retry-after-cancel']);
           const snapshotLabels = new Set(['after-initial', 'after-cancellation', 'after-retry', 'before-cleanup']);
           const validationCodes = new Set([
@@ -354,25 +355,113 @@ jobs:
             'final',
           ]);
           let validationPhase = 'root';
+
+          const omissionArtifactCategories = new Map([
+            ['configuration', 'CONFIGURATION'],
+            ['server-lifecycle', 'LIFECYCLE'],
+            ['attempt-inventory', 'INVENTORY'],
+            ['control-record', 'CONTROL'],
+            ['attempt-association', 'ASSOCIATION'],
+            ['installer-pipes', 'PIPES'],
+            ['expected-node-runtime', 'NODE'],
+          ]);
+          const omissionInvocationCategories = new Map([
+            ['initial', 'INITIAL'],
+            ['cancel-before-commit', 'CANCEL_BEFORE_COMMIT'],
+            ['retry-after-cancel', 'RETRY_AFTER_CANCEL'],
+            ['after-initial', 'AFTER_INITIAL'],
+            ['after-cancellation', 'AFTER_CANCELLATION'],
+            ['after-retry', 'AFTER_RETRY'],
+            ['before-cleanup', 'BEFORE_CLEANUP'],
+          ]);
+          const omissionReasonCategories = new Map([
+            ['configuration', new Map([
+              ['unapproved-path', 'UNAPPROVED_PATH'],
+              ['invalid', 'INVALID'],
+            ])],
+            ['server-lifecycle', new Map([
+              ['unapproved-path', 'UNAPPROVED_PATH'],
+              ['invalid', 'INVALID'],
+              ['missing-data-dir', 'MISSING_DATA_DIR'],
+              ['missing-unexpected', 'MISSING_UNEXPECTED'],
+              ['unsafe', 'UNSAFE'],
+              ['io-error', 'IO_ERROR'],
+              ['too-large', 'TOO_LARGE'],
+              ['shared-lifecycle-location-required-by-another-context', 'SHARED_LIFECYCLE_REQUIRED'],
+            ])],
+            ['attempt-inventory', new Map([
+              ['missing-unexpected', 'MISSING_UNEXPECTED'],
+              ['unapproved-path', 'UNAPPROVED_PATH'],
+              ['unsafe', 'UNSAFE'],
+              ['io-error', 'IO_ERROR'],
+              ['captured', 'CAPTURED'],
+            ])],
+            ['control-record', new Map([
+              ['unavailable', 'UNAVAILABLE'],
+              ['unapproved-path', 'UNAPPROVED_PATH'],
+              ['unsafe', 'UNSAFE'],
+              ['io-error', 'IO_ERROR'],
+              ['too-large', 'TOO_LARGE'],
+              ['invalid', 'INVALID'],
+            ])],
+            ['attempt-association', new Map([
+              ['ambiguous', 'AMBIGUOUS'],
+              ['unresolved', 'UNRESOLVED'],
+              ['incomplete', 'INCOMPLETE'],
+            ])],
+            ['installer-pipes', new Map([
+              ['pipes-incomplete', 'PIPES_INCOMPLETE'],
+            ])],
+            ['expected-node-runtime', new Map([
+              ['unapproved-path', 'UNAPPROVED_PATH'],
+              ['unsafe', 'UNSAFE'],
+              ['missing', 'MISSING'],
+              ['io-error', 'IO_ERROR'],
+            ])],
+          ]);
+          const omissionArtifactValues = new Set([...omissionArtifactCategories.values(), 'OTHER']);
+          const omissionInvocationValues = new Set([...omissionInvocationCategories.values(), 'OTHER']);
+          const omissionReasonValues = new Set([
+            ...[...omissionReasonCategories.values()].flatMap((categories) => [...categories.values()]),
+            'OTHER',
+          ]);
+          const classifyOmissionFailure = (item) => {
+            const artifact = item && typeof item === 'object' ? item.artifact : undefined;
+            const invocation = item && typeof item === 'object' ? item.invocationId : undefined;
+            const reason = item && typeof item === 'object' ? item.reason : undefined;
+            return {
+              artifact: omissionArtifactCategories.get(artifact) ?? 'OTHER',
+              invocation: omissionInvocationCategories.get(invocation) ?? 'OTHER',
+              reason: omissionReasonCategories.get(artifact)?.get(reason) ?? 'OTHER',
+            };
+          };
           class EvidenceValidationError extends Error {
-            constructor(code) {
+            constructor(code, phase, omissionDiagnostic) {
               super(code);
               this.name = 'EvidenceValidationError';
               this.code = code;
+              this.phase = phase;
+              this.omissionDiagnostic = omissionDiagnostic;
             }
           }
-          const fail = (code) => {
+          const fail = (code, omissionDiagnostic) => {
             if (!validationCodes.has(code)) throw new Error('unclassified validation error');
-            throw new EvidenceValidationError(code);
+            throw new EvidenceValidationError(code, validationPhase, omissionDiagnostic);
           };
-          const expectedFiles = [
-            '.github/workflows/ci.yml',
-            'test/installer-posix-toolchain.test.ts',
-            'test/support/installation/installer-toolchain-scenario.ts',
-          ];
-          const isInside = (root, candidate) => {
-            const rel = path.relative(root, candidate);
-            return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
+          const formatEvidenceValidationFailure = (error, fallbackPhase) => {
+            const expectedError = error instanceof EvidenceValidationError;
+            const code = expectedError && validationCodes.has(error.code)
+              ? error.code
+              : 'EVIDENCE_UNEXPECTED_ERROR';
+            const phaseCandidate = expectedError ? error.phase : fallbackPhase;
+            const phase = validationPhases.has(phaseCandidate) ? phaseCandidate : 'root';
+            const diagnostic = expectedError ? error.omissionDiagnostic : undefined;
+            const detail = diagnostic && typeof diagnostic === 'object'
+              ? '; artifact=' + (omissionArtifactValues.has(diagnostic.artifact) ? diagnostic.artifact : 'OTHER')
+                + '; invocation=' + (omissionInvocationValues.has(diagnostic.invocation) ? diagnostic.invocation : 'OTHER')
+                + '; reason=' + (omissionReasonValues.has(diagnostic.reason) ? diagnostic.reason : 'OTHER')
+              : '';
+            return ('Intel evidence validation failed: ' + code + '; phase=' + phase + detail).slice(0, 256);
           };
           const assertKeys = (value, expected, label) => {
             if (
@@ -381,6 +470,16 @@ jobs:
               Array.isArray(value) ||
               JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...expected].sort())
             ) fail('EVIDENCE_SCHEMA_INVALID');
+          };
+          // END INTEL_EVIDENCE_DIAGNOSTICS
+          const expectedFiles = [
+            '.github/workflows/ci.yml',
+            'test/installer-posix-toolchain.test.ts',
+            'test/support/installation/installer-toolchain-scenario.ts',
+          ];
+          const isInside = (root, candidate) => {
+            const rel = path.relative(root, candidate);
+            return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
           };
           const assertTrustedAncestors = (target) => {
             const absolute = path.resolve(target);
@@ -682,6 +781,7 @@ jobs:
               summary.cleanupOutcome.firstFixture !== 'complete'
             ) fail('EVIDENCE_CLEANUP_INCOMPLETE');
 
+            // BEGIN INTEL_EVIDENCE_OMISSIONS_VALIDATOR
             validationPhase = 'omissions';
             const omissionsDocument = documents.get('omissions.json');
             assertKeys(omissionsDocument, ['omissions'], 'omissions');
@@ -726,7 +826,7 @@ jobs:
             for (const item of omissionsDocument.omissions) {
               assertKeys(item, ['invocationId', 'contextId', 'artifact', 'reason', 'required'], 'omission');
               if (!item || item.artifact !== 'server-status') {
-                fail('EVIDENCE_OMISSION_ARTIFACT_INVALID');
+                fail('EVIDENCE_OMISSION_ARTIFACT_INVALID', classifyOmissionFailure(item));
               }
               if (item.reason !== 'active-status-not-queried-in-isolated-collector') {
                 fail('EVIDENCE_OMISSION_REASON_INVALID');
@@ -758,6 +858,7 @@ jobs:
               [...observedStatusOmissions].some((key) => !omissionKeys.has(key)) ||
               summary.collectorComplete !== (omissionKeys.size === 0)
             ) fail('EVIDENCE_SUMMARY_INVALID');
+            // END INTEL_EVIDENCE_OMISSIONS_VALIDATOR
 
             const phaseFiles = [
               'attempts/initial/preparation.json',
@@ -945,11 +1046,7 @@ jobs:
             }
             console.log('Intel evidence validated; active server status remains an explicit limitation.');
           } catch (error) {
-            const code = error instanceof EvidenceValidationError && validationCodes.has(error.code)
-              ? error.code
-              : 'EVIDENCE_UNEXPECTED_ERROR';
-            const phase = validationPhases.has(validationPhase) ? validationPhase : 'root';
-            console.error(('Intel evidence validation failed: ' + code + '; phase=' + phase).slice(0, 256));
+            console.error(formatEvidenceValidationFailure(error, validationPhase));
             process.exitCode = 1;
           }
           NODE

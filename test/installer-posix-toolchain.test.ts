@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 
-import { describe, expect, it, vi } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { readActivation, type ActivationReadResult } from '../src/installation/activation-store.js';
 import { ServerOwnershipService } from '../src/processes/server-ownership.service.js';
@@ -21,6 +22,412 @@ import {
   writeIntelDiagnosticSummary,
 } from './support/installation/installer-toolchain-scenario.js';
 import { ServerOwnerScenario } from './support/server/server-owner-scenario.js';
+
+const extractWorkflowBlock = (source: string, startMarker: string, endMarker: string): string => {
+  expect(source.split(startMarker)).toHaveLength(2);
+  expect(source.split(endMarker)).toHaveLength(2);
+  const start = source.indexOf(startMarker) + startMarker.length;
+  const end = source.indexOf(endMarker);
+  expect(start).toBeLessThan(end);
+  return source.slice(start, end).trim();
+};
+
+let intelDiagnosticsBlock = '';
+let intelOmissionsValidatorBlock = '';
+
+interface OmissionDiagnostic {
+  readonly artifact: string;
+  readonly invocation: string;
+  readonly reason: string;
+}
+
+function isOmissionDiagnostic(value: unknown): value is OmissionDiagnostic {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'artifact' in value &&
+    typeof value.artifact === 'string' &&
+    'invocation' in value &&
+    typeof value.invocation === 'string' &&
+    'reason' in value &&
+    typeof value.reason === 'string'
+  );
+}
+
+type OmissionValidationResult =
+  | { readonly status: 'accepted' }
+  | { readonly status: 'rejected'; readonly message: string };
+
+function isOmissionValidationResult(value: unknown): value is OmissionValidationResult {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'status' in value &&
+    (value.status === 'accepted' ||
+      (value.status === 'rejected' && 'message' in value && typeof value.message === 'string'))
+  );
+}
+
+beforeAll(async () => {
+  const workflow = await readFile(join(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
+  intelDiagnosticsBlock = extractWorkflowBlock(
+    workflow,
+    '// BEGIN INTEL_EVIDENCE_DIAGNOSTICS',
+    '// END INTEL_EVIDENCE_DIAGNOSTICS',
+  );
+  intelOmissionsValidatorBlock = extractWorkflowBlock(
+    workflow,
+    '// BEGIN INTEL_EVIDENCE_OMISSIONS_VALIDATOR',
+    '// END INTEL_EVIDENCE_OMISSIONS_VALIDATOR',
+  );
+});
+
+const validStatusOmission = (overrides: Record<string, unknown> = {}) => ({
+  invocationId: 'after-initial',
+  contextId: 'context-0',
+  artifact: 'server-status',
+  reason: 'active-status-not-queried-in-isolated-collector',
+  required: true,
+  ...overrides,
+});
+
+const validStatusSnapshot = (label = 'after-initial') => ({
+  label,
+  capturedAt: '2026-09-19T00:00:00.000Z',
+  fixtures: [
+    {
+      contextId: 'context-0',
+      channel: 'stable',
+      serverStatus: {
+        kind: 'unavailable',
+        reason: 'active-status-not-queried-in-isolated-collector',
+      },
+    },
+  ],
+});
+
+const runOmissionClassifier = (item: unknown) => {
+  const result = runInNewContext(
+    `${intelDiagnosticsBlock}\nJSON.stringify(classifyOmissionFailure(item))`,
+    { item },
+    { timeout: 1000 },
+  );
+  const parsed: unknown = JSON.parse(String(result));
+  if (!isOmissionDiagnostic(parsed)) {
+    throw new Error('invalid omission classifier result');
+  }
+  return parsed;
+};
+
+const runOmissionValidator = (input: {
+  readonly omissions: unknown;
+  readonly snapshots?: readonly ReturnType<typeof validStatusSnapshot>[];
+  readonly collectorComplete: boolean;
+}) => {
+  const documents = new Map<string, unknown>();
+  documents.set('omissions.json', { omissions: input.omissions });
+  for (const snapshot of input.snapshots ?? []) {
+    documents.set(`snapshots/${snapshot.label}.json`, snapshot);
+  }
+  const source = `${intelDiagnosticsBlock}
+try {
+${intelOmissionsValidatorBlock}
+  JSON.stringify({ status: 'accepted' });
+} catch (error) {
+  JSON.stringify({
+    status: 'rejected',
+    message: formatEvidenceValidationFailure(error, validationPhase),
+  });
+}`;
+  const result = runInNewContext(
+    source,
+    {
+      documents,
+      files: new Set<string>(),
+      summary: { collectorComplete: input.collectorComplete },
+    },
+    { timeout: 1000 },
+  );
+  const parsed: unknown = JSON.parse(String(result));
+  if (!isOmissionValidationResult(parsed)) {
+    throw new Error('invalid omission validator result');
+  }
+  return parsed;
+};
+
+const omissionReasonCases = [
+  ['configuration', 'unapproved-path', 'CONFIGURATION', 'UNAPPROVED_PATH'],
+  ['configuration', 'invalid', 'CONFIGURATION', 'INVALID'],
+  ['server-lifecycle', 'unapproved-path', 'LIFECYCLE', 'UNAPPROVED_PATH'],
+  ['server-lifecycle', 'invalid', 'LIFECYCLE', 'INVALID'],
+  ['server-lifecycle', 'missing-data-dir', 'LIFECYCLE', 'MISSING_DATA_DIR'],
+  ['server-lifecycle', 'missing-unexpected', 'LIFECYCLE', 'MISSING_UNEXPECTED'],
+  ['server-lifecycle', 'unsafe', 'LIFECYCLE', 'UNSAFE'],
+  ['server-lifecycle', 'io-error', 'LIFECYCLE', 'IO_ERROR'],
+  ['server-lifecycle', 'too-large', 'LIFECYCLE', 'TOO_LARGE'],
+  [
+    'server-lifecycle',
+    'shared-lifecycle-location-required-by-another-context',
+    'LIFECYCLE',
+    'SHARED_LIFECYCLE_REQUIRED',
+  ],
+  ['attempt-inventory', 'missing-unexpected', 'INVENTORY', 'MISSING_UNEXPECTED'],
+  ['attempt-inventory', 'unapproved-path', 'INVENTORY', 'UNAPPROVED_PATH'],
+  ['attempt-inventory', 'unsafe', 'INVENTORY', 'UNSAFE'],
+  ['attempt-inventory', 'io-error', 'INVENTORY', 'IO_ERROR'],
+  ['attempt-inventory', 'captured', 'INVENTORY', 'CAPTURED'],
+  ['control-record', 'unavailable', 'CONTROL', 'UNAVAILABLE'],
+  ['control-record', 'unapproved-path', 'CONTROL', 'UNAPPROVED_PATH'],
+  ['control-record', 'unsafe', 'CONTROL', 'UNSAFE'],
+  ['control-record', 'io-error', 'CONTROL', 'IO_ERROR'],
+  ['control-record', 'too-large', 'CONTROL', 'TOO_LARGE'],
+  ['control-record', 'invalid', 'CONTROL', 'INVALID'],
+  ['attempt-association', 'ambiguous', 'ASSOCIATION', 'AMBIGUOUS'],
+  ['attempt-association', 'unresolved', 'ASSOCIATION', 'UNRESOLVED'],
+  ['attempt-association', 'incomplete', 'ASSOCIATION', 'INCOMPLETE'],
+  ['installer-pipes', 'pipes-incomplete', 'PIPES', 'PIPES_INCOMPLETE'],
+  ['expected-node-runtime', 'unapproved-path', 'NODE', 'UNAPPROVED_PATH'],
+  ['expected-node-runtime', 'unsafe', 'NODE', 'UNSAFE'],
+  ['expected-node-runtime', 'missing', 'NODE', 'MISSING'],
+  ['expected-node-runtime', 'io-error', 'NODE', 'IO_ERROR'],
+] as const;
+
+describe('Intel omission diagnostic contract', () => {
+  it.each(omissionReasonCases)(
+    'classifies the fixed reason for %s / %s',
+    (artifact, reason, expectedArtifact, expectedReason) => {
+      expect(runOmissionClassifier({ artifact, reason, invocationId: 'after-initial' })).toEqual({
+        artifact: expectedArtifact,
+        invocation: 'AFTER_INITIAL',
+        reason: expectedReason,
+      });
+    },
+  );
+
+  it.each([
+    ['initial', 'INITIAL'],
+    ['cancel-before-commit', 'CANCEL_BEFORE_COMMIT'],
+    ['retry-after-cancel', 'RETRY_AFTER_CANCEL'],
+    ['after-initial', 'AFTER_INITIAL'],
+    ['after-cancellation', 'AFTER_CANCELLATION'],
+    ['after-retry', 'AFTER_RETRY'],
+    ['before-cleanup', 'BEFORE_CLEANUP'],
+  ] as const)('classifies the fixed invocation %s', (invocationId, expectedInvocation) => {
+    expect(
+      runOmissionClassifier({
+        artifact: 'configuration',
+        invocationId,
+        reason: 'invalid',
+      }).invocation,
+    ).toBe(expectedInvocation);
+  });
+
+  it.each([
+    {
+      item: null,
+      expected: { artifact: 'OTHER', invocation: 'OTHER', reason: 'OTHER' },
+    },
+    {
+      item: 7,
+      expected: { artifact: 'OTHER', invocation: 'OTHER', reason: 'OTHER' },
+    },
+    {
+      item: {
+        artifact: '/private/SECRET_PATH\nSECRET_RAW',
+        invocationId: 'SECRET_RAW',
+        reason: 'SECRET_RAW',
+      },
+      expected: { artifact: 'OTHER', invocation: 'OTHER', reason: 'OTHER' },
+    },
+    {
+      item: {
+        artifact: 'configuration',
+        invocationId: 'after-initial',
+        reason: 'pipes-incomplete',
+      },
+      expected: { artifact: 'CONFIGURATION', invocation: 'AFTER_INITIAL', reason: 'OTHER' },
+    },
+  ])('does not broaden fixed classifications for unknown inputs %#', ({ item, expected }) => {
+    expect(runOmissionClassifier(item)).toEqual(expected);
+  });
+
+  it('keeps untrusted diagnostic values out of formatted output', () => {
+    const untrustedValue = '/private/SECRET_PATH\nSECRET_RAW';
+    const formatted = runInNewContext(
+      `${intelDiagnosticsBlock}
+const diagnostic = classifyOmissionFailure({
+  artifact: untrustedValue,
+  invocationId: untrustedValue,
+  reason: untrustedValue,
+});
+formatEvidenceValidationFailure(
+  new EvidenceValidationError('EVIDENCE_OMISSION_ARTIFACT_INVALID', untrustedValue, diagnostic),
+  untrustedValue,
+)`,
+      { untrustedValue },
+      { timeout: 1000 },
+    );
+    expect(formatted).toBe(
+      'Intel evidence validation failed: EVIDENCE_OMISSION_ARTIFACT_INVALID; phase=root; artifact=OTHER; invocation=OTHER; reason=OTHER',
+    );
+    expect(String(formatted)).not.toContain('SECRET');
+    expect(String(formatted)).not.toContain('/private');
+    expect(String(formatted).length).toBeLessThanOrEqual(256);
+  });
+
+  it('formats ordinary failures without printing arbitrary error messages', () => {
+    const formatted = runInNewContext(
+      `${intelDiagnosticsBlock}
+formatEvidenceValidationFailure(new Error('SECRET_RAW'), 'omissions')`,
+      {},
+      { timeout: 1000 },
+    );
+    expect(formatted).toBe(
+      'Intel evidence validation failed: EVIDENCE_UNEXPECTED_ERROR; phase=omissions',
+    );
+    expect(String(formatted)).not.toContain('SECRET_RAW');
+    expect(String(formatted).length).toBeLessThanOrEqual(256);
+  });
+
+  it.each([
+    {
+      id: 'V01 empty_without_snapshots',
+      omissions: [],
+      snapshots: [],
+      collectorComplete: true,
+      expected: { status: 'accepted' },
+    },
+    {
+      id: 'V02 matching_status_omission',
+      omissions: [validStatusOmission()],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: { status: 'accepted' },
+    },
+    {
+      id: 'V03 omissions_not_array',
+      omissions: {},
+      snapshots: [],
+      collectorComplete: true,
+      expected: {
+        status: 'rejected',
+        message:
+          'Intel evidence validation failed: EVIDENCE_OMISSION_LIST_INVALID; phase=omissions',
+      },
+    },
+    {
+      id: 'V04 omissions_over_limit',
+      omissions: Array.from({ length: 101 }, () => validStatusOmission()),
+      snapshots: [],
+      collectorComplete: true,
+      expected: {
+        status: 'rejected',
+        message:
+          'Intel evidence validation failed: EVIDENCE_OMISSION_LIST_INVALID; phase=omissions',
+      },
+    },
+    {
+      id: 'V05 omission_extra_key',
+      omissions: [validStatusOmission({ unexpected: 'SECRET_RAW' })],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: {
+        status: 'rejected',
+        message: 'Intel evidence validation failed: EVIDENCE_SCHEMA_INVALID; phase=omissions',
+      },
+    },
+    {
+      id: 'V06 omission_not_required',
+      omissions: [validStatusOmission({ required: false })],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: {
+        status: 'rejected',
+        message:
+          'Intel evidence validation failed: EVIDENCE_OMISSION_CONTEXT_MISMATCH; phase=omissions',
+      },
+    },
+    {
+      id: 'V07 forbidden_artifact',
+      omissions: [validStatusOmission({ artifact: 'configuration', reason: 'invalid' })],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: {
+        status: 'rejected',
+        message:
+          'Intel evidence validation failed: EVIDENCE_OMISSION_ARTIFACT_INVALID; phase=omissions; artifact=CONFIGURATION; invocation=AFTER_INITIAL; reason=INVALID',
+      },
+    },
+    {
+      id: 'V08 forbidden_status_reason',
+      omissions: [validStatusOmission({ reason: 'SECRET_RAW' })],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: {
+        status: 'rejected',
+        message:
+          'Intel evidence validation failed: EVIDENCE_OMISSION_REASON_INVALID; phase=omissions',
+      },
+    },
+    {
+      id: 'V09 referenced_snapshot_missing',
+      omissions: [validStatusOmission({ invocationId: 'after-retry' })],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: {
+        status: 'rejected',
+        message:
+          'Intel evidence validation failed: EVIDENCE_OMISSION_SNAPSHOT_MISMATCH; phase=omissions',
+      },
+    },
+    {
+      id: 'V10 referenced_context_missing',
+      omissions: [validStatusOmission({ contextId: 'context-1' })],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: {
+        status: 'rejected',
+        message:
+          'Intel evidence validation failed: EVIDENCE_OMISSION_CONTEXT_MISMATCH; phase=omissions',
+      },
+    },
+    {
+      id: 'V11 duplicate_omission',
+      omissions: [validStatusOmission(), validStatusOmission()],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: false,
+      expected: {
+        status: 'rejected',
+        message: 'Intel evidence validation failed: EVIDENCE_OMISSION_DUPLICATE; phase=omissions',
+      },
+    },
+    {
+      id: 'V12 completeness_mismatch',
+      omissions: [validStatusOmission()],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: true,
+      expected: {
+        status: 'rejected',
+        message: 'Intel evidence validation failed: EVIDENCE_SUMMARY_INVALID; phase=omissions',
+      },
+    },
+    {
+      id: 'V13 observed_context_unaccounted',
+      omissions: [],
+      snapshots: [validStatusSnapshot()],
+      collectorComplete: true,
+      expected: {
+        status: 'rejected',
+        message: 'Intel evidence validation failed: EVIDENCE_SUMMARY_INVALID; phase=omissions',
+      },
+    },
+  ])(
+    '$id exercises the workflow omission validator',
+    ({ omissions, snapshots, collectorComplete, expected }) => {
+      expect(runOmissionValidator({ omissions, snapshots, collectorComplete })).toEqual(expected);
+    },
+  );
+});
 
 const syntax = (script: string) =>
   new Promise<number>((resolve) => {
