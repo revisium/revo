@@ -45,6 +45,53 @@ function Assert-HarnessSuccess($Result, [int]$ExpectedExitCode, [string]$Label) 
   }
 }
 
+function ConvertTo-HarnessDiagnosticCode($Value, [string[]]$AllowedCodes) {
+  if ([string]::IsNullOrEmpty([string]$Value)) {
+    return 'none'
+  }
+  if ($AllowedCodes -ccontains [string]$Value) {
+    return [string]$Value
+  }
+  return 'unknown'
+}
+
+function ConvertTo-HarnessDiagnosticBoolean($Value) {
+  return ([bool]$Value).ToString().ToLowerInvariant()
+}
+
+function Format-DescendantHarnessDiagnostic($Result, [bool]$AckExists, [long]$ElapsedMs) {
+  $failureCodes = @(
+    'DESCENDANTS_REMAINED', 'EARLY_EXIT', 'EXECUTION_TIMEOUT', 'GO_WRITE_FAILED',
+    'JOB_CONFIGURATION_FAILED', 'PROCESS_START_FAILED', 'READY_TIMEOUT',
+    'SUPERVISOR_FAILURE', 'TOKEN_PREFLIGHT_FAILED'
+  )
+  $cleanupCodes = @(
+    'JOB_HANDLE_CLOSE_FAILED', 'JOB_NOT_EMPTY', 'JOB_QUERY_FAILED',
+    'JOB_TERMINATION_FAILED', 'OUTPUT_DRAIN_NOT_STARTED', 'OUTPUT_EOF_UNCONFIRMED',
+    'PROCESS_EVENT_HANDLER_RELEASE_FAILED', 'PROCESS_HANDLE_RELEASE_FAILED',
+    'PROCESS_INPUT_RELEASE_FAILED', 'ROOT_EXIT_QUERY_FAILED',
+    'ROOT_EXIT_UNCONFIRMED', 'ROOT_TERMINATION_FAILED'
+  )
+  $stdout = [string]$Result.StandardOutput
+  $stderr = [string]$Result.StandardError
+  return [string]::Format(
+    [Globalization.CultureInfo]::InvariantCulture,
+    'control=descendant failure={0} cleanupFailure={1} exitObserved={2} exitCode={3} timedOut={4} goAttempted={5} goSent={6} cleanupConfirmed={7} stdoutMarker={8} stderrMarker={9} ackExists={10} elapsedMs={11}',
+    (ConvertTo-HarnessDiagnosticCode $Result.FailureCode $failureCodes),
+    (ConvertTo-HarnessDiagnosticCode $Result.CleanupFailureCode $cleanupCodes),
+    (ConvertTo-HarnessDiagnosticBoolean $Result.ExitObserved),
+    [int]$Result.ExitCode,
+    (ConvertTo-HarnessDiagnosticBoolean $Result.TimedOut),
+    (ConvertTo-HarnessDiagnosticBoolean $Result.GoAttempted),
+    (ConvertTo-HarnessDiagnosticBoolean $Result.GoSent),
+    (ConvertTo-HarnessDiagnosticBoolean $Result.CleanupConfirmed),
+    (ConvertTo-HarnessDiagnosticBoolean $stdout.Contains('RVW_DESCENDANT_STDOUT')),
+    (ConvertTo-HarnessDiagnosticBoolean $stderr.Contains('RVW_DESCENDANT_STDERR')),
+    (ConvertTo-HarnessDiagnosticBoolean $AckExists),
+    [long]$ElapsedMs
+  )
+}
+
 function Get-DirectoryOwnerSid([string]$Path) {
   $acl = Get-Acl -LiteralPath $Path
   return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
@@ -60,6 +107,9 @@ try {
   if (-not $IsWindows -or [Environment]::Is64BitProcess -ne $true) {
     throw 'The Windows identity harness requires 64-bit PowerShell on Windows.'
   }
+  Write-Output ("WINDOWS_HARNESS_RUNTIME=PowerShell/{0} {1}" -f
+    $PSVersionTable.PSVersion.ToString(),
+    [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription)
 
   $nativeHelperPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'windows-harness-native.cs'))
   $smokeInfo = [Diagnostics.ProcessStartInfo]::new([IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe')))
@@ -479,6 +529,8 @@ try {
   )
   $descendantWatch.Stop()
   Assert-HarnessResultSchema $descendantResult 'Descendant-held-pipe control'
+  $descendantAckExists = Test-Path -LiteralPath $environment['REVO_DESCENDANT_ACK'] -PathType Leaf
+  Write-Output (Format-DescendantHarnessDiagnostic $descendantResult $descendantAckExists $descendantWatch.ElapsedMilliseconds)
   if ($descendantResult.FailureCode -ne 'DESCENDANTS_REMAINED' -or
       $descendantResult.CleanupFailureCode -or
       -not $descendantResult.ExitObserved -or
