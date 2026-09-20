@@ -47,10 +47,12 @@ public static class WindowsHarnessNative
     private const string MediumIntegritySid = "S-1-16-8192";
     private const int TokenElevationTypeDefault = 1;
     private const int MaxCapturedCharacters = 262144;
+    private const int ProfilePathBufferChars = 260;
 
     public static string CreateUserProfile(string sid, string userName)
     {
-        var path = new StringBuilder(32768);
+        // Compatibility bound for the short disposable profile path used by this CI harness.
+        var path = new StringBuilder(ProfilePathBufferChars);
         var result = CreateProfile(sid, userName, path, (uint)path.Capacity);
         if (result != 0)
         {
