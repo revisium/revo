@@ -197,9 +197,53 @@ try {
 
   [WindowsHarnessNative]::SetReadOnlyDirectorySecurity($fixtureRoot, $accountSid)
   [WindowsHarnessNative]::SetReadOnlyDirectorySecurity($bootstrap, $accountSid)
+
+  $restorePrivilegeInitialState = [WindowsHarnessNative]::IsRestorePrivilegeEnabled()
+  $missingSecurityPath = Join-Path $fixtureRoot "missing-security-control-$suffix"
+  $aclApplyFailureObserved = $false
+  try {
+    [WindowsHarnessNative]::SetDirectorySecurity($missingSecurityPath, $accountSid, 'FullControl')
+  } catch {
+    $failureText = $_.Exception.ToString()
+    $aclApplyFailureObserved = $failureText.Contains('DIRECTORY_ACL_APPLY_FAILED', [StringComparison]::Ordinal) -and
+      -not $failureText.Contains('SE_RESTORE_PRIVILEGE_RESTORE_FAILED', [StringComparison]::Ordinal)
+  }
+  if (-not $aclApplyFailureObserved) {
+    throw 'SeRestorePrivilege failure control did not fail specifically during ACL application.'
+  }
+  if ([WindowsHarnessNative]::IsRestorePrivilegeEnabled() -ne $restorePrivilegeInitialState) {
+    throw 'SeRestorePrivilege state was not restored after controlled ACL-application failure.'
+  }
+  Write-Output 'SE_RESTORE_PRIVILEGE_FAILURE_RESTORE_PROBE=PASS'
+
+  $expectedOwnerSids = @($accountSid, 'S-1-5-18', 'S-1-5-32-544')
+  $expectedInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+    [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
   foreach ($directory in @($workspace, $tempDirectory, $pnpmStore, $pnpmHome, $npmCache)) {
     [WindowsHarnessNative]::SetDirectorySecurity($directory, $accountSid, 'FullControl')
+    $acl = Get-Acl -LiteralPath $directory
+    $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($ownerSid -cne $accountSid -or -not $acl.AreAccessRulesProtected -or $acl.Access.Count -ne $expectedOwnerSids.Count) {
+      throw 'User-owned fixture directory security descriptor readback failed.'
+    }
+    foreach ($expectedSid in $expectedOwnerSids) {
+      $matchingRules = @($acl.Access | Where-Object {
+        $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ceq $expectedSid
+      })
+      if ($matchingRules.Count -ne 1 -or
+          $matchingRules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+          $matchingRules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+          $matchingRules[0].InheritanceFlags -ne $expectedInheritance -or
+          $matchingRules[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None -or
+          $matchingRules[0].IsInherited) {
+        throw 'User-owned fixture directory ACE readback failed.'
+      }
+    }
+    if ([WindowsHarnessNative]::IsRestorePrivilegeEnabled() -ne $restorePrivilegeInitialState) {
+      throw 'SeRestorePrivilege state changed after fixture directory security setup.'
+    }
   }
+  Write-Output 'USER_DIRECTORY_SECURITY_READBACK=PASS'
 
   $runnerReport = [WindowsHarnessNative]::InspectProcess($PID)
   $runnerFailure = [WindowsHarnessNative]::ValidateStandardUser($runnerReport, $runnerReport.Sid)

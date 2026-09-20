@@ -34,8 +34,10 @@ public sealed class WindowsHarnessRunResult
 public static class WindowsHarnessNative
 {
     private const uint TokenQuery = 0x0008;
+    private const uint TokenAdjustPrivileges = 0x0020;
     private const int TokenUserClass = 1;
     private const int TokenGroupsClass = 2;
+    private const int TokenPrivilegesClass = 3;
     private const int TokenElevationTypeClass = 18;
     private const int TokenElevationClass = 20;
     private const int TokenIntegrityLevelClass = 25;
@@ -48,6 +50,9 @@ public static class WindowsHarnessNative
     private const int TokenElevationTypeDefault = 1;
     private const int MaxCapturedCharacters = 262144;
     private const int ProfilePathBufferChars = 260;
+    private const uint SePrivilegeEnabled = 0x00000002;
+    private const int ErrorNotAllAssigned = 1300;
+    private const string SeRestorePrivilege = "SeRestorePrivilege";
 
     public static string CreateUserProfile(string sid, string userName)
     {
@@ -89,7 +94,33 @@ public static class WindowsHarnessNative
         AddRule(security, ownerSid, userRights);
         AddRule(security, SystemSid, "FullControl");
         AddRule(security, AdministratorsSid, "FullControl");
-        new DirectoryInfo(path).SetAccessControl(security);
+        SetDirectorySecurityWithRestorePrivilege(path, security);
+    }
+
+    public static bool IsRestorePrivilegeEnabled()
+    {
+        IntPtr token = IntPtr.Zero;
+        if (!OpenProcessToken(GetCurrentProcess(), TokenQuery, out token))
+        {
+            throw new InvalidOperationException("TOKEN_QUERY_FAILED");
+        }
+
+        try
+        {
+            Luid restorePrivilege;
+            if (!LookupPrivilegeValue(null, SeRestorePrivilege, out restorePrivilege))
+            {
+                throw new InvalidOperationException("SE_RESTORE_PRIVILEGE_LOOKUP_FAILED");
+            }
+            return IsPrivilegeEnabled(token, restorePrivilege);
+        }
+        finally
+        {
+            if (!CloseHandle(token))
+            {
+                throw new InvalidOperationException("TOKEN_HANDLE_CLOSE_FAILED");
+            }
+        }
     }
 
     public static void SetReadOnlyDirectorySecurity(string path, string userSid)
@@ -312,6 +343,133 @@ public static class WindowsHarnessNative
             AccessControlType.Allow));
     }
 
+    private static void SetDirectorySecurityWithRestorePrivilege(string path, DirectorySecurity security)
+    {
+        IntPtr token = IntPtr.Zero;
+        var restoreStateCaptured = false;
+        TokenPrivilegesOne previousState = new TokenPrivilegesOne();
+        string operationFailureCode = null;
+        Exception operationFailure = null;
+        Exception restoreFailure = null;
+        Exception closeFailure = null;
+
+        try
+        {
+            if (!OpenProcessToken(GetCurrentProcess(), TokenQuery | TokenAdjustPrivileges, out token))
+            {
+                operationFailureCode = "TOKEN_ADJUST_PRIVILEGES_OPEN_FAILED";
+                throw new InvalidOperationException(operationFailureCode);
+            }
+
+            Luid restorePrivilege;
+            if (!LookupPrivilegeValue(null, SeRestorePrivilege, out restorePrivilege))
+            {
+                operationFailureCode = "SE_RESTORE_PRIVILEGE_LOOKUP_FAILED";
+                throw new InvalidOperationException(operationFailureCode);
+            }
+
+            if (!IsPrivilegeEnabled(token, restorePrivilege))
+            {
+                var requestedState = new TokenPrivilegesOne
+                {
+                    PrivilegeCount = 1,
+                    Privileges = new LuidAndAttributes
+                    {
+                        Luid = restorePrivilege,
+                        Attributes = SePrivilegeEnabled,
+                    },
+                };
+                var privilegeBufferSize = checked((uint)Marshal.SizeOf(typeof(TokenPrivilegesOne)));
+                TokenPrivilegesOne returnedPreviousState;
+                uint returnLength;
+                var adjusted = AdjustTokenPrivileges(
+                    token,
+                    false,
+                    ref requestedState,
+                    privilegeBufferSize,
+                    out returnedPreviousState,
+                    out returnLength);
+                var adjustError = Marshal.GetLastWin32Error();
+                if (returnedPreviousState.PrivilegeCount == 1)
+                {
+                    previousState = returnedPreviousState;
+                    restoreStateCaptured = true;
+                }
+
+                if (!adjusted || adjustError == ErrorNotAllAssigned)
+                {
+                    operationFailureCode = "SE_RESTORE_PRIVILEGE_ENABLE_FAILED";
+                    throw new InvalidOperationException(operationFailureCode);
+                }
+                if (!restoreStateCaptured || returnLength < privilegeBufferSize)
+                {
+                    operationFailureCode = "SE_RESTORE_PRIVILEGE_PREVIOUS_STATE_INVALID";
+                    throw new InvalidOperationException(operationFailureCode);
+                }
+            }
+
+            try
+            {
+                new DirectoryInfo(path).SetAccessControl(security);
+            }
+            catch (Exception exception)
+            {
+                operationFailureCode = "DIRECTORY_ACL_APPLY_FAILED";
+                operationFailure = exception;
+            }
+        }
+        catch (Exception exception)
+        {
+            if (operationFailure == null)
+            {
+                if (operationFailureCode == null) operationFailureCode = "DIRECTORY_ACL_SETUP_FAILED";
+                operationFailure = exception;
+            }
+        }
+        finally
+        {
+            if (restoreStateCaptured)
+            {
+                try
+                {
+                    TokenPrivilegesOne ignoredPreviousState;
+                    uint ignoredReturnLength;
+                    var restored = AdjustTokenPrivileges(
+                        token,
+                        false,
+                        ref previousState,
+                        checked((uint)Marshal.SizeOf(typeof(TokenPrivilegesOne))),
+                        out ignoredPreviousState,
+                        out ignoredReturnLength);
+                    var restoreError = Marshal.GetLastWin32Error();
+                    if (!restored || restoreError == ErrorNotAllAssigned)
+                    {
+                        restoreFailure = new InvalidOperationException("SE_RESTORE_PRIVILEGE_RESTORE_FAILED");
+                    }
+                }
+                catch (Exception exception)
+                {
+                    restoreFailure = new InvalidOperationException("SE_RESTORE_PRIVILEGE_RESTORE_FAILED", exception);
+                }
+            }
+
+            if (token != IntPtr.Zero && !CloseHandle(token))
+            {
+                closeFailure = new InvalidOperationException("TOKEN_HANDLE_CLOSE_FAILED");
+            }
+        }
+
+        var failures = new List<Exception>();
+        if (operationFailure != null)
+        {
+            failures.Add(new InvalidOperationException(operationFailureCode, operationFailure));
+        }
+        if (restoreFailure != null) failures.Add(restoreFailure);
+        if (closeFailure != null) failures.Add(closeFailure);
+        if (failures.Count == 1) throw failures[0];
+        if (failures.Count > 1) throw new AggregateException("DIRECTORY_SECURITY_OPERATION_FAILED", failures);
+    }
+
     private static WindowsHarnessTokenReport InspectHandle(IntPtr processHandle)
     {
         IntPtr token = IntPtr.Zero;
@@ -397,6 +555,31 @@ public static class WindowsHarnessNative
             throw new InvalidOperationException("GetTokenInformation failed: " + error);
         }
         return buffer;
+    }
+
+    private static bool IsPrivilegeEnabled(IntPtr token, Luid expectedPrivilege)
+    {
+        var buffer = GetTokenInformationBuffer(token, TokenPrivilegesClass);
+        try
+        {
+            var count = unchecked((uint)Marshal.ReadInt32(buffer));
+            var entrySize = Marshal.SizeOf(typeof(LuidAndAttributes));
+            for (uint index = 0; index < count; index++)
+            {
+                var entryPointer = IntPtr.Add(buffer, checked(sizeof(uint) + (int)index * entrySize));
+                var entry = (LuidAndAttributes)Marshal.PtrToStructure(entryPointer, typeof(LuidAndAttributes));
+                if (entry.Luid.LowPart == expectedPrivilege.LowPart &&
+                    entry.Luid.HighPart == expectedPrivilege.HighPart)
+                {
+                    return (entry.Attributes & SePrivilegeEnabled) != 0;
+                }
+            }
+            return false;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     private static string GetProfilePath(IntPtr token)
@@ -493,6 +676,27 @@ public static class WindowsHarnessNative
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct Luid
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LuidAndAttributes
+    {
+        public Luid Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenPrivilegesOne
+    {
+        public uint PrivilegeCount;
+        public LuidAndAttributes Privileges;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct JobObjectExtendedLimitInformation
     {
         public JobObjectBasicLimitInformation BasicLimitInformation;
@@ -519,6 +723,9 @@ public static class WindowsHarnessNative
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string name);
 
+    [DllImport("kernel32.dll", SetLastError = false)]
+    private static extern IntPtr GetCurrentProcess();
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetInformationJobObject(IntPtr job, int informationClass, IntPtr information, uint length);
@@ -542,6 +749,20 @@ public static class WindowsHarnessNative
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool OpenProcessToken(IntPtr process, uint desiredAccess, out IntPtr token);
+
+    [DllImport("advapi32.dll", EntryPoint = "LookupPrivilegeValueW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LookupPrivilegeValue(string systemName, string name, out Luid luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AdjustTokenPrivileges(
+        IntPtr token,
+        [MarshalAs(UnmanagedType.Bool)] bool disableAllPrivileges,
+        ref TokenPrivilegesOne newState,
+        uint bufferLength,
+        out TokenPrivilegesOne previousState,
+        out uint returnLength);
 
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
