@@ -59,6 +59,16 @@ function ConvertTo-HarnessDiagnosticBoolean($Value) {
   return ([bool]$Value).ToString().ToLowerInvariant()
 }
 
+function ConvertTo-HarnessDiagnosticInt32($Value) {
+  if ($null -eq $Value) {
+    return 'none'
+  }
+  if ($Value -isnot [int]) {
+    return 'unknown'
+  }
+  return ([int]$Value).ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Format-DescendantHarnessDiagnostic($Result, [bool]$AckExists, [long]$ElapsedMs) {
   $failureCodes = @(
     'DESCENDANTS_REMAINED', 'EARLY_EXIT', 'EXECUTION_TIMEOUT', 'GO_WRITE_FAILED',
@@ -74,11 +84,41 @@ function Format-DescendantHarnessDiagnostic($Result, [bool]$AckExists, [long]$El
   )
   $stdout = [string]$Result.StandardOutput
   $stderr = [string]$Result.StandardError
+  $startOrigin = 'none'
+  $startKind = 'none'
+  $startHResult = 'none'
+  $startNativeCode = 'none'
+  if ($Result.FailureCode -ceq 'PROCESS_START_FAILED') {
+    $startOrigin = ConvertTo-HarnessDiagnosticCode $Result.StartFailureOrigin @('exception', 'returned-false')
+    if ($startOrigin -ceq 'exception') {
+      $startKind = ConvertTo-HarnessDiagnosticCode $Result.StartExceptionKind @(
+        'argument', 'invalid-operation', 'not-supported', 'other',
+        'security', 'unauthorized-access', 'win32'
+      )
+      if ($startKind -ceq 'none') {
+        $startKind = 'unknown'
+      }
+      $startHResult = ConvertTo-HarnessDiagnosticInt32 $Result.StartHResult
+      if ($startKind -ceq 'win32') {
+        $startNativeCode = ConvertTo-HarnessDiagnosticInt32 $Result.StartNativeErrorCode
+      } elseif ($null -ne $Result.StartNativeErrorCode) {
+        $startNativeCode = 'unknown'
+      }
+    } elseif ($startOrigin -ceq 'unknown') {
+      $startKind = 'unknown'
+      $startHResult = 'unknown'
+      $startNativeCode = 'unknown'
+    }
+  }
   return [string]::Format(
     [Globalization.CultureInfo]::InvariantCulture,
-    'control=descendant failure={0} cleanupFailure={1} exitObserved={2} exitCode={3} timedOut={4} goAttempted={5} goSent={6} cleanupConfirmed={7} stdoutMarker={8} stderrMarker={9} ackExists={10} elapsedMs={11}',
+    'control=descendant failure={0} cleanupFailure={1} startOrigin={2} startKind={3} startHResult={4} startNativeCode={5} exitObserved={6} exitCode={7} timedOut={8} goAttempted={9} goSent={10} cleanupConfirmed={11} stdoutMarker={12} stderrMarker={13} ackExists={14} elapsedMs={15}',
     (ConvertTo-HarnessDiagnosticCode $Result.FailureCode $failureCodes),
     (ConvertTo-HarnessDiagnosticCode $Result.CleanupFailureCode $cleanupCodes),
+    $startOrigin,
+    $startKind,
+    $startHResult,
+    $startNativeCode,
     (ConvertTo-HarnessDiagnosticBoolean $Result.ExitObserved),
     [int]$Result.ExitCode,
     (ConvertTo-HarnessDiagnosticBoolean $Result.TimedOut),

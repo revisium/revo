@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -33,6 +34,10 @@ public sealed class WindowsHarnessRunResult
     public bool GoSent { get; set; }
     public string StandardOutput { get; set; }
     public string StandardError { get; set; }
+    public string StartFailureOrigin { get; set; }
+    public string StartExceptionKind { get; set; }
+    public int? StartHResult { get; set; }
+    public int? StartNativeErrorCode { get; set; }
     public WindowsHarnessTokenReport Token { get; set; }
 }
 
@@ -58,6 +63,36 @@ public static class WindowsHarnessNative
     private const uint SePrivilegeEnabled = 0x00000002;
     private const int ErrorNotAllAssigned = 1300;
     private const string SeRestorePrivilege = "SeRestorePrivilege";
+
+    public static string ClassifyStartException(Exception exception)
+    {
+        if (exception is Win32Exception) return "win32";
+        if (exception is ArgumentException) return "argument";
+        if (exception is InvalidOperationException) return "invalid-operation";
+        if (exception is PlatformNotSupportedException || exception is NotSupportedException)
+            return "not-supported";
+        if (exception is UnauthorizedAccessException) return "unauthorized-access";
+        if (exception is System.Security.SecurityException) return "security";
+        return "other";
+    }
+
+    private static void RecordStartReturnedFalse(WindowsHarnessRunResult result)
+    {
+        result.FailureCode = "PROCESS_START_FAILED";
+        result.StartFailureOrigin = "returned-false";
+    }
+
+    private static void RecordStartException(WindowsHarnessRunResult result, Exception exception)
+    {
+        result.FailureCode = "PROCESS_START_FAILED";
+        result.StartFailureOrigin = "exception";
+        result.StartExceptionKind = ClassifyStartException(exception);
+        result.StartHResult = exception.HResult;
+        if (exception is Win32Exception win32Exception)
+        {
+            result.StartNativeErrorCode = win32Exception.NativeErrorCode;
+        }
+    }
 
     public static string CreateUserProfile(string sid, string userName)
     {
@@ -309,12 +344,12 @@ public static class WindowsHarnessNative
                     processStarted = process.Start();
                     if (!processStarted)
                     {
-                        result.FailureCode = "PROCESS_START_FAILED";
+                        RecordStartReturnedFalse(result);
                     }
                 }
-                catch (Exception)
+                catch (Exception exception)
                 {
-                    result.FailureCode = "PROCESS_START_FAILED";
+                    RecordStartException(result, exception);
                 }
 
                 if (processStarted)
