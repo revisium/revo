@@ -206,7 +206,12 @@ function New-FixtureProcessScanResult(
   [bool]$SidPresent = $false,
   [string]$SidKind = 'none',
   [string]$Category = 'none',
-  [string]$HResult = 'none'
+  [string]$HResult = 'none',
+  [bool]$ProcessIdPresent = $false,
+  [string]$ProcessId = 'none',
+  [bool]$IsHarnessProcess = $false,
+  [bool]$CreationTimePresent = $false,
+  [string]$CreationTime = 'none'
 ) {
   return [pscustomobject]@{
     State = $State
@@ -221,6 +226,55 @@ function New-FixtureProcessScanResult(
     SidKind = $SidKind
     Category = $Category
     HResult = $HResult
+    ProcessIdPresent = $ProcessIdPresent
+    ProcessId = $ProcessId
+    IsHarnessProcess = $IsHarnessProcess
+    CreationTimePresent = $CreationTimePresent
+    CreationTime = $CreationTime
+  }
+}
+
+function Get-FixtureProcessIdentityEvidence($Process) {
+  $processIdPresent = $false
+  $processId = 'none'
+  $isHarnessProcess = $false
+  $creationTimePresent = $false
+  $creationTime = 'none'
+  try {
+    $property = $Process.PSObject.Properties['ProcessId']
+    if ($null -ne $property -and ($property.Value -is [uint32] -or $property.Value -is [int32] -or $property.Value -is [int64])) {
+      $value = [long]$property.Value
+      if ($value -ge 0 -and $value -le [uint32]::MaxValue) {
+        $processIdPresent = $true
+        $processId = $value.ToString([Globalization.CultureInfo]::InvariantCulture)
+        $isHarnessProcess = $value -eq [long]$PID
+      }
+    }
+  } catch {}
+  try {
+    $property = $Process.PSObject.Properties['CreationDate']
+    if ($null -ne $property -and $property.Value -is [DateTime]) {
+      $creationTime = $property.Value.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+      $creationTimePresent = $true
+    } elseif ($null -ne $property -and $property.Value -is [string]) {
+      $parsed = [DateTime]::MinValue
+      if ([DateTime]::TryParse(
+          $property.Value,
+          [Globalization.CultureInfo]::InvariantCulture,
+          [Globalization.DateTimeStyles]::AssumeUniversal,
+          [ref]$parsed
+        )) {
+        $creationTime = $parsed.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        $creationTimePresent = $true
+      }
+    }
+  } catch {}
+  return [pscustomobject]@{
+    ProcessIdPresent = $processIdPresent
+    ProcessId = $processId
+    IsHarnessProcess = $isHarnessProcess
+    CreationTimePresent = $creationTimePresent
+    CreationTime = $creationTime
   }
 }
 
@@ -274,6 +328,7 @@ function Get-FixtureProcessScanResult([string]$ExpectedSid) {
         return New-FixtureProcessScanResult 'unknown' 'PROCESS_ENTRY_INVALID' 'process-entry' $examinedCount 0
       }
       $examinedCount++
+      $processIdentity = Get-FixtureProcessIdentityEvidence $process
       $phase = 'owner-method'
       try {
         $ownerResults = @(Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop)
@@ -303,7 +358,13 @@ function Get-FixtureProcessScanResult([string]$ExpectedSid) {
       }
       $safeReturnValue = $returnValue.ToString([Globalization.CultureInfo]::InvariantCulture)
       if ($returnValue -ne 0) {
-        return New-FixtureProcessScanResult 'unknown' 'METHOD_NONZERO' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $sidPresent
+        return New-FixtureProcessScanResult `
+          'unknown' 'METHOD_NONZERO' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $sidPresent `
+          -ProcessIdPresent $processIdentity.ProcessIdPresent `
+          -ProcessId $processIdentity.ProcessId `
+          -IsHarnessProcess $processIdentity.IsHarnessProcess `
+          -CreationTimePresent $processIdentity.CreationTimePresent `
+          -CreationTime $processIdentity.CreationTime
       }
       if (-not $sidPresent) {
         return New-FixtureProcessScanResult 'unknown' 'SID_MISSING' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $false
@@ -331,6 +392,662 @@ function Get-FixtureProcessScanResult([string]$ExpectedSid) {
   } catch {
     $metadata = Get-FixtureSafeErrorMetadata $_
     return New-FixtureProcessScanResult 'unknown' 'SCAN_EXCEPTION' $phase $examinedCount $resultCount $false 'none' 'none' $false 'none' $metadata.Category $metadata.HResult
+  }
+}
+
+function Get-FixtureOwnerDiagnostic(
+  [object]$OwnerScan,
+  [string]$ExpectedSid,
+  [int]$BudgetSeconds = 15,
+  [scriptblock]$ProcessQuery,
+  [scriptblock]$OwnerQuery
+) {
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  $selfQuery = 'unknown'
+  $selfSidMatchesToken = $false
+  $processIdentity = 'unknown'
+  $processOwnerReturn = 'none'
+  $processOwnerSidMatchesFixture = 'unknown'
+  $processAfterOwnerIdentity = 'unknown'
+  $targetProcessId = 'none'
+  if ($null -ne $OwnerScan -and $OwnerScan.ProcessIdPresent -and $OwnerScan.ProcessId -match '^\d+$') {
+    $targetProcessId = $OwnerScan.ProcessId
+  }
+
+  $invokeProcessQuery = if ($null -ne $ProcessQuery) {
+    $ProcessQuery
+  } else {
+    { param([string]$Id) @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $Id" -OperationTimeoutSec 3 -ErrorAction Stop) }.GetNewClosure()
+  }
+  $invokeOwnerQuery = if ($null -ne $OwnerQuery) {
+    $OwnerQuery
+  } else {
+    { param($Process) @(Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -OperationTimeoutSec 3 -ErrorAction Stop) }.GetNewClosure()
+  }
+
+  try {
+    if ($watch.Elapsed.TotalSeconds -lt $BudgetSeconds) {
+      $selfRows = @(& $invokeProcessQuery ([string]$PID))
+      if ($selfRows.Count -eq 1 -and $null -ne $selfRows[0]) {
+        $selfOwnerRows = @(& $invokeOwnerQuery $selfRows[0])
+        if ($selfOwnerRows.Count -eq 1 -and $null -ne $selfOwnerRows[0]) {
+          $returnProperty = $selfOwnerRows[0].PSObject.Properties['ReturnValue']
+          $sidProperty = $selfOwnerRows[0].PSObject.Properties['Sid']
+          if ($null -ne $returnProperty -and $returnProperty.Value -is [uint32] -and
+              $returnProperty.Value -eq 0 -and $null -ne $sidProperty -and $sidProperty.Value -is [string]) {
+            $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $selfSidMatchesToken = [string]::Equals($sidProperty.Value, $currentSid, [StringComparison]::Ordinal)
+            $selfQuery = if ($selfSidMatchesToken) { 'match' } else { 'mismatch' }
+          } elseif ($null -ne $returnProperty -and ($returnProperty.Value -is [uint32] -or $returnProperty.Value -is [int32])) {
+            $selfQuery = 'nonzero'
+          }
+        }
+      }
+    }
+
+    if ($targetProcessId -ne 'none' -and $OwnerScan.CreationTimePresent -and
+        $watch.Elapsed.TotalSeconds -lt $BudgetSeconds) {
+      $beforeRows = @(& $invokeProcessQuery $targetProcessId)
+      if ($beforeRows.Count -eq 0) {
+        $processIdentity = 'gone'
+      } elseif ($beforeRows.Count -eq 1 -and $null -ne $beforeRows[0]) {
+        $beforeEvidence = Get-FixtureProcessIdentityEvidence $beforeRows[0]
+        if (-not $beforeEvidence.CreationTimePresent) {
+          $processIdentity = 'unknown'
+        } elseif (-not [string]::Equals($beforeEvidence.CreationTime, $OwnerScan.CreationTime, [StringComparison]::Ordinal)) {
+          $processIdentity = 'changed'
+        } elseif ($watch.Elapsed.TotalSeconds -ge $BudgetSeconds) {
+          $processIdentity = 'unknown'
+        } else {
+          $processIdentity = 'same'
+          $ownerRows = @(& $invokeOwnerQuery $beforeRows[0])
+          if ($ownerRows.Count -eq 1 -and $null -ne $ownerRows[0]) {
+            $returnProperty = $ownerRows[0].PSObject.Properties['ReturnValue']
+            $sidProperty = $ownerRows[0].PSObject.Properties['Sid']
+            if ($null -ne $returnProperty -and ($returnProperty.Value -is [uint32] -or $returnProperty.Value -is [int32])) {
+              $processOwnerReturn = $returnProperty.Value.ToString([Globalization.CultureInfo]::InvariantCulture)
+              if ($returnProperty.Value -eq 0 -and $null -ne $sidProperty -and $sidProperty.Value -is [string]) {
+                $processOwnerSidMatchesFixture = [string]::Equals($sidProperty.Value, $ExpectedSid, [StringComparison]::Ordinal).ToString().ToLowerInvariant()
+              } else {
+                $processOwnerSidMatchesFixture = 'unknown'
+              }
+            }
+          }
+          if ($watch.Elapsed.TotalSeconds -lt $BudgetSeconds) {
+            $afterRows = @(& $invokeProcessQuery $targetProcessId)
+            if ($afterRows.Count -eq 0) {
+              $processAfterOwnerIdentity = 'gone'
+            } elseif ($afterRows.Count -eq 1 -and $null -ne $afterRows[0]) {
+              $afterEvidence = Get-FixtureProcessIdentityEvidence $afterRows[0]
+              if (-not $afterEvidence.CreationTimePresent) {
+                $processAfterOwnerIdentity = 'unknown'
+              } elseif ([string]::Equals($afterEvidence.CreationTime, $OwnerScan.CreationTime, [StringComparison]::Ordinal)) {
+                $processAfterOwnerIdentity = 'same'
+              } else {
+                $processAfterOwnerIdentity = 'changed'
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    if ($processIdentity -eq 'unknown') { $processIdentity = 'unknown' }
+    if ($selfQuery -eq 'unknown') { $selfQuery = 'unknown' }
+  }
+
+  return [pscustomobject]@{
+    ProcessIdPresent = $targetProcessId -ne 'none'
+    ProcessId = $targetProcessId
+    IsHarnessProcess = $null -ne $OwnerScan -and [bool]$OwnerScan.IsHarnessProcess
+    CreationTimePresent = $null -ne $OwnerScan -and [bool]$OwnerScan.CreationTimePresent
+    ProcessIdentity = $processIdentity
+    ProcessAfterOwnerIdentity = $processAfterOwnerIdentity
+    SelfQuery = $selfQuery
+    SelfSidMatchesToken = $selfSidMatchesToken
+    ProcessOwnerReturn = $processOwnerReturn
+    ProcessOwnerSidMatchesFixture = $processOwnerSidMatchesFixture
+    ElapsedMilliseconds = $watch.ElapsedMilliseconds
+  }
+}
+
+function Copy-FixtureEnvironment([System.Collections.IDictionary]$Environment) {
+  if ($null -eq $Environment) { throw 'ENVIRONMENT_INVALID' }
+  $copy = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+  foreach ($entry in $Environment.GetEnumerator()) {
+    if ($null -eq $entry.Key -or $null -eq $entry.Value) { throw 'ENVIRONMENT_INVALID' }
+    $copy[[string]$entry.Key] = [string]$entry.Value
+  }
+  return ,$copy
+}
+
+function Test-FixtureEnvironmentEqual(
+  [System.Collections.IDictionary]$Left,
+  [System.Collections.IDictionary]$Right
+) {
+  if ($null -eq $Left -or $null -eq $Right -or $Left.Count -ne $Right.Count) { return $false }
+  foreach ($key in $Left.Keys) {
+    if (-not $Right.ContainsKey([string]$key) -or
+        -not [string]::Equals([string]$Left[$key], [string]$Right[[string]$key], [StringComparison]::Ordinal)) {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Get-FixtureEnvironmentDelta(
+  [System.Collections.IDictionary]$Baseline,
+  [System.Collections.IDictionary]$Candidate,
+  [bool]$AllowPathExtOnly
+) {
+  if (Test-FixtureEnvironmentEqual $Baseline $Candidate) { return 'none' }
+  if (-not $AllowPathExtOnly -or $Baseline.ContainsKey('PATHEXT') -or
+      -not $Candidate.ContainsKey('PATHEXT') -or
+      -not [string]::Equals([string]$Candidate['PATHEXT'], '.EXE', [StringComparison]::OrdinalIgnoreCase) -or
+      $Candidate.Count -ne ($Baseline.Count + 1)) {
+    return 'invalid'
+  }
+  foreach ($key in $Baseline.Keys) {
+    if (-not $Candidate.ContainsKey([string]$key) -or
+        -not [string]::Equals([string]$Baseline[$key], [string]$Candidate[[string]$key], [StringComparison]::Ordinal)) {
+      return 'invalid'
+    }
+  }
+  return 'pathext-only'
+}
+
+function ConvertFrom-WindowsNodeDiagnosticReceipt(
+  [object]$RunResult,
+  [string]$ExpectedMode,
+  [string]$ExpectedCase
+) {
+  $invalid = [pscustomobject]@{ Valid = $false; Receipt = $null; Reason = 'invalid' }
+  try {
+    if ($null -eq $RunResult -or
+        $null -eq $RunResult.PSObject.Properties['StandardOutput'] -or
+        $RunResult.StandardOutput -isnot [string] -or
+        $RunResult.StandardOutput.Length -gt 8192 -or
+        $null -eq $RunResult.PSObject.Properties['StandardError'] -or
+        $RunResult.StandardError -isnot [string] -or
+        $RunResult.StandardError.Length -ne 0 -or
+        $null -eq $RunResult.PSObject.Properties['ExitCode'] -or
+        $RunResult.ExitCode -isnot [int]) {
+      return $invalid
+    }
+  $allowedKeys = @(
+    'schemaVersion', 'mode', 'measurement', 'exceptionKind', 'identityMatch', 'profileMatch', 'cwdMatch', 'executableMatch',
+    'powershellVersion', 'runtimeVersion', 'pathextPresent', 'pathextHasExe', 'pathextHasCmd', 'pathextExactExe',
+    'argumentPassing', 'nativeErrorPreference', 'lastExitBeforePresent', 'lastExitBeforeType', 'lastExitBeforeCode',
+    'invokeSucceeded', 'outputCount', 'runtimeMatch', 'lastExitAfterPresent', 'lastExitAfterType', 'lastExitAfterCode',
+    'stderrBytes', 'stderrReadSucceeded', 'stderrTruncated', 'stderrCleanupConfirmed',
+    'directStarted', 'directExitObserved', 'directExitCode', 'directStdoutBytes', 'directStderrBytes',
+    'directStdoutEof', 'directStderrEof', 'directCleanupConfirmed', 'directFailure'
+  )
+  $lines = @(([string]$RunResult.StandardOutput -split "`r?`n") | Where-Object { $_ -ne '' })
+  $receiptLines = @($lines | Where-Object { $_.StartsWith('WINDOWS_NODE_DIAGNOSTIC_RECEIPT=', [StringComparison]::Ordinal) })
+  $otherLines = @($lines | Where-Object {
+      $_ -cne 'RVW_NODE_DIAGNOSTIC_READY' -and
+        -not $_.StartsWith('WINDOWS_NODE_DIAGNOSTIC_RECEIPT=', [StringComparison]::Ordinal)
+    })
+  if ($receiptLines.Count -ne 1 -or $otherLines.Count -ne 0) { return $invalid }
+  $json = $receiptLines[0].Substring('WINDOWS_NODE_DIAGNOSTIC_RECEIPT='.Length)
+  if ($json.Length -gt 7900) { return $invalid }
+  $jsonDocument = [System.Text.Json.JsonDocument]::Parse($json)
+  try {
+    if ($jsonDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $invalid }
+    $jsonPropertyNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($property in $jsonDocument.RootElement.EnumerateObject()) {
+      if (-not $jsonPropertyNames.Add($property.Name)) { return $invalid }
+    }
+  } finally {
+    $jsonDocument.Dispose()
+  }
+  $receipt = ConvertFrom-Json -InputObject $json -AsHashtable -ErrorAction Stop
+  if ($null -eq $receipt -or $receipt -isnot [System.Collections.IDictionary] -or
+      $receipt.Count -ne $allowedKeys.Count -or
+      @($receipt.Keys | Where-Object { $_ -notin $allowedKeys }).Count -ne 0) {
+    return $invalid
+  }
+  foreach ($name in $allowedKeys) {
+    if (@($receipt.Keys | Where-Object { [string]::Equals([string]$_, $name, [StringComparison]::Ordinal) }).Count -ne 1) {
+      return $invalid
+    }
+  }
+  if (($receipt.schemaVersion -isnot [int] -and $receipt.schemaVersion -isnot [long]) -or $receipt.schemaVersion -ne 1 -or
+      $receipt.mode -cne $ExpectedMode -or $receipt.measurement -notin @('match', 'mismatch', 'exception') -or
+      $receipt.exceptionKind -notin @('none', 'command-not-found', 'native-command', 'access-denied', 'io', 'invalid-operation', 'other') -or
+      $receipt.argumentPassing -notin @('Legacy', 'Standard', 'Windows', 'unknown') -or
+      $receipt.nativeErrorPreference -notin @('true', 'false', 'unknown') -or
+      $receipt.lastExitBeforeType -notin @('none', 'int32', 'other') -or
+      $receipt.lastExitAfterType -notin @('none', 'int32', 'other')) {
+    return $invalid
+  }
+  $booleanNames = @(
+    'identityMatch', 'profileMatch', 'cwdMatch', 'executableMatch', 'pathextPresent', 'pathextHasExe', 'pathextHasCmd',
+    'pathextExactExe', 'lastExitBeforePresent', 'invokeSucceeded', 'runtimeMatch', 'lastExitAfterPresent',
+    'stderrReadSucceeded', 'stderrTruncated', 'stderrCleanupConfirmed', 'directStarted', 'directExitObserved',
+    'directStdoutEof', 'directStderrEof', 'directCleanupConfirmed'
+  )
+  foreach ($name in $booleanNames) {
+    if ($receipt[$name] -isnot [bool]) { return $invalid }
+  }
+  foreach ($name in @('outputCount', 'stderrBytes', 'directStdoutBytes', 'directStderrBytes')) {
+    if ($receipt[$name] -isnot [int] -and $receipt[$name] -isnot [long]) { return $invalid }
+    if ($receipt[$name] -lt 0) { return $invalid }
+  }
+  foreach ($name in @('powershellVersion', 'runtimeVersion', 'lastExitBeforeCode', 'lastExitAfterCode', 'directExitCode', 'directFailure')) {
+    if ($receipt[$name] -isnot [string] -or $receipt[$name].Length -gt 64 -or
+        $receipt[$name].Contains("`r") -or $receipt[$name].Contains("`n")) { return $invalid }
+  }
+  if ($receipt.powershellVersion -notmatch '^\d+(?:\.\d+){1,3}$' -or
+      $receipt.runtimeVersion -notmatch '^\d+(?:\.\d+){1,3}$' -or
+      -not (Test-WindowsNodeExitEvidence $receipt.lastExitBeforePresent $receipt.lastExitBeforeType $receipt.lastExitBeforeCode) -or
+      -not (Test-WindowsNodeExitEvidence $receipt.lastExitAfterPresent $receipt.lastExitAfterType $receipt.lastExitAfterCode)) {
+    return $invalid
+  }
+  if (-not $receipt.identityMatch -or -not $receipt.profileMatch -or -not $receipt.cwdMatch -or -not $receipt.executableMatch) {
+    return $invalid
+  }
+  if ($receipt.measurement -eq 'exception' -or -not $receipt.stderrReadSucceeded -or -not $receipt.stderrCleanupConfirmed -or
+      $receipt.stderrBytes -gt 16777216 -or $receipt.outputCount -gt 2) {
+    return $invalid
+  }
+  $expectedPathExt = $ExpectedCase -in @('B', 'E')
+  if ($receipt.pathextPresent -ne $expectedPathExt -or
+      $receipt.pathextHasExe -ne $expectedPathExt -or
+      $receipt.pathextHasCmd -or
+      $receipt.pathextExactExe -ne $expectedPathExt) {
+    return $invalid
+  }
+  if ($ExpectedMode -in @('runtime-null', 'runtime-file')) {
+    if ($receipt.directStarted -or $receipt.directExitObserved -or $receipt.directExitCode -cne 'none' -or
+        $receipt.directStdoutBytes -ne 0 -or $receipt.directStderrBytes -ne 0 -or $receipt.directStdoutEof -or
+        $receipt.directStderrEof -or $receipt.directCleanupConfirmed -or $receipt.directFailure -cne 'not-run') {
+      return $invalid
+    }
+    $expectedMatch = $receipt.invokeSucceeded -and $receipt.outputCount -eq 1 -and $receipt.runtimeMatch -and
+      $receipt.lastExitAfterPresent -and $receipt.lastExitAfterType -eq 'int32' -and $receipt.lastExitAfterCode -eq '0'
+  } elseif ($ExpectedMode -eq 'exit17') {
+    if ($receipt.directStarted -or $receipt.directExitObserved -or $receipt.directExitCode -cne 'none' -or
+        $receipt.directStdoutBytes -ne 0 -or $receipt.directStderrBytes -ne 0 -or $receipt.directStdoutEof -or
+        $receipt.directStderrEof -or $receipt.directCleanupConfirmed -or $receipt.directFailure -cne 'not-run') {
+      return $invalid
+    }
+    $expectedMatch = -not $receipt.invokeSucceeded -and $receipt.outputCount -eq 0 -and $receipt.runtimeMatch -and
+      $receipt.lastExitAfterPresent -and $receipt.lastExitAfterType -eq 'int32' -and $receipt.lastExitAfterCode -eq '17'
+  } elseif ($ExpectedMode -eq 'direct') {
+    if ($receipt.directFailure -notin @(
+        'none', 'input-invalid', 'start-returned-false', 'start-exception', 'probe-setup-failed', 'exit-observation-failed',
+        'stdin-close-failed', 'execution-timeout', 'probe-exception', 'cleanup-unconfirmed', 'exit-nonzero',
+        'runtime-output-mismatch', 'unexpected-stderr'
+      ) -or -not $receipt.directStarted -or -not $receipt.directExitObserved -or
+        -not $receipt.directStdoutEof -or -not $receipt.directStderrEof -or -not $receipt.directCleanupConfirmed -or
+        -not (Test-WindowsNodeExitEvidence $receipt.directExitObserved 'int32' $receipt.directExitCode)) {
+      return $invalid
+    }
+    $expectedMatch = $receipt.directFailure -eq 'none' -and $receipt.directExitCode -eq '0' -and $receipt.runtimeMatch
+  } else {
+    return $invalid
+  }
+  if (($receipt.measurement -eq 'match') -ne [bool]$expectedMatch -or
+      $RunResult.ExitCode -ne $(if ($expectedMatch) { 0 } else { 90 })) {
+    return $invalid
+  }
+  return [pscustomobject]@{ Valid = $true; Receipt = $receipt; Reason = 'none' }
+  } catch {
+    return $invalid
+  }
+}
+
+function Test-WindowsNodeExitEvidence([bool]$Present, [string]$Type, [string]$Code) {
+  if ($Type -eq 'none') { return (-not $Present -and $Code -ceq 'none') }
+  if ($Type -eq 'other') { return ($Present -and $Code -ceq 'none') }
+  if ($Type -ne 'int32' -or -not $Present -or $Code -notmatch '^-?\d{1,10}$') { return $false }
+  $parsed = 0
+  if (-not [int]::TryParse($Code, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+    return $false
+  }
+  return $parsed.ToString([Globalization.CultureInfo]::InvariantCulture) -ceq $Code
+}
+
+function Test-WindowsNodeDiagnosticSupervision(
+  [object]$RunResult,
+  [string]$ExpectedSid,
+  [string]$ExpectedProfile
+) {
+  if ($null -eq $RunResult) { return $false }
+  $required = @(
+    'FailureCode', 'CleanupFailureCode', 'ExitObserved', 'GoAttempted', 'GoSent', 'TimedOut',
+    'CleanupConfirmed', 'EnvironmentValidated', 'Token'
+  )
+  foreach ($name in $required) {
+    if ($null -eq $RunResult.PSObject.Properties[$name]) { return $false }
+  }
+  foreach ($name in @('ExitObserved', 'GoAttempted', 'GoSent', 'TimedOut', 'CleanupConfirmed', 'EnvironmentValidated')) {
+    if ($RunResult.$name -isnot [bool]) { return $false }
+  }
+  if ($RunResult.FailureCode -or $RunResult.CleanupFailureCode -or
+      -not $RunResult.ExitObserved -or -not $RunResult.GoAttempted -or -not $RunResult.GoSent -or
+      $RunResult.TimedOut -or -not $RunResult.CleanupConfirmed -or -not $RunResult.EnvironmentValidated -or
+      $null -eq $RunResult.Token) {
+    return $false
+  }
+  $token = $RunResult.Token
+  foreach ($name in @('Sid', 'IntegritySid', 'ElevationType', 'IsElevated', 'HasAdministratorsSid', 'ProfileHiveLoaded', 'ProfilePath')) {
+    if ($null -eq $token.PSObject.Properties[$name]) { return $false }
+  }
+  foreach ($name in @('IsElevated', 'HasAdministratorsSid', 'ProfileHiveLoaded')) {
+    if ($token.$name -isnot [bool]) { return $false }
+  }
+  if ($token.Sid -isnot [string] -or $token.IntegritySid -isnot [string] -or
+      $token.ElevationType -isnot [int] -or $token.ProfilePath -isnot [string]) {
+    return $false
+  }
+  $profileMatches = if ($IsWindows) {
+    [WindowsHarnessNative]::ProfilePathsEqual($token.ProfilePath, $ExpectedProfile)
+  } else {
+    [string]::Equals($token.ProfilePath, $ExpectedProfile, [StringComparison]::Ordinal)
+  }
+  return [string]::Equals($token.Sid, $ExpectedSid, [StringComparison]::Ordinal) -and
+    -not $token.IsElevated -and -not $token.HasAdministratorsSid -and
+    $token.ElevationType -eq 1 -and $token.IntegritySid -ceq 'S-1-16-8192' -and
+    $token.ProfileHiveLoaded -and $profileMatches
+}
+
+function Invoke-WindowsNodeInvocationDiagnostics(
+  [System.Collections.IDictionary]$BaseEnvironment,
+  [string]$PowerShellPath,
+  [string]$DiagnosticScriptPath,
+  [string]$WorkingDirectory,
+  [string]$ExpectedSid,
+  [string]$ExpectedProfile,
+  [scriptblock]$Runner,
+  [string]$SourceSha,
+  [string]$TreeSha,
+  [string]$ArchiveSha256,
+  [bool]$DiagnosticScriptHashMatch,
+  [string]$RunId,
+  [string]$RunAttempt
+) {
+  $result = [pscustomobject]@{
+    Complete = $false
+    RetentionRequired = $true
+    StopReason = 'not-started'
+    Cases = [System.Collections.Generic.List[object]]::new()
+  }
+  if ($null -eq $Runner -or -not $DiagnosticScriptHashMatch -or
+      -not (Test-Path -LiteralPath $DiagnosticScriptPath -PathType Leaf)) {
+    $result.StopReason = 'diagnostic-source-invalid'
+    return $result
+  }
+  $baseline = Copy-FixtureEnvironment $BaseEnvironment
+  if ($baseline.ContainsKey('PATHEXT')) {
+    $result.StopReason = 'baseline-already-has-pathext'
+    return $result
+  }
+  $baselineBefore = Copy-FixtureEnvironment $baseline
+  $plan = @(
+    [pscustomobject]@{ Case = 'A'; Mode = 'runtime-null'; AddPathExt = $false },
+    [pscustomobject]@{ Case = 'B'; Mode = 'runtime-null'; AddPathExt = $true },
+    [pscustomobject]@{ Case = 'A2'; Mode = 'runtime-null'; AddPathExt = $false },
+    [pscustomobject]@{ Case = 'C'; Mode = 'runtime-file'; AddPathExt = $false },
+    [pscustomobject]@{ Case = 'D'; Mode = 'direct'; AddPathExt = $false },
+    [pscustomobject]@{ Case = 'E'; Mode = 'exit17'; AddPathExt = $true }
+  )
+  [Console]::Out.WriteLine("WINDOWS_NODE_DIAGNOSTIC_PROVENANCE sourceSha=$SourceSha treeSha=$TreeSha archiveSha256=$ArchiveSha256 diagnosticScriptHashMatch=$($DiagnosticScriptHashMatch.ToString().ToLowerInvariant()) runId=$RunId runAttempt=$RunAttempt")
+  $bMatched = $false
+  foreach ($item in $plan) {
+    if ($item.Case -eq 'E' -and -not $bMatched) {
+      $result.Cases.Add([pscustomobject]@{
+          Case = 'E'
+          Mode = 'exit17'
+          EnvironmentDelta = 'pathext-only'
+          Measurement = 'skipped'
+          Supervision = 'not-run'
+          Receipt = 'not-run'
+          CleanupConfirmed = $true
+          Result = $null
+        })
+      [Console]::Out.WriteLine('WINDOWS_NODE_INVOCATION case=E mode=exit17 environmentDelta=pathext-only measurement=skipped supervision=not-run receipt=not-run cleanupConfirmed=true reason=B_not_match')
+      continue
+    }
+    $caseEnvironment = Copy-FixtureEnvironment $baseline
+    if ($item.AddPathExt) { $caseEnvironment['PATHEXT'] = '.EXE' }
+    $environmentDelta = Get-FixtureEnvironmentDelta $baseline $caseEnvironment ([bool]$item.AddPathExt)
+    $expectedEnvironmentDelta = if ($item.AddPathExt) { 'pathext-only' } else { 'none' }
+    $caseArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $DiagnosticScriptPath, '-Mode', $item.Mode)
+    if ($environmentDelta -cne $expectedEnvironmentDelta) {
+      $result.StopReason = 'environment-delta-invalid'
+      [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=invalid measurement=unknown supervision=failed receipt=invalid cleanupConfirmed=false")
+      return $result
+    }
+    $caseEnvironmentBefore = Copy-FixtureEnvironment $caseEnvironment
+    $runResult = $null
+    try { $runResult = & $Runner $PowerShellPath $caseArguments $WorkingDirectory $caseEnvironment 30 30 15 } catch {
+      $result.StopReason = 'runner-threw'
+      [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=$environmentDelta measurement=unknown supervision=failed receipt=invalid cleanupConfirmed=false")
+      return $result
+    }
+    $supervisionConfirmed = Test-WindowsNodeDiagnosticSupervision $runResult $ExpectedSid $ExpectedProfile
+    if (-not $supervisionConfirmed) {
+      $result.StopReason = 'supervision-unconfirmed'
+      [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=$environmentDelta measurement=unknown supervision=failed receipt=invalid cleanupConfirmed=false")
+      return $result
+    }
+    $parsed = ConvertFrom-WindowsNodeDiagnosticReceipt $runResult $item.Mode $item.Case
+    if (-not $parsed.Valid -or -not (Test-FixtureEnvironmentEqual $caseEnvironment $caseEnvironmentBefore)) {
+      $result.StopReason = 'receipt-invalid'
+      [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=$environmentDelta measurement=unknown supervision=confirmed receipt=invalid cleanupConfirmed=true")
+      return $result
+    }
+    if (-not (Test-FixtureEnvironmentEqual $baseline $baselineBefore) -or
+        -not (Test-FixtureEnvironmentEqual $BaseEnvironment $baselineBefore)) {
+      $result.StopReason = 'baseline-environment-mutated'
+      [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=$environmentDelta measurement=unknown supervision=confirmed receipt=invalid cleanupConfirmed=true")
+      return $result
+    }
+    $receipt = $parsed.Receipt
+    if ($item.Case -eq 'B') { $bMatched = $receipt.measurement -eq 'match' }
+    $caseResult = [pscustomobject]@{
+      Case = $item.Case
+      Mode = $item.Mode
+      EnvironmentDelta = $environmentDelta
+      Measurement = $receipt.measurement
+      Supervision = 'confirmed'
+      Receipt = 'complete'
+      CleanupConfirmed = $true
+      Result = $receipt
+    }
+    $result.Cases.Add($caseResult)
+    [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=$environmentDelta measurement=$($receipt.measurement) supervision=confirmed receipt=complete cleanupConfirmed=true identityMatch=$($receipt.identityMatch.ToString().ToLowerInvariant()) profileMatch=$($receipt.profileMatch.ToString().ToLowerInvariant()) cwdMatch=$($receipt.cwdMatch.ToString().ToLowerInvariant()) executableMatch=$($receipt.executableMatch.ToString().ToLowerInvariant()) powershellVersion=$($receipt.powershellVersion) runtimeVersion=$($receipt.runtimeVersion) pathextPresent=$($receipt.pathextPresent.ToString().ToLowerInvariant()) pathextHasExe=$($receipt.pathextHasExe.ToString().ToLowerInvariant()) pathextHasCmd=$($receipt.pathextHasCmd.ToString().ToLowerInvariant()) pathextExactExe=$($receipt.pathextExactExe.ToString().ToLowerInvariant()) argumentPassing=$($receipt.argumentPassing) nativeErrorPreference=$($receipt.nativeErrorPreference) lastExitBeforePresent=$($receipt.lastExitBeforePresent.ToString().ToLowerInvariant()) lastExitBeforeType=$($receipt.lastExitBeforeType) lastExitBeforeCode=$($receipt.lastExitBeforeCode) invokeSucceeded=$($receipt.invokeSucceeded.ToString().ToLowerInvariant()) outputCount=$($receipt.outputCount) runtimeMatch=$($receipt.runtimeMatch.ToString().ToLowerInvariant()) lastExitAfterPresent=$($receipt.lastExitAfterPresent.ToString().ToLowerInvariant()) lastExitAfterType=$($receipt.lastExitAfterType) lastExitAfterCode=$($receipt.lastExitAfterCode) stderrBytes=$($receipt.stderrBytes) stderrReadSucceeded=$($receipt.stderrReadSucceeded.ToString().ToLowerInvariant()) stderrTruncated=$($receipt.stderrTruncated.ToString().ToLowerInvariant()) directStarted=$($receipt.directStarted.ToString().ToLowerInvariant()) directExitObserved=$($receipt.directExitObserved.ToString().ToLowerInvariant()) directExitCode=$($receipt.directExitCode) directStdoutBytes=$($receipt.directStdoutBytes) directStderrBytes=$($receipt.directStderrBytes) directStdoutEof=$($receipt.directStdoutEof.ToString().ToLowerInvariant()) directStderrEof=$($receipt.directStderrEof.ToString().ToLowerInvariant()) directCleanupConfirmed=$($receipt.directCleanupConfirmed.ToString().ToLowerInvariant()) directFailure=$($receipt.directFailure)")
+  }
+  if (-not (Test-FixtureEnvironmentEqual $BaseEnvironment $baselineBefore)) {
+    $result.StopReason = 'baseline-environment-mutated'
+    return $result
+  }
+  $result.Complete = $true
+  $result.RetentionRequired = $false
+  $result.StopReason = 'none'
+  return $result
+}
+
+function New-WindowsNodeDiagnosticBootstrap(
+  [string]$ArchivePath,
+  [string]$ExpectedArchiveSha256,
+  [string]$BootstrapDirectory
+) {
+  $destination = Join-Path $BootstrapDirectory 'windows-node-invocation-diagnostic.ps1'
+  $result = [pscustomobject]@{ Ready = $false; Reason = 'not-started'; Path = $destination; ScriptSha256 = 'none' }
+  $archiveStream = $null
+  $archive = $null
+  $entryStream = $null
+  $contentStream = $null
+  $destinationStream = $null
+  $sha = $null
+  $stage = 'input'
+  try {
+    if ($ExpectedArchiveSha256 -notmatch '^[0-9a-f]{64}$') {
+      $result.Reason = 'archive-hash-invalid'
+      return $result
+    }
+    $bootstrapItem = Get-Item -LiteralPath $BootstrapDirectory -Force -ErrorAction Stop
+    if (-not $bootstrapItem.PSIsContainer -or ($bootstrapItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      $result.Reason = 'bootstrap-directory-unsafe'
+      return $result
+    }
+    if (Test-Path -LiteralPath $destination) {
+      $result.Reason = 'destination-exists'
+      return $result
+    }
+    $stage = 'archive-hash'
+    $observedArchiveHash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    if (-not [string]::Equals($observedArchiveHash, $ExpectedArchiveSha256, [StringComparison]::Ordinal)) {
+      $result.Reason = 'archive-hash-mismatch'
+      return $result
+    }
+
+    $stage = 'archive-open'
+    $archiveStream = [IO.File]::Open($ArchivePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Read, $false)
+    $entryName = 'scripts/ci/windows-node-invocation-diagnostic.ps1'
+    $entries = @($archive.Entries | Where-Object { [string]::Equals($_.FullName, $entryName, [StringComparison]::Ordinal) })
+    if ($entries.Count -eq 0) {
+      $result.Reason = 'entry-missing'
+      return $result
+    }
+    if ($entries.Count -ne 1) {
+      $result.Reason = 'entry-duplicate'
+      return $result
+    }
+    if ($entries[0].Length -le 0 -or $entries[0].Length -gt 65536) {
+      $result.Reason = 'entry-size-invalid'
+      return $result
+    }
+
+    $stage = 'entry-read'
+    $entryStream = $entries[0].Open()
+    $contentStream = [IO.MemoryStream]::new()
+    $entryStream.CopyTo($contentStream)
+    if ($contentStream.Length -ne $entries[0].Length) {
+      $result.Reason = 'entry-length-mismatch'
+      return $result
+    }
+    $content = $contentStream.ToArray()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $entryHash = [Convert]::ToHexString($sha.ComputeHash($content)).ToLowerInvariant()
+
+    $stage = 'destination-write'
+    $destinationStream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $destinationStream.Write($content, 0, $content.Length)
+    $destinationStream.Flush($true)
+    $destinationStream.Dispose()
+    $destinationStream = $null
+
+    $stage = 'destination-verify'
+    $destinationItem = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+    if ($destinationItem.PSIsContainer -or ($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $destinationItem.Length -ne $content.Length) {
+      $result.Reason = 'destination-unsafe'
+      return $result
+    }
+    $destinationHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    if (-not [string]::Equals($entryHash, $destinationHash, [StringComparison]::Ordinal)) {
+      $result.Reason = 'entry-copy-hash-mismatch'
+      return $result
+    }
+    $result.Ready = $true
+    $result.Reason = 'none'
+    $result.ScriptSha256 = $entryHash
+    return $result
+  } catch {
+    $result.Reason = switch ($stage) {
+      'archive-hash' { 'archive-read-failed' }
+      'archive-open' { 'archive-invalid' }
+      'entry-read' { 'entry-read-failed' }
+      'destination-write' { 'destination-write-failed' }
+      'destination-verify' { 'destination-verify-failed' }
+      default { 'bootstrap-input-invalid' }
+    }
+    return $result
+  } finally {
+    if ($null -ne $destinationStream) { $destinationStream.Dispose() }
+    if ($null -ne $contentStream) { $contentStream.Dispose() }
+    if ($null -ne $entryStream) { $entryStream.Dispose() }
+    if ($null -ne $archive) { $archive.Dispose() }
+    elseif ($null -ne $archiveStream) { $archiveStream.Dispose() }
+    if ($null -ne $sha) { $sha.Dispose() }
+  }
+}
+
+function Get-WindowsNodeDiagnosticGate([object]$BaselineResult, [bool]$BootstrapReady, [string]$ExpectedSid, [string]$ExpectedProfile) {
+  $gate = [pscustomobject]@{ TargetFailure = $false; ShouldRun = $false; Reason = 'baseline-not-targeted' }
+  if ($null -eq $BaselineResult -or
+      $null -eq $BaselineResult.PSObject.Properties['ExitCode'] -or
+      $BaselineResult.ExitCode -isnot [int] -or $BaselineResult.ExitCode -ne 90 -or
+      $null -eq $BaselineResult.PSObject.Properties['StandardError'] -or
+      $BaselineResult.StandardError -isnot [string]) {
+    return $gate
+  }
+  if (-not (Test-WindowsNodeDiagnosticSupervision $BaselineResult $ExpectedSid $ExpectedProfile)) {
+    $gate.Reason = 'baseline-supervision-unconfirmed'
+    return $gate
+  }
+  $lines = @([Regex]::Split($BaselineResult.StandardError, '\r\n|\n|\r'))
+  if ($lines.Count -eq 2 -and $lines[1] -ceq '') { $lines = @($lines[0]) }
+  if ($lines.Count -ne 1 -or $lines[0] -cne 'WINDOWS_IDENTITY_PREFLIGHT_FAILED: Node runtime probe failed') {
+    return $gate
+  }
+  $gate.TargetFailure = $true
+  if (-not $BootstrapReady) {
+    $gate.Reason = 'diagnostic-bootstrap-unverified'
+    return $gate
+  }
+  $gate.ShouldRun = $true
+  $gate.Reason = 'none'
+  return $gate
+}
+
+function Invoke-WindowsNodeDiagnosticsFailClosed([int]$BaselineExitCode, [object]$Gate, [scriptblock]$DiagnosticInvoker) {
+  $retentionRequired = $false
+  if ($null -ne $Gate -and $null -ne $Gate.PSObject.Properties['TargetFailure'] -and $Gate.TargetFailure -is [bool]) {
+    $retentionRequired = $Gate.TargetFailure
+  }
+  $attempt = [pscustomobject]@{
+    ExitCode = $BaselineExitCode
+    Complete = $false
+    RetentionRequired = $retentionRequired
+    Reason = 'gate-unavailable'
+  }
+  if ($null -ne $Gate -and $null -ne $Gate.PSObject.Properties['Reason'] -and $Gate.Reason -is [string]) {
+    $attempt.Reason = $Gate.Reason
+  }
+  try {
+    if ($null -eq $Gate -or $Gate.TargetFailure -isnot [bool] -or $Gate.ShouldRun -isnot [bool]) {
+      $attempt.Reason = 'gate-invalid'
+      return $attempt
+    }
+    if (-not $Gate.TargetFailure -or -not $Gate.ShouldRun) { return $attempt }
+    if ($null -eq $DiagnosticInvoker) {
+      $attempt.Reason = 'diagnostic-invoker-missing'
+      return $attempt
+    }
+    $diagnosticResult = & $DiagnosticInvoker
+    if ($diagnosticResult -isnot [pscustomobject] -or
+        $null -eq $diagnosticResult.PSObject.Properties['Complete'] -or
+        $null -eq $diagnosticResult.PSObject.Properties['RetentionRequired'] -or
+        $diagnosticResult.Complete -isnot [bool] -or
+        $diagnosticResult.RetentionRequired -isnot [bool] -or
+        -not $diagnosticResult.Complete -or $diagnosticResult.RetentionRequired) {
+      $attempt.Reason = 'diagnostic-result-unconfirmed'
+      return $attempt
+    }
+    $attempt.Complete = $true
+    $attempt.RetentionRequired = $false
+    $attempt.Reason = 'none'
+    return $attempt
+  } catch {
+    $attempt.Reason = 'diagnostic-exception'
+    return $attempt
   }
 }
 
@@ -573,6 +1290,7 @@ $accountSid = $null
 $fixtureRoot = $null
 $securePassword = $null
 $nativeResult = $null
+$diagnosticBootstrap = [pscustomobject]@{ Ready = $false; Reason = 'not-prepared'; Path = 'none'; ScriptSha256 = 'none' }
 $cleanupFailure = $false
 $scriptExitCode = 0
 $retainFixtureForProcess = $false
@@ -762,6 +1480,17 @@ try {
   Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts/ci/windows-identity-run.ps1') -Destination $bootstrap
   Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts/ci/windows-harness-native.cs') -Destination $bootstrap
   Copy-Item -LiteralPath (Join-Path $sourceRoot 'scripts/ci/windows-token-probe.ps1') -Destination $bootstrap
+  try {
+    $diagnosticBootstrap = New-WindowsNodeDiagnosticBootstrap $archivePath $archiveHash $bootstrap
+  } catch {
+    $diagnosticBootstrap = [pscustomobject]@{
+      Ready = $false
+      Reason = 'bootstrap-initialization-failed'
+      Path = (Join-Path $bootstrap 'windows-node-invocation-diagnostic.ps1')
+      ScriptSha256 = 'none'
+    }
+  }
+  Write-Output "WINDOWS_NODE_DIAGNOSTIC_BOOTSTRAP ready=$($diagnosticBootstrap.Ready.ToString().ToLowerInvariant()) reason=$($diagnosticBootstrap.Reason) scriptSha256=$($diagnosticBootstrap.ScriptSha256)"
 
   [WindowsHarnessNative]::SetReadOnlyDirectorySecurity($fixtureRoot, $accountSid)
   [WindowsHarnessNative]::SetReadOnlyDirectorySecurity($bootstrap, $accountSid)
@@ -1281,6 +2010,70 @@ try {
   Write-Output "STANDARD_USER_TOKEN=PASS sid=$($nativeResult.Token.Sid) elevated=$($nativeResult.Token.IsElevated) adminGroup=$($nativeResult.Token.HasAdministratorsSid) integrity=$($nativeResult.Token.IntegritySid) profileLoaded=$($nativeResult.Token.ProfileHiveLoaded)"
   if ($nativeResult.ExitCode -ne 0) {
     $scriptExitCode = $nativeResult.ExitCode
+  }
+
+  $baselineExitCode = $scriptExitCode
+  $diagnosticGate = $null
+  try {
+    $diagnosticGate = Get-WindowsNodeDiagnosticGate $nativeResult ([bool]$diagnosticBootstrap.Ready) $accountSid $profilePath
+  } catch {
+    if ($nativeResult.ExitCode -is [int] -and $nativeResult.ExitCode -eq 90) {
+      $retainFixtureForProcess = $true
+    }
+    Write-Output 'WINDOWS_NODE_DIAGNOSTICS=failed reason=gate-evaluation-failed'
+  }
+  if ($null -ne $diagnosticGate -and $diagnosticGate.TargetFailure) {
+    $retainFixtureForProcess = $true
+    $diagnosticInvoker = {
+      $diagnosticRunner = {
+        param($Executable, $Arguments, $WorkingDirectory, $ChildEnvironment, $ReadyTimeout, $ExecutionTimeout, $CleanupTimeout)
+        [void](Assert-WindowsCredentialedCommandLineBound $Executable $Arguments)
+        return [WindowsHarnessNative]::RunAsUser(
+          $Executable,
+          $Arguments,
+          $accountName,
+          $env:COMPUTERNAME,
+          $securePassword,
+          $WorkingDirectory,
+          $ChildEnvironment,
+          $accountSid,
+          'RVW_NODE_DIAGNOSTIC_READY',
+          $ReadyTimeout,
+          $ExecutionTimeout,
+          $CleanupTimeout
+        )
+      }.GetNewClosure()
+      return Invoke-WindowsNodeInvocationDiagnostics `
+        -BaseEnvironment $environment `
+        -PowerShellPath $pwshPath `
+        -DiagnosticScriptPath $diagnosticBootstrap.Path `
+        -WorkingDirectory $fixtureRoot `
+        -ExpectedSid $accountSid `
+        -ExpectedProfile $profilePath `
+        -Runner $diagnosticRunner `
+        -SourceSha $head `
+        -TreeSha $tree `
+        -ArchiveSha256 $archiveHash `
+        -DiagnosticScriptHashMatch $diagnosticBootstrap.Ready `
+        -RunId ([string]$env:GITHUB_RUN_ID) `
+        -RunAttempt ([string]$env:GITHUB_RUN_ATTEMPT)
+    }.GetNewClosure()
+    try {
+      $diagnosticAttempt = Invoke-WindowsNodeDiagnosticsFailClosed $baselineExitCode $diagnosticGate $diagnosticInvoker
+      $scriptExitCode = $diagnosticAttempt.ExitCode
+      $retainFixtureForProcess = $diagnosticAttempt.RetentionRequired
+      if ($diagnosticAttempt.Complete) {
+        Write-Output 'WINDOWS_NODE_DIAGNOSTICS=complete baselineExit=90'
+      } elseif ($diagnosticAttempt.Reason -eq 'diagnostic-bootstrap-unverified') {
+        Write-Output "WINDOWS_NODE_DIAGNOSTICS=skipped reason=$($diagnosticAttempt.Reason) baselineExit=90"
+      } else {
+        Write-Output "WINDOWS_NODE_DIAGNOSTICS=failed reason=$($diagnosticAttempt.Reason) baselineExit=90"
+      }
+    } catch {
+      $scriptExitCode = $baselineExitCode
+      $retainFixtureForProcess = $true
+      Write-Output 'WINDOWS_NODE_DIAGNOSTICS=failed reason=exception baselineExit=90'
+    }
   }
 } finally {
   if ($securePassword) {

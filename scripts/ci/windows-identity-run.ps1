@@ -12,6 +12,52 @@ function Fail-Preflight([string]$Message) {
   exit 90
 }
 
+function Get-LastExitCodeEvidence {
+  $variable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+  if ($null -eq $variable) {
+    return [pscustomobject]@{ Present = $false; Type = 'none'; Code = 'none' }
+  }
+  if ($variable.Value -is [int32]) {
+    return [pscustomobject]@{
+      Present = $true
+      Type = 'int32'
+      Code = $variable.Value.ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+  }
+  return [pscustomobject]@{ Present = $true; Type = 'other'; Code = 'none' }
+}
+
+function Get-NodeInvocationEnvironmentEvidence {
+  $pathExt = [Environment]::GetEnvironmentVariable('PATHEXT', [EnvironmentVariableTarget]::Process)
+  $extensions = @()
+  if ($null -ne $pathExt) {
+    $extensions = @($pathExt -split ';' | ForEach-Object { $_.Trim().ToUpperInvariant() })
+  }
+  $argumentPassing = 'unknown'
+  $argumentPassingVariable = Get-Variable -Name PSNativeCommandArgumentPassing -ErrorAction SilentlyContinue
+  if ($null -ne $argumentPassingVariable) {
+    $candidatePassing = [string]$argumentPassingVariable.Value
+    if ($candidatePassing -in @('Legacy', 'Standard', 'Windows')) {
+      $argumentPassing = $candidatePassing
+    }
+  }
+  $errorPreference = 'unknown'
+  $errorPreferenceVariable = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+  if ($null -ne $errorPreferenceVariable -and $errorPreferenceVariable.Value -is [bool]) {
+    $errorPreference = $errorPreferenceVariable.Value.ToString().ToLowerInvariant()
+  }
+  return [pscustomobject]@{
+    PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+    RuntimeVersion = [Environment]::Version.ToString()
+    PathExtPresent = $null -ne $pathExt
+    PathExtHasExe = $extensions -contains '.EXE'
+    PathExtHasCmd = $extensions -contains '.CMD'
+    PathExtExactExe = [string]::Equals($pathExt, '.EXE', [StringComparison]::OrdinalIgnoreCase)
+    ArgumentPassing = $argumentPassing
+    ErrorActionPreference = $errorPreference
+  }
+}
+
 function Write-NodeDirectProbeReceipt([object]$Probe) {
   $exitCode = 'none'
   if ($null -ne $Probe.ExitCode) { $exitCode = $Probe.ExitCode.ToString([Globalization.CultureInfo]::InvariantCulture) }
@@ -343,6 +389,8 @@ try {
     Fail-Preflight 'invalid tool-cache runtime metadata'
   }
   $preflightStage = 'NODE_INVOKE'
+  $nodeInvocationEnvironment = Get-NodeInvocationEnvironmentEvidence
+  $nodeExitBefore = Get-LastExitCodeEvidence
   $nodeOutput = @(& $node -p "process.version + '|' + process.platform + '|' + process.arch" 2>$null)
   $nodeInvokeSucceeded = $?
   $preflightStage = 'NODE_EXIT_READ'
@@ -358,13 +406,13 @@ try {
     }
     $nodeExit = $nodeExitVariable.Value
   }
+  $nodeExitAfter = Get-LastExitCodeEvidence
   $preflightStage = 'NODE_OUTPUT_VALIDATE'
   $nodeOutputCount = $nodeOutput.Count
-  $loggedNodeExit = 'none'
-  if ($nodeExitType -eq 'int32') {
-    $loggedNodeExit = $nodeExit.ToString([Globalization.CultureInfo]::InvariantCulture)
-  }
+  $loggedNodeExit = $nodeExitAfter.Code
   $expectedNodeInfo = "$expectedNodeVersion|win32|x64"
+  $loggedNodeExitBefore = $nodeExitBefore.Code
+  Write-Output "NODE_PROBE_CONTEXT powershellVersion=$($nodeInvocationEnvironment.PowerShellVersion) runtimeVersion=$($nodeInvocationEnvironment.RuntimeVersion) pathextPresent=$($nodeInvocationEnvironment.PathExtPresent.ToString().ToLowerInvariant()) pathextHasExe=$($nodeInvocationEnvironment.PathExtHasExe.ToString().ToLowerInvariant()) pathextHasCmd=$($nodeInvocationEnvironment.PathExtHasCmd.ToString().ToLowerInvariant()) pathextExactExe=$($nodeInvocationEnvironment.PathExtExactExe.ToString().ToLowerInvariant()) argumentPassing=$($nodeInvocationEnvironment.ArgumentPassing) nativeErrorPreference=$($nodeInvocationEnvironment.ErrorActionPreference) lastExitBeforePresent=$($nodeExitBefore.Present.ToString().ToLowerInvariant()) lastExitBeforeType=$($nodeExitBefore.Type) lastExitBeforeCode=$loggedNodeExitBefore lastExitAfterPresent=$($nodeExitAfter.Present.ToString().ToLowerInvariant()) lastExitAfterType=$($nodeExitAfter.Type) lastExitAfterCode=$loggedNodeExit"
   Write-Output "NODE_PROBE invokeSucceeded=$($nodeInvokeSucceeded.ToString().ToLowerInvariant()) exitPresent=$($nodeExitPresent.ToString().ToLowerInvariant()) exitType=$nodeExitType exitCode=$loggedNodeExit outputCount=$nodeOutputCount"
   $preflightStage = 'NODE_OUTPUT_COMPARE'
   $nodeInfo = Assert-NodeRuntimeProbe `

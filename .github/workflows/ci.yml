@@ -38,6 +38,15 @@ jobs:
           node-version-file: .nvmrc
           architecture: x64
 
+      - name: Test Windows diagnostic branches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & pwsh -NoLogo -NoProfile -File ./scripts/ci/windows-identity-node-branch-tests.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Node branch regression tests failed.' }
+          & pwsh -NoLogo -NoProfile -File ./scripts/ci/windows-harness-diagnostic-tests.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Harness diagnostic regression tests failed.' }
+
       - name: Run native identity harness as a verified standard user
         shell: pwsh
         run: ./scripts/ci/windows-nonadmin.ps1
