@@ -21,6 +21,7 @@ function Assert-HarnessResultSchema($Result, [string]$Label) {
   if ($null -eq $Result) {
     throw "$Label returned no harness result."
   }
+  Write-ExecutableEnvironmentReceipt $Result
   $required = @('FailureCode', 'CleanupFailureCode', 'ExitObserved', 'GoAttempted', 'GoSent')
   $properties = @($Result.PSObject.Properties.Name)
   if ($required | Where-Object { $_ -notin $properties }) {
@@ -53,6 +54,15 @@ function ConvertTo-HarnessDiagnosticCode($Value, [string[]]$AllowedCodes) {
     return [string]$Value
   }
   return 'unknown'
+}
+
+function Write-ExecutableEnvironmentReceipt($Result) {
+  $environmentFailureCodes = @('ENVIRONMENT_INPUT_INVALID', 'ENVIRONMENT_COPY_MISMATCH')
+  if ($null -eq $Result -or $Result.FailureCode -notin $environmentFailureCodes) {
+    return
+  }
+  $code = ConvertTo-HarnessDiagnosticCode $Result.FailureCode $environmentFailureCodes
+  Write-Output "WINDOWS_EXECUTABLE_ENV_COPY_FAILURE code=$code nodeInputPresent=$($Result.NodeEnvironmentInputPresent.ToString().ToLowerInvariant()) nodeInputLength=$($Result.NodeEnvironmentInputLength) nodeCopiedPresent=$($Result.NodeEnvironmentCopiedPresent.ToString().ToLowerInvariant()) nodeCopyEqual=$($Result.NodeEnvironmentCopyEqual.ToString().ToLowerInvariant()) npmInputPresent=$($Result.NpmEnvironmentInputPresent.ToString().ToLowerInvariant()) npmInputLength=$($Result.NpmEnvironmentInputLength) npmCopiedPresent=$($Result.NpmEnvironmentCopiedPresent.ToString().ToLowerInvariant()) npmCopyEqual=$($Result.NpmEnvironmentCopyEqual.ToString().ToLowerInvariant()) environmentValidated=$($Result.EnvironmentValidated.ToString().ToLowerInvariant())"
 }
 
 function ConvertTo-HarnessDiagnosticBoolean($Value) {
@@ -117,7 +127,8 @@ function Assert-WindowsCredentialedCommandLineBound([string]$Executable, [string
 
 function Format-DescendantHarnessDiagnostic($Result, [bool]$AckExists, [long]$ElapsedMs) {
   $failureCodes = @(
-    'DESCENDANTS_REMAINED', 'EARLY_EXIT', 'EXECUTION_TIMEOUT', 'GO_WRITE_FAILED',
+    'DESCENDANTS_REMAINED', 'EARLY_EXIT', 'ENVIRONMENT_COPY_MISMATCH', 'ENVIRONMENT_INPUT_INVALID',
+    'EXECUTION_TIMEOUT', 'GO_WRITE_FAILED',
     'JOB_CONFIGURATION_FAILED', 'PROCESS_START_FAILED', 'READY_TIMEOUT',
     'SUPERVISOR_FAILURE', 'TOKEN_PREFLIGHT_FAILED'
   )
@@ -516,6 +527,47 @@ function Get-NodeToolCacheInstallation([string]$RepositoryRoot) {
   }
 }
 
+function Get-ExecutableInputEvidence([object]$Value, [object]$ResolvedSelection) {
+  $valueKind = 'other'
+  if ($null -eq $Value) { $valueKind = 'null' }
+  elseif ($Value -is [string]) { $valueKind = 'string' }
+  elseif ($Value -is [array]) { $valueKind = 'array' }
+  $length = 0
+  $nonblank = $false
+  $fullyQualified = $false
+  $localDrive = $false
+  $hasControl = $false
+  $hasDoubleQuote = $false
+  $surroundingWhitespace = $false
+  $matchesResolvedSelection = $false
+  if ($Value -is [string]) {
+    $length = $Value.Length
+    $nonblank = -not [string]::IsNullOrWhiteSpace($Value)
+    $surroundingWhitespace = $Value -cne $Value.Trim()
+    $hasDoubleQuote = $Value.Contains('"')
+    foreach ($character in $Value.ToCharArray()) {
+      if ([char]::IsControl($character)) { $hasControl = $true; break }
+    }
+    try { $fullyQualified = [IO.Path]::IsPathFullyQualified($Value) } catch {}
+    $localDrive = $Value -match '^[A-Za-z]:\\'
+    $matchesResolvedSelection = $ResolvedSelection -is [string] -and
+      [string]::Equals($Value, $ResolvedSelection, [StringComparison]::OrdinalIgnoreCase)
+  }
+  return [pscustomobject]@{
+    ValueKind = $valueKind
+    Length = $length
+    Nonblank = $nonblank
+    FullyQualified = $fullyQualified
+    LocalDrive = $localDrive
+    HasControl = $hasControl
+    HasDoubleQuote = $hasDoubleQuote
+    SurroundingWhitespace = $surroundingWhitespace
+    MatchesResolvedSelection = $matchesResolvedSelection
+    Valid = $valueKind -eq 'string' -and $nonblank -and $fullyQualified -and $localDrive -and
+      -not $hasControl -and -not $hasDoubleQuote -and -not $surroundingWhitespace -and $matchesResolvedSelection
+  }
+}
+
 $accountName = $null
 $accountSid = $null
 $fixtureRoot = $null
@@ -583,6 +635,13 @@ try {
   $nodePath = $nodeInstallation.NodePath
   $npmPath = $nodeInstallation.NpmPath
   $nodeDirectory = $nodeInstallation.NodeDirectory
+  $nodeInputEvidence = Get-ExecutableInputEvidence $nodePath $nodeInstallation.NodePath
+  $npmInputEvidence = Get-ExecutableInputEvidence $npmPath $nodeInstallation.NpmPath
+  Write-Output "WINDOWS_EXECUTABLE_INPUT name=node kind=$($nodeInputEvidence.ValueKind) length=$($nodeInputEvidence.Length) nonblank=$($nodeInputEvidence.Nonblank.ToString().ToLowerInvariant()) fullyQualified=$($nodeInputEvidence.FullyQualified.ToString().ToLowerInvariant()) localDrive=$($nodeInputEvidence.LocalDrive.ToString().ToLowerInvariant()) hasControl=$($nodeInputEvidence.HasControl.ToString().ToLowerInvariant()) hasDoubleQuote=$($nodeInputEvidence.HasDoubleQuote.ToString().ToLowerInvariant()) surroundingWhitespace=$($nodeInputEvidence.SurroundingWhitespace.ToString().ToLowerInvariant()) matchesResolvedSelection=$($nodeInputEvidence.MatchesResolvedSelection.ToString().ToLowerInvariant())"
+  Write-Output "WINDOWS_EXECUTABLE_INPUT name=npm kind=$($npmInputEvidence.ValueKind) length=$($npmInputEvidence.Length) nonblank=$($npmInputEvidence.Nonblank.ToString().ToLowerInvariant()) fullyQualified=$($npmInputEvidence.FullyQualified.ToString().ToLowerInvariant()) localDrive=$($npmInputEvidence.LocalDrive.ToString().ToLowerInvariant()) hasControl=$($npmInputEvidence.HasControl.ToString().ToLowerInvariant()) hasDoubleQuote=$($npmInputEvidence.HasDoubleQuote.ToString().ToLowerInvariant()) surroundingWhitespace=$($npmInputEvidence.SurroundingWhitespace.ToString().ToLowerInvariant()) matchesResolvedSelection=$($npmInputEvidence.MatchesResolvedSelection.ToString().ToLowerInvariant())"
+  if (-not $nodeInputEvidence.Valid -or -not $npmInputEvidence.Valid) {
+    throw 'EXECUTABLE_INPUT_PREFLIGHT_FAILED'
+  }
   $pwshPath = [IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
   if (-not (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
     throw 'Current PowerShell executable is missing.'
@@ -1209,6 +1268,7 @@ try {
   if ($null -ne $nativeResult -and $nativeResult.CleanupConfirmed -is [bool] -and $nativeResult.CleanupConfirmed) {
     $retainFixtureForProcess = $false
   }
+  Write-Output "WINDOWS_EXECUTABLE_ENV_COPY nodeInputPresent=$($nativeResult.NodeEnvironmentInputPresent.ToString().ToLowerInvariant()) nodeInputLength=$($nativeResult.NodeEnvironmentInputLength) nodeCopiedPresent=$($nativeResult.NodeEnvironmentCopiedPresent.ToString().ToLowerInvariant()) nodeCopyEqual=$($nativeResult.NodeEnvironmentCopyEqual.ToString().ToLowerInvariant()) npmInputPresent=$($nativeResult.NpmEnvironmentInputPresent.ToString().ToLowerInvariant()) npmInputLength=$($nativeResult.NpmEnvironmentInputLength) npmCopiedPresent=$($nativeResult.NpmEnvironmentCopiedPresent.ToString().ToLowerInvariant()) npmCopyEqual=$($nativeResult.NpmEnvironmentCopyEqual.ToString().ToLowerInvariant()) environmentValidated=$($nativeResult.EnvironmentValidated.ToString().ToLowerInvariant())"
   Write-Output "WINDOWS_NATIVE_TARGET os=$($os.Caption) arch=x64 node=26.8.2 source=$head tree=$tree"
   Write-Output "WINDOWS_NATIVE_CHILD_EXIT=$($nativeResult.ExitCode) timedOut=$($nativeResult.TimedOut) cleanupConfirmed=$($nativeResult.CleanupConfirmed)"
   Write-Output "WINDOWS_NATIVE_SUPERVISOR_FAILURE=$($nativeResult.FailureCode) cleanupFailure=$($nativeResult.CleanupFailureCode) exitObserved=$($nativeResult.ExitObserved) goAttempted=$($nativeResult.GoAttempted) goSent=$($nativeResult.GoSent)"

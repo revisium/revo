@@ -22,6 +22,15 @@ public sealed class WindowsHarnessTokenReport
     public bool ProfileHiveLoaded { get; set; }
 }
 
+public sealed class WindowsHarnessExecutableReport
+{
+    public bool Valid { get; set; }
+    public string Machine { get; set; }
+    public string OptionalHeader { get; set; }
+    public string Subsystem { get; set; }
+    public string FailureCode { get; set; }
+}
+
 public sealed class WindowsHarnessRunResult
 {
     public int ExitCode { get; set; }
@@ -38,6 +47,15 @@ public sealed class WindowsHarnessRunResult
     public string StartExceptionKind { get; set; }
     public int? StartHResult { get; set; }
     public int? StartNativeErrorCode { get; set; }
+    public bool EnvironmentValidated { get; set; }
+    public bool NodeEnvironmentInputPresent { get; set; }
+    public int NodeEnvironmentInputLength { get; set; }
+    public bool NodeEnvironmentCopiedPresent { get; set; }
+    public bool NodeEnvironmentCopyEqual { get; set; }
+    public bool NpmEnvironmentInputPresent { get; set; }
+    public int NpmEnvironmentInputLength { get; set; }
+    public bool NpmEnvironmentCopiedPresent { get; set; }
+    public bool NpmEnvironmentCopyEqual { get; set; }
     public WindowsHarnessTokenReport Token { get; set; }
 }
 
@@ -124,6 +142,202 @@ public static class WindowsHarnessNative
         {
             return false;
         }
+    }
+
+    private static bool IsSafeEnvironment(IDictionary<string, string> environment)
+    {
+        if (environment == null) return false;
+        foreach (var entry in environment)
+        {
+            if (String.IsNullOrEmpty(entry.Key) || entry.Key.IndexOf('=') >= 0 ||
+                entry.Key.IndexOf('\0') >= 0 || entry.Value == null || entry.Value.IndexOf('\0') >= 0)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool TryGetEnvironmentValue(
+        IDictionary<string, string> environment,
+        string name,
+        out string value)
+    {
+        value = null;
+        return environment != null && environment.TryGetValue(name, out value);
+    }
+
+    private static void CaptureEnvironmentEvidence(
+        IDictionary<string, string> source,
+        IDictionary<string, string> copied,
+        WindowsHarnessRunResult result)
+    {
+        string nodeInput;
+        string nodeCopied;
+        string npmInput;
+        string npmCopied;
+        var nodeInputPresent = TryGetEnvironmentValue(source, "REVO_NODE_EXE", out nodeInput) &&
+            !String.IsNullOrWhiteSpace(nodeInput);
+        var nodeCopiedPresent = TryGetEnvironmentValue(copied, "REVO_NODE_EXE", out nodeCopied) &&
+            !String.IsNullOrWhiteSpace(nodeCopied);
+        var npmInputPresent = TryGetEnvironmentValue(source, "REVO_NPM_CMD", out npmInput) &&
+            !String.IsNullOrWhiteSpace(npmInput);
+        var npmCopiedPresent = TryGetEnvironmentValue(copied, "REVO_NPM_CMD", out npmCopied) &&
+            !String.IsNullOrWhiteSpace(npmCopied);
+
+        result.NodeEnvironmentInputPresent = nodeInputPresent;
+        result.NodeEnvironmentInputLength = nodeInput == null ? 0 : nodeInput.Length;
+        result.NodeEnvironmentCopiedPresent = nodeCopiedPresent;
+        result.NodeEnvironmentCopyEqual = nodeInputPresent && nodeCopiedPresent &&
+            String.Equals(nodeInput, nodeCopied, StringComparison.Ordinal);
+        result.NpmEnvironmentInputPresent = npmInputPresent;
+        result.NpmEnvironmentInputLength = npmInput == null ? 0 : npmInput.Length;
+        result.NpmEnvironmentCopiedPresent = npmCopiedPresent;
+        result.NpmEnvironmentCopyEqual = npmInputPresent && npmCopiedPresent &&
+            String.Equals(npmInput, npmCopied, StringComparison.Ordinal);
+
+        var allEntriesEqual = source != null && copied != null && source.Count == copied.Count;
+        if (allEntriesEqual)
+        {
+            foreach (var entry in source)
+            {
+                string copiedValue;
+                if (!TryGetEnvironmentValue(copied, entry.Key, out copiedValue) ||
+                    !String.Equals(entry.Value, copiedValue, StringComparison.Ordinal))
+                {
+                    allEntriesEqual = false;
+                    break;
+                }
+            }
+        }
+        result.EnvironmentValidated = IsSafeEnvironment(source) && allEntriesEqual &&
+            result.NodeEnvironmentCopyEqual && result.NpmEnvironmentCopyEqual;
+    }
+
+    public static WindowsHarnessExecutableReport InspectExecutable(string path)
+    {
+        var report = new WindowsHarnessExecutableReport
+        {
+            Valid = false,
+            Machine = "unknown",
+            OptionalHeader = "unknown",
+            Subsystem = "unknown",
+            FailureCode = "invalid-image",
+        };
+        if (String.IsNullOrWhiteSpace(path))
+        {
+            report.FailureCode = "path-missing";
+            return report;
+        }
+
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.Directory) != 0 ||
+                (attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                report.FailureCode = "path-unsafe";
+                return report;
+            }
+
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new BinaryReader(stream))
+            {
+                if (stream.Length < 64)
+                {
+                    report.FailureCode = "image-too-small";
+                    return report;
+                }
+                if (reader.ReadUInt16() != 0x5A4D)
+                {
+                    report.FailureCode = "dos-signature-invalid";
+                    return report;
+                }
+
+                stream.Position = 0x3c;
+                var peOffset = reader.ReadInt32();
+                if (peOffset < 64 || peOffset > stream.Length - 24)
+                {
+                    report.FailureCode = "pe-offset-invalid";
+                    return report;
+                }
+
+                stream.Position = peOffset;
+                if (reader.ReadUInt32() != 0x00004550)
+                {
+                    report.FailureCode = "pe-signature-invalid";
+                    return report;
+                }
+
+                var machine = reader.ReadUInt16();
+                stream.Position = (long)peOffset + 20;
+                var optionalHeaderSize = reader.ReadUInt16();
+                if (stream.Position + 2 > stream.Length)
+                {
+                    report.FailureCode = "optional-header-invalid";
+                    return report;
+                }
+
+                var optionalHeaderStart = peOffset + 24L;
+                if (optionalHeaderStart + optionalHeaderSize > stream.Length)
+                {
+                    report.FailureCode = "optional-header-truncated";
+                    return report;
+                }
+
+                stream.Position = optionalHeaderStart;
+                var optionalHeaderMagic = reader.ReadUInt16();
+                report.OptionalHeader = optionalHeaderMagic == 0x010b
+                    ? "pe32"
+                    : optionalHeaderMagic == 0x020b ? "pe32plus" : "other";
+                if (report.OptionalHeader == "other")
+                {
+                    report.FailureCode = "optional-header-magic-invalid";
+                    return report;
+                }
+                var minimumOptionalHeaderSize = optionalHeaderMagic == 0x010b ? 96 : 112;
+                if (optionalHeaderSize < minimumOptionalHeaderSize)
+                {
+                    report.FailureCode = "optional-header-invalid";
+                    return report;
+                }
+                if (((machine == 0x8664 || machine == 0xaa64) && optionalHeaderMagic != 0x020b) ||
+                    (machine == 0x014c && optionalHeaderMagic != 0x010b))
+                {
+                    report.FailureCode = "optional-header-machine-mismatch";
+                    return report;
+                }
+
+                stream.Position = optionalHeaderStart + 68;
+                var subsystem = reader.ReadUInt16();
+                report.Machine = machine == 0x8664 ? "amd64" : machine == 0x014c ? "x86" : machine == 0xaa64 ? "arm64" : "other";
+                report.Subsystem = subsystem == 2 ? "gui" : subsystem == 3 ? "console" : "other";
+                report.Valid = true;
+                report.FailureCode = "none";
+                return report;
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+            report.FailureCode = "access-denied";
+        }
+        catch (FileNotFoundException)
+        {
+            report.FailureCode = "file-not-found";
+        }
+        catch (DirectoryNotFoundException)
+        {
+            report.FailureCode = "directory-not-found";
+        }
+        catch (IOException)
+        {
+            report.FailureCode = "io-error";
+        }
+        catch (Exception)
+        {
+            report.FailureCode = "other";
+        }
+        return report;
     }
 
     public static void SetDirectorySecurity(string path, string ownerSid, string userRights)
@@ -301,9 +515,20 @@ public static class WindowsHarnessNative
                     CreateNoWindow = true,
                 };
                 start.Environment.Clear();
+                if (!IsSafeEnvironment(environment))
+                {
+                    result.FailureCode = "ENVIRONMENT_INPUT_INVALID";
+                    throw new InvalidOperationException("Harness environment input validation failed.");
+                }
                 foreach (var entry in environment)
                 {
                     start.Environment[entry.Key] = entry.Value;
+                }
+                CaptureEnvironmentEvidence(environment, start.Environment, result);
+                if (!result.EnvironmentValidated)
+                {
+                    result.FailureCode = "ENVIRONMENT_COPY_MISMATCH";
+                    throw new InvalidOperationException("Harness environment copy validation failed.");
                 }
                 foreach (var argument in arguments)
                 {

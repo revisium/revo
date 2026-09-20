@@ -56,6 +56,118 @@ function Get-PreflightExceptionDiagnostic([System.Management.Automation.ErrorRec
   return "category=$category errorKind=$(Get-PreflightErrorKind $Record) line=$line outerHResult=$outerHResult innerHResult=$innerHResult nativeError=$nativeErrorCode"
 }
 
+function Get-ExecutableOperandEvidence(
+  [object]$Value,
+  [object]$PowerShellEnvironmentValue,
+  [object]$ProcessEnvironmentValue
+) {
+  $valueKind = 'other'
+  if ($null -eq $Value) { $valueKind = 'null' }
+  elseif ($Value -is [string]) { $valueKind = 'string' }
+  elseif ($Value -is [array]) { $valueKind = 'array' }
+  $length = 0
+  $nonblank = $false
+  $fullyQualified = $false
+  $localDrive = $false
+  $hasControl = $false
+  $hasDoubleQuote = $false
+  $surroundingWhitespace = $false
+  $matchesPowerShellEnvironment = $false
+  $matchesProcessEnvironment = $false
+
+  if ($Value -is [string]) {
+    $length = $Value.Length
+    $nonblank = -not [string]::IsNullOrWhiteSpace($Value)
+    $surroundingWhitespace = $Value -cne $Value.Trim()
+    $hasDoubleQuote = $Value.Contains('"')
+    foreach ($character in $Value.ToCharArray()) {
+      if ([char]::IsControl($character)) { $hasControl = $true; break }
+    }
+    try { $fullyQualified = [IO.Path]::IsPathFullyQualified($Value) } catch {}
+    $localDrive = $Value -match '^[A-Za-z]:\\'
+    $matchesPowerShellEnvironment = $PowerShellEnvironmentValue -is [string] -and
+      [string]::Equals($Value, $PowerShellEnvironmentValue, [StringComparison]::Ordinal)
+    $matchesProcessEnvironment = $PowerShellEnvironmentValue -is [string] -and
+      $ProcessEnvironmentValue -is [string] -and
+      [string]::Equals($PowerShellEnvironmentValue, $ProcessEnvironmentValue, [StringComparison]::Ordinal)
+  }
+
+  return [pscustomobject]@{
+    ValueKind = $valueKind
+    Length = $length
+    Nonblank = $nonblank
+    FullyQualified = $fullyQualified
+    LocalDrive = $localDrive
+    HasControl = $hasControl
+    HasDoubleQuote = $hasDoubleQuote
+    SurroundingWhitespace = $surroundingWhitespace
+    MatchesPowerShellEnvironment = $matchesPowerShellEnvironment
+    MatchesProcessEnvironment = $matchesProcessEnvironment
+    Valid = $valueKind -eq 'string' -and $nonblank -and $fullyQualified -and $localDrive -and
+      -not $hasControl -and -not $hasDoubleQuote -and -not $surroundingWhitespace -and
+      $matchesPowerShellEnvironment -and $matchesProcessEnvironment
+  }
+}
+
+function Get-ExecutableFileFailure([System.Management.Automation.ErrorRecord]$Record) {
+  $exception = $Record.Exception
+  $level = 0
+  while ($null -ne $exception -and $level -lt 4) {
+    if ($exception -is [System.UnauthorizedAccessException]) { return 'access-denied' }
+    if ($exception -is [System.IO.FileNotFoundException] -or
+        $exception -is [System.Management.Automation.ItemNotFoundException]) { return 'file-not-found' }
+    if ($exception -is [System.IO.DirectoryNotFoundException]) { return 'directory-not-found' }
+    if ($exception -is [System.IO.IOException]) { return 'io-error' }
+    $exception = $exception.InnerException
+    $level++
+  }
+  return 'other'
+}
+
+function Get-ExecutableFileEvidence([string]$Path, [bool]$InspectPe) {
+  $regularFile = $false
+  $reparsePoint = $false
+  $readable = $false
+  $failure = 'none'
+  $peValid = $false
+  $peMachine = 'none'
+  $peFormat = 'none'
+  $peSubsystem = 'none'
+  $peFailure = 'none'
+  try {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $reparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    $regularFile = -not $item.PSIsContainer -and -not $reparsePoint
+    if (-not $regularFile) {
+      $failure = 'path-unsafe'
+    } else {
+      $file = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+      try { $readable = $true } finally { $file.Dispose() }
+      if ($InspectPe) {
+        $pe = [WindowsHarnessNative]::InspectExecutable($Path)
+        $peValid = $pe.Valid
+        $peMachine = $pe.Machine
+        $peFormat = $pe.OptionalHeader
+        $peSubsystem = $pe.Subsystem
+        $peFailure = $pe.FailureCode
+      }
+    }
+  } catch {
+    $failure = Get-ExecutableFileFailure $_
+  }
+  return [pscustomobject]@{
+    RegularFile = $regularFile
+    ReparsePoint = $reparsePoint
+    Readable = $readable
+    Failure = $failure
+    PeValid = $peValid
+    PeMachine = $peMachine
+    PeFormat = $peFormat
+    PeSubsystem = $peSubsystem
+    PeFailure = $peFailure
+  }
+}
+
 [Console]::WriteLine('RVW_HARNESS_READY')
 [Console]::Out.Flush()
 if ([Console]::ReadLine() -cne 'GO') {
@@ -117,8 +229,34 @@ try {
     Fail-Preflight 'source archive is missing the frozen lockfile'
   }
 
-  $node = $env:REVO_NODE_EXE
-  $npm = $env:REVO_NPM_CMD
+  $preflightStage = 'NODE_ENV_READ'
+  $nodeEnvironmentValue = $env:REVO_NODE_EXE
+  $nodeProcessEnvironmentValue = [Environment]::GetEnvironmentVariable('REVO_NODE_EXE', [EnvironmentVariableTarget]::Process)
+  $node = $nodeEnvironmentValue
+  $npmEnvironmentValue = $env:REVO_NPM_CMD
+  $npmProcessEnvironmentValue = [Environment]::GetEnvironmentVariable('REVO_NPM_CMD', [EnvironmentVariableTarget]::Process)
+  $npm = $npmEnvironmentValue
+  $preflightStage = 'NODE_OPERAND_VALIDATE'
+  $nodeOperand = Get-ExecutableOperandEvidence $node $nodeEnvironmentValue $nodeProcessEnvironmentValue
+  $npmOperand = Get-ExecutableOperandEvidence $npm $npmEnvironmentValue $npmProcessEnvironmentValue
+  Write-Output "WINDOWS_EXECUTABLE_CHILD name=node kind=$($nodeOperand.ValueKind) length=$($nodeOperand.Length) nonblank=$($nodeOperand.Nonblank.ToString().ToLowerInvariant()) fullyQualified=$($nodeOperand.FullyQualified.ToString().ToLowerInvariant()) localDrive=$($nodeOperand.LocalDrive.ToString().ToLowerInvariant()) hasControl=$($nodeOperand.HasControl.ToString().ToLowerInvariant()) hasDoubleQuote=$($nodeOperand.HasDoubleQuote.ToString().ToLowerInvariant()) surroundingWhitespace=$($nodeOperand.SurroundingWhitespace.ToString().ToLowerInvariant()) matchesPowerShellEnvironment=$($nodeOperand.MatchesPowerShellEnvironment.ToString().ToLowerInvariant()) matchesProcessEnvironment=$($nodeOperand.MatchesProcessEnvironment.ToString().ToLowerInvariant())"
+  Write-Output "WINDOWS_EXECUTABLE_CHILD name=npm kind=$($npmOperand.ValueKind) length=$($npmOperand.Length) nonblank=$($npmOperand.Nonblank.ToString().ToLowerInvariant()) fullyQualified=$($npmOperand.FullyQualified.ToString().ToLowerInvariant()) localDrive=$($npmOperand.LocalDrive.ToString().ToLowerInvariant()) hasControl=$($npmOperand.HasControl.ToString().ToLowerInvariant()) hasDoubleQuote=$($npmOperand.HasDoubleQuote.ToString().ToLowerInvariant()) surroundingWhitespace=$($npmOperand.SurroundingWhitespace.ToString().ToLowerInvariant()) matchesPowerShellEnvironment=$($npmOperand.MatchesPowerShellEnvironment.ToString().ToLowerInvariant()) matchesProcessEnvironment=$($npmOperand.MatchesProcessEnvironment.ToString().ToLowerInvariant())"
+  if (-not $nodeOperand.Valid -or -not $npmOperand.Valid) {
+    Fail-Preflight 'executable environment value failed validation'
+  }
+
+  $preflightStage = 'NODE_FILE_VALIDATE'
+  $nodeFile = Get-ExecutableFileEvidence $node $true
+  $npmFile = Get-ExecutableFileEvidence $npm $false
+  Write-Output "WINDOWS_EXECUTABLE_FILE name=node regularFile=$($nodeFile.RegularFile.ToString().ToLowerInvariant()) reparsePoint=$($nodeFile.ReparsePoint.ToString().ToLowerInvariant()) readable=$($nodeFile.Readable.ToString().ToLowerInvariant()) peValid=$($nodeFile.PeValid.ToString().ToLowerInvariant()) peMachine=$($nodeFile.PeMachine) peFormat=$($nodeFile.PeFormat) peSubsystem=$($nodeFile.PeSubsystem) peFailure=$($nodeFile.PeFailure) failure=$($nodeFile.Failure)"
+  Write-Output "WINDOWS_EXECUTABLE_FILE name=npm regularFile=$($npmFile.RegularFile.ToString().ToLowerInvariant()) reparsePoint=$($npmFile.ReparsePoint.ToString().ToLowerInvariant()) readable=$($npmFile.Readable.ToString().ToLowerInvariant()) failure=$($npmFile.Failure)"
+  if ($nodeFile.Failure -ne 'none' -or -not $nodeFile.RegularFile -or $nodeFile.ReparsePoint -or -not $nodeFile.Readable -or
+      -not $nodeFile.PeValid -or $nodeFile.PeMachine -ne 'amd64' -or $nodeFile.PeFormat -ne 'pe32plus' -or $nodeFile.PeSubsystem -ne 'console' -or
+      $npmFile.Failure -ne 'none' -or -not $npmFile.RegularFile -or $npmFile.ReparsePoint -or -not $npmFile.Readable) {
+    Fail-Preflight 'executable file failed validation'
+  }
+
+  $preflightStage = 'NODE_METADATA_VALIDATE'
   $expectedNodeVersion = $env:REVO_EXPECTED_NODE_VERSION
   $expectedNpmVersion = $env:REVO_EXPECTED_NPM_VERSION
   if ($expectedNodeVersion -notmatch '^v\d+\.\d+\.\d+$' -or
