@@ -12,6 +12,85 @@ function Fail-Preflight([string]$Message) {
   exit 90
 }
 
+function Write-NodeDirectProbeReceipt([object]$Probe) {
+  $exitCode = 'none'
+  if ($null -ne $Probe.ExitCode) { $exitCode = $Probe.ExitCode.ToString([Globalization.CultureInfo]::InvariantCulture) }
+  $startHResult = 'none'
+  if ($null -ne $Probe.StartHResult) { $startHResult = $Probe.StartHResult.ToString([Globalization.CultureInfo]::InvariantCulture) }
+  $startNativeError = 'none'
+  if ($null -ne $Probe.StartNativeErrorCode) { $startNativeError = $Probe.StartNativeErrorCode.ToString([Globalization.CultureInfo]::InvariantCulture) }
+  $exceptionHResult = 'none'
+  if ($null -ne $Probe.ExceptionHResult) { $exceptionHResult = $Probe.ExceptionHResult.ToString([Globalization.CultureInfo]::InvariantCulture) }
+  $exceptionNativeError = 'none'
+  if ($null -ne $Probe.ExceptionNativeErrorCode) { $exceptionNativeError = $Probe.ExceptionNativeErrorCode.ToString([Globalization.CultureInfo]::InvariantCulture) }
+  $killHResult = 'none'
+  if ($null -ne $Probe.KillHResult) { $killHResult = $Probe.KillHResult.ToString([Globalization.CultureInfo]::InvariantCulture) }
+  $killNativeError = 'none'
+  if ($null -ne $Probe.KillNativeErrorCode) { $killNativeError = $Probe.KillNativeErrorCode.ToString([Globalization.CultureInfo]::InvariantCulture) }
+  [Console]::Out.WriteLine("NODE_DIRECT_PROBE attempted=$($Probe.StartAttempted.ToString().ToLowerInvariant()) started=$($Probe.Started.ToString().ToLowerInvariant()) stage=$($Probe.Stage) failure=$($Probe.FailureCode) exitObserved=$($Probe.ExitObserved.ToString().ToLowerInvariant()) exitCode=$exitCode timedOut=$($Probe.TimedOut.ToString().ToLowerInvariant()) killAttempted=$($Probe.KillAttempted.ToString().ToLowerInvariant()) killRequestSucceeded=$($Probe.KillRequestSucceeded.ToString().ToLowerInvariant()) killFailure=$($Probe.KillFailureKind) killHResult=$killHResult killNativeError=$killNativeError stdoutBytes=$($Probe.StandardOutputBytes) stdoutTruncated=$($Probe.StandardOutputTruncated.ToString().ToLowerInvariant()) stdoutEof=$($Probe.StandardOutputEof.ToString().ToLowerInvariant()) stdoutReadFailure=$($Probe.StandardOutputReadFailureKind) stderrBytes=$($Probe.StandardErrorBytes) stderrTruncated=$($Probe.StandardErrorTruncated.ToString().ToLowerInvariant()) stderrEof=$($Probe.StandardErrorEof.ToString().ToLowerInvariant()) stderrReadFailure=$($Probe.StandardErrorReadFailureKind) stdinCloseFailure=$($Probe.StandardInputCloseFailureKind) disposeFailure=$($Probe.DisposeFailureKind) runtimeMatch=$($Probe.RuntimeMatch.ToString().ToLowerInvariant()) cleanupConfirmed=$($Probe.CleanupConfirmed.ToString().ToLowerInvariant()) cleanupFailure=$($Probe.CleanupFailureCode) exceptionPhase=$($Probe.ExceptionPhase) exceptionKind=$($Probe.ExceptionKind) exceptionHResult=$exceptionHResult exceptionNativeError=$exceptionNativeError startExceptionKind=$($Probe.StartExceptionKind) startHResult=$startHResult startNativeError=$startNativeError elapsedMs=$($Probe.ElapsedMilliseconds)")
+}
+
+function Assert-NodeRuntimeProbe(
+  [bool]$InvokeSucceeded,
+  [bool]$ExitPresent,
+  [string]$ExitType,
+  [AllowNull()][object]$ExitCode,
+  [AllowNull()][object[]]$Output,
+  [string]$Executable,
+  [string]$WorkingDirectory,
+  [string]$ExpectedRuntime,
+  [scriptblock]$DirectProbe
+) {
+  $outputMatches = $false
+  $runtimeInfo = ''
+  if ($null -ne $Output -and $Output.Count -eq 1) {
+    $runtimeInfo = [string]$Output[0]
+    $outputMatches = [string]::Equals($runtimeInfo, $ExpectedRuntime, [StringComparison]::Ordinal)
+  }
+  $exitMatches = $ExitPresent -and $ExitType -eq 'int32' -and $ExitCode -is [int32] -and $ExitCode -eq 0
+  if ($InvokeSucceeded -and $exitMatches -and $outputMatches) {
+    return $runtimeInfo
+  }
+
+  try {
+    if ($null -eq $DirectProbe) {
+      $DirectProbe = {
+        param($CandidateExecutable, $CandidateWorkingDirectory, $CandidateRuntime)
+        [WindowsHarnessNative]::ProbeNodeRuntimeDirect(
+          $CandidateExecutable,
+          $CandidateWorkingDirectory,
+          $CandidateRuntime
+        ).GetAwaiter().GetResult()
+      }
+    }
+    $probe = & $DirectProbe $Executable $WorkingDirectory $ExpectedRuntime
+    if ($null -eq $probe) { throw [InvalidOperationException]::new() }
+    Write-NodeDirectProbeReceipt $probe
+  } catch {
+    $exception = $_.Exception
+    $kind = 'other'
+    $hResult = 'none'
+    $nativeError = 'none'
+    try { $hResult = $exception.HResult.ToString([Globalization.CultureInfo]::InvariantCulture) } catch {}
+    if ($exception -is [System.ComponentModel.Win32Exception]) {
+      $kind = 'win32'
+      try { $nativeError = $exception.NativeErrorCode.ToString([Globalization.CultureInfo]::InvariantCulture) } catch {}
+    } elseif ($exception -is [UnauthorizedAccessException]) {
+      $kind = 'unauthorized-access'
+    } elseif ($exception -is [IO.IOException]) {
+      $kind = 'io-error'
+    } elseif ($exception -is [ArgumentException]) {
+      $kind = 'argument'
+    } elseif ($exception -is [InvalidOperationException]) {
+      $kind = 'invalid-operation'
+    } elseif ($exception -is [System.Security.SecurityException]) {
+      $kind = 'security'
+    }
+    [Console]::Out.WriteLine("NODE_DIRECT_PROBE attempted=true stage=diagnostic failure=diagnostic-unavailable exceptionPhase=diagnostic exceptionKind=$kind exceptionHResult=$hResult exceptionNativeError=$nativeError")
+  }
+  Fail-Preflight 'Node runtime probe failed'
+}
+
 function Get-PreflightErrorKind([System.Management.Automation.ErrorRecord]$Record) {
   $identifier = [string]$Record.FullyQualifiedErrorId
   if ($identifier -match 'VariableIsUndefined|VariableNotFound') { return 'variable-undefined' }
@@ -285,18 +364,18 @@ try {
   if ($nodeExitType -eq 'int32') {
     $loggedNodeExit = $nodeExit.ToString([Globalization.CultureInfo]::InvariantCulture)
   }
-  Write-Output "NODE_PROBE invokeSucceeded=$($nodeInvokeSucceeded.ToString().ToLowerInvariant()) exitPresent=$($nodeExitPresent.ToString().ToLowerInvariant()) exitType=$nodeExitType exitCode=$loggedNodeExit outputCount=$nodeOutputCount"
-  if (-not $nodeInvokeSucceeded -or
-      -not $nodeExitPresent -or
-      $nodeExitType -ne 'int32' -or
-      $nodeExit -ne 0 -or
-      $nodeOutputCount -ne 1) {
-    Fail-Preflight 'Node runtime probe failed'
-  }
-  $preflightStage = 'NODE_OUTPUT_COMPARE'
-  $nodeInfo = [string]$nodeOutput[0]
   $expectedNodeInfo = "$expectedNodeVersion|win32|x64"
-  if ($nodeInfo -ne $expectedNodeInfo) { Fail-Preflight 'unexpected Node runtime' }
+  Write-Output "NODE_PROBE invokeSucceeded=$($nodeInvokeSucceeded.ToString().ToLowerInvariant()) exitPresent=$($nodeExitPresent.ToString().ToLowerInvariant()) exitType=$nodeExitType exitCode=$loggedNodeExit outputCount=$nodeOutputCount"
+  $preflightStage = 'NODE_OUTPUT_COMPARE'
+  $nodeInfo = Assert-NodeRuntimeProbe `
+    -InvokeSucceeded $nodeInvokeSucceeded `
+    -ExitPresent $nodeExitPresent `
+    -ExitType $nodeExitType `
+    -ExitCode $nodeExit `
+    -Output $nodeOutput `
+    -Executable $node `
+    -WorkingDirectory (Get-Location).ProviderPath `
+    -ExpectedRuntime $expectedNodeInfo
   Write-Output 'NODE_RUNTIME versionMatch=true platformMatch=true archMatch=true exit=0'
 
   $preflightStage = 'NPM_INVOKE'

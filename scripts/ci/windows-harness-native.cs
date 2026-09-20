@@ -31,6 +31,128 @@ public sealed class WindowsHarnessExecutableReport
     public string FailureCode { get; set; }
 }
 
+internal sealed class WindowsHarnessNodeProbeState
+{
+    public bool StartAttempted { get; set; }
+    public bool Started { get; set; }
+    public string Stage { get; set; } = "input-validation";
+    public string FailureCode { get; set; } = "none";
+    public string StartExceptionKind { get; set; } = "none";
+    public int? StartHResult { get; set; }
+    public int? StartNativeErrorCode { get; set; }
+    public string ExceptionPhase { get; set; } = "none";
+    public string ExceptionKind { get; set; } = "none";
+    public int? ExceptionHResult { get; set; }
+    public int? ExceptionNativeErrorCode { get; set; }
+    public int? ExitCode { get; set; }
+    public bool ExitObserved { get; set; }
+    public bool TimedOut { get; set; }
+    public bool KillAttempted { get; set; }
+    public bool KillRequestSucceeded { get; set; }
+    public string KillFailureKind { get; set; } = "none";
+    public int? KillHResult { get; set; }
+    public int? KillNativeErrorCode { get; set; }
+    public long StandardOutputBytes { get; set; }
+    public bool StandardOutputTruncated { get; set; }
+    public bool StandardOutputEof { get; set; }
+    public string StandardOutputReadFailureKind { get; set; } = "none";
+    public long StandardErrorBytes { get; set; }
+    public bool StandardErrorTruncated { get; set; }
+    public bool StandardErrorEof { get; set; }
+    public string StandardErrorReadFailureKind { get; set; } = "none";
+    public string StandardInputCloseFailureKind { get; set; } = "none";
+    public string DisposeFailureKind { get; set; } = "none";
+    public bool RuntimeMatch { get; set; }
+    public bool CleanupConfirmed
+    {
+        get
+        {
+            return ExitObserved &&
+                StandardOutputEof && StandardErrorEof &&
+                StandardOutputReadFailureKind == "none" &&
+                StandardErrorReadFailureKind == "none" &&
+                DisposeFailureKind == "none" &&
+                CleanupFailureCode == "none";
+        }
+    }
+    public string CleanupFailureCode { get; set; } = "none";
+    public long ElapsedMilliseconds { get; set; }
+}
+
+public sealed class WindowsHarnessNodeProbeReport
+{
+    internal WindowsHarnessNodeProbeReport(WindowsHarnessNodeProbeState state)
+    {
+        StartAttempted = state.StartAttempted;
+        Started = state.Started;
+        Stage = state.Stage;
+        FailureCode = state.FailureCode;
+        StartExceptionKind = state.StartExceptionKind;
+        StartHResult = state.StartHResult;
+        StartNativeErrorCode = state.StartNativeErrorCode;
+        ExceptionPhase = state.ExceptionPhase;
+        ExceptionKind = state.ExceptionKind;
+        ExceptionHResult = state.ExceptionHResult;
+        ExceptionNativeErrorCode = state.ExceptionNativeErrorCode;
+        ExitCode = state.ExitCode;
+        ExitObserved = state.ExitObserved;
+        TimedOut = state.TimedOut;
+        KillAttempted = state.KillAttempted;
+        KillRequestSucceeded = state.KillRequestSucceeded;
+        KillFailureKind = state.KillFailureKind;
+        KillHResult = state.KillHResult;
+        KillNativeErrorCode = state.KillNativeErrorCode;
+        StandardOutputBytes = state.StandardOutputBytes;
+        StandardOutputTruncated = state.StandardOutputTruncated;
+        StandardOutputEof = state.StandardOutputEof;
+        StandardOutputReadFailureKind = state.StandardOutputReadFailureKind;
+        StandardErrorBytes = state.StandardErrorBytes;
+        StandardErrorTruncated = state.StandardErrorTruncated;
+        StandardErrorEof = state.StandardErrorEof;
+        StandardErrorReadFailureKind = state.StandardErrorReadFailureKind;
+        StandardInputCloseFailureKind = state.StandardInputCloseFailureKind;
+        DisposeFailureKind = state.DisposeFailureKind;
+        RuntimeMatch = state.RuntimeMatch;
+        CleanupConfirmed = state.CleanupConfirmed;
+        CleanupFailureCode = state.CleanupFailureCode;
+        ElapsedMilliseconds = state.ElapsedMilliseconds;
+    }
+
+    public bool StartAttempted { get; }
+    public bool Started { get; }
+    public string Stage { get; }
+    public string FailureCode { get; }
+    public string StartExceptionKind { get; }
+    public int? StartHResult { get; }
+    public int? StartNativeErrorCode { get; }
+    public string ExceptionPhase { get; }
+    public string ExceptionKind { get; }
+    public int? ExceptionHResult { get; }
+    public int? ExceptionNativeErrorCode { get; }
+    public int? ExitCode { get; }
+    public bool ExitObserved { get; }
+    public bool TimedOut { get; }
+    public bool KillAttempted { get; }
+    public bool KillRequestSucceeded { get; }
+    public string KillFailureKind { get; }
+    public int? KillHResult { get; }
+    public int? KillNativeErrorCode { get; }
+    public long StandardOutputBytes { get; }
+    public bool StandardOutputTruncated { get; }
+    public bool StandardOutputEof { get; }
+    public string StandardOutputReadFailureKind { get; }
+    public long StandardErrorBytes { get; }
+    public bool StandardErrorTruncated { get; }
+    public bool StandardErrorEof { get; }
+    public string StandardErrorReadFailureKind { get; }
+    public string StandardInputCloseFailureKind { get; }
+    public string DisposeFailureKind { get; }
+    public bool RuntimeMatch { get; }
+    public bool CleanupConfirmed { get; }
+    public string CleanupFailureCode { get; }
+    public long ElapsedMilliseconds { get; }
+}
+
 public sealed class WindowsHarnessRunResult
 {
     public int ExitCode { get; set; }
@@ -77,6 +199,9 @@ public static class WindowsHarnessNative
     private const string MediumIntegritySid = "S-1-16-8192";
     private const int TokenElevationTypeDefault = 1;
     private const int MaxCapturedCharacters = 262144;
+    private const int NodeProbeExecutionTimeoutMilliseconds = 10000;
+    private const int NodeProbeCleanupTimeoutMilliseconds = 5000;
+    private const int NodeProbeCaptureLimitBytes = 4096;
     private const int ProfilePathBufferChars = 260;
     private const uint SePrivilegeEnabled = 0x00000002;
     private const int ErrorNotAllAssigned = 1300;
@@ -90,6 +215,418 @@ public static class WindowsHarnessNative
         if (exception is PlatformNotSupportedException || exception is NotSupportedException)
             return "not-supported";
         if (exception is UnauthorizedAccessException) return "unauthorized-access";
+        if (exception is System.Security.SecurityException) return "security";
+        return "other";
+    }
+
+    public static async Task<WindowsHarnessNodeProbeReport> ProbeNodeRuntimeDirect(
+        string executable,
+        string workingDirectory,
+        string expectedRuntime)
+    {
+        var state = new WindowsHarnessNodeProbeState();
+        var stopwatch = Stopwatch.StartNew();
+        if (String.IsNullOrWhiteSpace(executable) || !Path.IsPathFullyQualified(executable) ||
+            String.IsNullOrWhiteSpace(workingDirectory) || !Path.IsPathFullyQualified(workingDirectory) ||
+            String.IsNullOrEmpty(expectedRuntime) || expectedRuntime.Length > 128 ||
+            expectedRuntime.IndexOf('\0') >= 0)
+        {
+            state.FailureCode = "input-invalid";
+            state.ElapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+            return new WindowsHarnessNodeProbeReport(state);
+        }
+
+        Process process = null;
+        NodeProbeCapture output = null;
+        NodeProbeCapture error = null;
+        Task outputTask = null;
+        Task errorTask = null;
+        Task<NodeProbeExitResult> exitTask = null;
+        var processStarted = false;
+        try
+        {
+            state.Stage = "setup";
+            var start = new ProcessStartInfo
+            {
+                FileName = executable,
+                UseShellExecute = false,
+                WorkingDirectory = workingDirectory,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            start.ArgumentList.Add("-p");
+            start.ArgumentList.Add("process.version + '|' + process.platform + '|' + process.arch");
+            process = new Process { StartInfo = start };
+            state.Stage = "start";
+            state.StartAttempted = true;
+            try
+            {
+                processStarted = process.Start();
+                state.Started = processStarted;
+                if (!processStarted) state.FailureCode = "start-returned-false";
+            }
+            catch (Exception exception)
+            {
+                state.FailureCode = "start-exception";
+                var evidence = CreateNodeProbeExceptionEvidence("start", exception);
+                RecordNodeProbeException(state, evidence);
+                state.StartExceptionKind = evidence.Kind;
+                state.StartHResult = evidence.HResult;
+                if (exception is Win32Exception win32Exception)
+                {
+                    state.StartNativeErrorCode = win32Exception.NativeErrorCode;
+                }
+            }
+
+            if (processStarted)
+            {
+                var executionDeadline = Environment.TickCount64 + NodeProbeExecutionTimeoutMilliseconds;
+                output = new NodeProbeCapture(NodeProbeCaptureLimitBytes, "stdout-read");
+                error = new NodeProbeCapture(NodeProbeCaptureLimitBytes, "stderr-read");
+                try
+                {
+                    state.Stage = "stdout-read";
+                    outputTask = CaptureNodeProbeStreamAsync(process.StandardOutput.BaseStream, output);
+                    state.Stage = "stderr-read";
+                    errorTask = CaptureNodeProbeStreamAsync(process.StandardError.BaseStream, error);
+                }
+                catch (Exception exception)
+                {
+                    RecordNodeProbeException(state, CreateNodeProbeExceptionEvidence("setup", exception));
+                    if (state.FailureCode == "none") state.FailureCode = "probe-setup-failed";
+                }
+                try
+                {
+                    state.Stage = "exit-observation";
+                    exitTask = ObserveNodeProbeExitAsync(process);
+                }
+                catch (Exception exception)
+                {
+                    RecordNodeProbeException(state, CreateNodeProbeExceptionEvidence("exit-observation", exception));
+                    if (state.FailureCode == "none") state.FailureCode = "exit-observation-failed";
+                }
+
+                state.Stage = "stdin-close";
+                try
+                {
+                    process.StandardInput.Close();
+                }
+                catch (Exception exception)
+                {
+                    var evidence = CreateNodeProbeExceptionEvidence("stdin-close", exception);
+                    state.StandardInputCloseFailureKind = evidence.Kind;
+                    RecordNodeProbeException(state, evidence);
+                    if (state.FailureCode == "none") state.FailureCode = "stdin-close-failed";
+                }
+
+                if (state.FailureCode == "none" && exitTask != null)
+                {
+                    state.Stage = "execution-wait";
+                    if (!await WaitForNodeProbeTaskUntilAsync(exitTask, executionDeadline).ConfigureAwait(false))
+                    {
+                        state.TimedOut = true;
+                        state.FailureCode = "execution-timeout";
+                        TryKillNodeProbe(process, state);
+                    }
+                }
+                else if (exitTask == null || !exitTask.IsCompleted)
+                {
+                    TryKillNodeProbe(process, state);
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            RecordNodeProbeException(state, CreateNodeProbeExceptionEvidence("supervisor", exception));
+            if (state.FailureCode == "none") state.FailureCode = "probe-exception";
+            if (process != null && processStarted)
+            {
+                TryKillNodeProbe(process, state);
+            }
+        }
+        finally
+        {
+            if (processStarted && process != null)
+            {
+                state.Stage = state.FailureCode == "none" ? "cleanup-wait" : state.Stage;
+                var cleanupDeadline = Environment.TickCount64 + NodeProbeCleanupTimeoutMilliseconds;
+                if (exitTask == null)
+                {
+                    try
+                    {
+                        exitTask = ObserveNodeProbeExitAsync(process);
+                    }
+                    catch (Exception exception)
+                    {
+                        RecordNodeProbeException(state, CreateNodeProbeExceptionEvidence("exit-observation", exception));
+                    }
+                }
+                if (exitTask == null || !exitTask.IsCompleted)
+                {
+                    TryKillNodeProbe(process, state);
+                }
+
+                var activeTasks = new List<Task>();
+                if (exitTask != null) activeTasks.Add(exitTask);
+                if (outputTask != null) activeTasks.Add(outputTask);
+                if (errorTask != null) activeTasks.Add(errorTask);
+                var cleanupTask = Task.WhenAll(activeTasks);
+                if (activeTasks.Count > 0 &&
+                    !await WaitForNodeProbeTaskUntilAsync(cleanupTask, cleanupDeadline).ConfigureAwait(false))
+                {
+                    SetNodeProbeCleanupFailure(state, "cleanup-deadline-exceeded");
+                    CloseNodeProbeReadStreams(process, state);
+                }
+
+                if (exitTask != null && exitTask.IsCompleted)
+                {
+                    var exitResult = await exitTask.ConfigureAwait(false);
+                    state.ExitObserved = exitResult.ExitObserved;
+                    state.ExitCode = exitResult.ExitCode;
+                    if (exitResult.Exception != null)
+                    {
+                        RecordNodeProbeException(state, exitResult.Exception);
+                        if (state.FailureCode == "none") state.FailureCode = "exit-observation-failed";
+                    }
+                }
+                else
+                {
+                    TryObserveNodeProbeExit(process, state);
+                }
+
+            }
+
+            if (process != null)
+            {
+                try
+                {
+                    process.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    var evidence = CreateNodeProbeExceptionEvidence("dispose", exception);
+                    state.DisposeFailureKind = evidence.Kind;
+                    RecordNodeProbeException(state, evidence);
+                    SetNodeProbeCleanupFailure(state, "process-dispose-failed");
+                }
+            }
+
+            if (processStarted)
+            {
+                var outputSnapshot = output == null ? null : output.Snapshot();
+                var errorSnapshot = error == null ? null : error.Snapshot();
+                ApplyNodeProbeCapture(state, outputSnapshot, true, expectedRuntime);
+                ApplyNodeProbeCapture(state, errorSnapshot, false, expectedRuntime);
+                if (!state.ExitObserved) SetNodeProbeCleanupFailure(state, "root-exit-unconfirmed");
+                if (!state.StandardOutputEof) SetNodeProbeCleanupFailure(state, "stdout-eof-unconfirmed");
+                if (!state.StandardErrorEof) SetNodeProbeCleanupFailure(state, "stderr-eof-unconfirmed");
+                if (state.StandardOutputReadFailureKind != "none") SetNodeProbeCleanupFailure(state, "stdout-read-failed");
+                if (state.StandardErrorReadFailureKind != "none") SetNodeProbeCleanupFailure(state, "stderr-read-failed");
+            }
+
+            state.ElapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+        }
+
+        if (state.FailureCode == "none")
+        {
+            if (!state.CleanupConfirmed)
+            {
+                state.Stage = "cleanup-wait";
+                state.FailureCode = "cleanup-unconfirmed";
+            }
+            else if (!state.ExitCode.HasValue || state.ExitCode.Value != 0)
+            {
+                state.FailureCode = "exit-nonzero";
+            }
+            else if (!state.RuntimeMatch || state.StandardOutputTruncated)
+            {
+                state.FailureCode = "runtime-output-mismatch";
+            }
+            else if (state.StandardErrorBytes != 0 || state.StandardErrorTruncated)
+            {
+                state.FailureCode = "unexpected-stderr";
+            }
+            else
+            {
+                state.Stage = "complete";
+            }
+        }
+
+        return new WindowsHarnessNodeProbeReport(state);
+    }
+
+    private static async Task CaptureNodeProbeStreamAsync(Stream stream, NodeProbeCapture capture)
+    {
+        try
+        {
+            var buffer = new byte[8192];
+            while (true)
+            {
+                var count = await stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+                if (count == 0)
+                {
+                    capture.MarkEof();
+                    return;
+                }
+                capture.Append(buffer, count);
+            }
+        }
+        catch (Exception exception)
+        {
+            capture.RecordFailure(CreateNodeProbeExceptionEvidence(capture.FailurePhase, exception));
+        }
+    }
+
+    private static async Task<NodeProbeExitResult> ObserveNodeProbeExitAsync(Process process)
+    {
+        try
+        {
+            await process.WaitForExitAsync().ConfigureAwait(false);
+            return new NodeProbeExitResult(true, process.ExitCode, null);
+        }
+        catch (Exception exception)
+        {
+            return new NodeProbeExitResult(false, null, CreateNodeProbeExceptionEvidence("exit-observation", exception));
+        }
+    }
+
+    private static async Task<bool> WaitForNodeProbeTaskUntilAsync(Task task, long deadline)
+    {
+        if (task.IsCompleted) return true;
+        var remaining = deadline - Environment.TickCount64;
+        if (remaining <= 0) return task.IsCompleted;
+        var delay = Task.Delay((int)Math.Min(Int32.MaxValue, remaining));
+        return await Task.WhenAny(task, delay).ConfigureAwait(false) == task && task.IsCompleted;
+    }
+
+    private static void TryKillNodeProbe(Process process, WindowsHarnessNodeProbeState state)
+    {
+        if (state.KillAttempted) return;
+        state.KillAttempted = true;
+        try
+        {
+            process.Kill();
+            state.KillRequestSucceeded = true;
+        }
+        catch (Exception exception)
+        {
+            var evidence = CreateNodeProbeExceptionEvidence("kill", exception);
+            state.KillFailureKind = evidence.Kind;
+            state.KillHResult = evidence.HResult;
+            state.KillNativeErrorCode = evidence.NativeErrorCode;
+        }
+    }
+
+    private static void CloseNodeProbeReadStreams(Process process, WindowsHarnessNodeProbeState state)
+    {
+        try
+        {
+            process.StandardOutput.BaseStream.Dispose();
+        }
+        catch (Exception exception)
+        {
+            var evidence = CreateNodeProbeExceptionEvidence("dispose", exception);
+            state.DisposeFailureKind = evidence.Kind;
+            RecordNodeProbeException(state, evidence);
+        }
+        try
+        {
+            process.StandardError.BaseStream.Dispose();
+        }
+        catch (Exception exception)
+        {
+            var evidence = CreateNodeProbeExceptionEvidence("dispose", exception);
+            if (state.DisposeFailureKind == "none") state.DisposeFailureKind = evidence.Kind;
+            RecordNodeProbeException(state, evidence);
+        }
+    }
+
+    private static void TryObserveNodeProbeExit(Process process, WindowsHarnessNodeProbeState state)
+    {
+        try
+        {
+            if (process.HasExited)
+            {
+                state.ExitCode = process.ExitCode;
+                state.ExitObserved = true;
+            }
+        }
+        catch (Exception exception)
+        {
+            RecordNodeProbeException(state, CreateNodeProbeExceptionEvidence("exit-observation", exception));
+        }
+    }
+
+    private static void ApplyNodeProbeCapture(
+        WindowsHarnessNodeProbeState state,
+        NodeProbeCaptureSnapshot snapshot,
+        bool standardOutput,
+        string expectedRuntime)
+    {
+        if (snapshot == null) return;
+        if (standardOutput)
+        {
+            state.StandardOutputBytes = snapshot.TotalBytes;
+            state.StandardOutputTruncated = snapshot.Truncated;
+            state.StandardOutputEof = snapshot.Eof;
+            state.StandardOutputReadFailureKind = snapshot.ReadFailureKind;
+            state.RuntimeMatch = snapshot.MatchesExpectedRuntime(expectedRuntime);
+        }
+        else
+        {
+            state.StandardErrorBytes = snapshot.TotalBytes;
+            state.StandardErrorTruncated = snapshot.Truncated;
+            state.StandardErrorEof = snapshot.Eof;
+            state.StandardErrorReadFailureKind = snapshot.ReadFailureKind;
+        }
+        if (snapshot.Exception != null)
+        {
+            RecordNodeProbeException(state, snapshot.Exception);
+        }
+    }
+
+    private static void RecordNodeProbeException(
+        WindowsHarnessNodeProbeState state,
+        NodeProbeExceptionEvidence evidence)
+    {
+        if (evidence == null || state.ExceptionPhase != "none") return;
+        state.ExceptionPhase = evidence.Phase;
+        state.ExceptionKind = evidence.Kind;
+        state.ExceptionHResult = evidence.HResult;
+        state.ExceptionNativeErrorCode = evidence.NativeErrorCode;
+    }
+
+    private static void SetNodeProbeCleanupFailure(WindowsHarnessNodeProbeState state, string code)
+    {
+        if (state.CleanupFailureCode == "none") state.CleanupFailureCode = code;
+    }
+
+    private static NodeProbeExceptionEvidence CreateNodeProbeExceptionEvidence(
+        string phase,
+        Exception exception)
+    {
+        var nativeErrorCode = exception is Win32Exception win32Exception
+            ? (int?)win32Exception.NativeErrorCode
+            : null;
+        return new NodeProbeExceptionEvidence(
+            phase,
+            ClassifyProbeException(exception),
+            exception.HResult,
+            nativeErrorCode);
+    }
+
+    private static string ClassifyProbeException(Exception exception)
+    {
+        if (exception is Win32Exception) return "win32";
+        if (exception is UnauthorizedAccessException) return "unauthorized-access";
+        if (exception is IOException) return "io-error";
+        if (exception is ObjectDisposedException) return "object-disposed";
+        if (exception is ArgumentException) return "argument";
+        if (exception is InvalidOperationException) return "invalid-operation";
+        if (exception is PlatformNotSupportedException || exception is NotSupportedException)
+            return "not-supported";
         if (exception is System.Security.SecurityException) return "security";
         return "other";
     }
@@ -1195,6 +1732,159 @@ public static class WindowsHarnessNative
     private static void RecordCleanupFailure(WindowsHarnessRunResult result, string code)
     {
         if (result.CleanupFailureCode == null) result.CleanupFailureCode = code;
+    }
+
+    private sealed class NodeProbeExceptionEvidence
+    {
+        public NodeProbeExceptionEvidence(string phase, string kind, int? hResult, int? nativeErrorCode)
+        {
+            Phase = phase;
+            Kind = kind;
+            HResult = hResult;
+            NativeErrorCode = nativeErrorCode;
+        }
+
+        public string Phase { get; }
+        public string Kind { get; }
+        public int? HResult { get; }
+        public int? NativeErrorCode { get; }
+    }
+
+    private sealed class NodeProbeExitResult
+    {
+        public NodeProbeExitResult(bool exitObserved, int? exitCode, NodeProbeExceptionEvidence exception)
+        {
+            ExitObserved = exitObserved;
+            ExitCode = exitCode;
+            Exception = exception;
+        }
+
+        public bool ExitObserved { get; }
+        public int? ExitCode { get; }
+        public NodeProbeExceptionEvidence Exception { get; }
+    }
+
+    private sealed class NodeProbeCaptureSnapshot
+    {
+        private readonly byte[] captured;
+        private readonly int stored;
+
+        public NodeProbeCaptureSnapshot(
+            long totalBytes,
+            byte[] captured,
+            int stored,
+            bool eof,
+            string readFailureKind,
+            NodeProbeExceptionEvidence exception)
+        {
+            TotalBytes = totalBytes;
+            this.captured = captured;
+            this.stored = stored;
+            Eof = eof;
+            ReadFailureKind = readFailureKind;
+            Exception = exception;
+        }
+
+        public long TotalBytes { get; }
+        public bool Truncated { get { return TotalBytes > stored; } }
+        public bool Eof { get; }
+        public string ReadFailureKind { get; }
+        public NodeProbeExceptionEvidence Exception { get; }
+
+        public bool MatchesExpectedRuntime(string expectedRuntime)
+        {
+            if (!Eof || ReadFailureKind != "none" || Truncated || stored != TotalBytes) return false;
+            var expected = Encoding.ASCII.GetBytes(expectedRuntime);
+            var contentLength = stored;
+            if (contentLength == expected.Length + 2 &&
+                captured[contentLength - 2] == (byte)'\r' &&
+                captured[contentLength - 1] == (byte)'\n')
+            {
+                contentLength -= 2;
+            }
+            else if (contentLength == expected.Length + 1 &&
+                     captured[contentLength - 1] == (byte)'\n')
+            {
+                contentLength--;
+            }
+            else
+            {
+                return false;
+            }
+            if (contentLength != expected.Length) return false;
+            for (var index = 0; index < expected.Length; index++)
+            {
+                if (captured[index] != expected[index]) return false;
+            }
+            return true;
+        }
+    }
+
+    private sealed class NodeProbeCapture
+    {
+        private readonly byte[] captured;
+        private readonly object gate = new object();
+        private int stored;
+        private long totalBytes;
+        private bool eof;
+        private string readFailureKind = "none";
+        private NodeProbeExceptionEvidence exception;
+
+        public NodeProbeCapture(int captureLimitBytes, string failurePhase)
+        {
+            captured = new byte[captureLimitBytes];
+            FailurePhase = failurePhase;
+        }
+
+        public string FailurePhase { get; }
+
+        public void Append(byte[] buffer, int count)
+        {
+            if (count < 0 || count > buffer.Length) throw new ArgumentOutOfRangeException("count");
+            lock (gate)
+            {
+                totalBytes = totalBytes > Int64.MaxValue - count
+                    ? Int64.MaxValue
+                    : totalBytes + count;
+                var copyCount = Math.Min(captured.Length - stored, count);
+                if (copyCount > 0)
+                {
+                    Array.Copy(buffer, 0, captured, stored, copyCount);
+                    stored += copyCount;
+                }
+            }
+        }
+
+        public void MarkEof()
+        {
+            lock (gate) eof = true;
+        }
+
+        public void RecordFailure(NodeProbeExceptionEvidence evidence)
+        {
+            lock (gate)
+            {
+                if (exception != null) return;
+                exception = evidence;
+                readFailureKind = evidence.Kind;
+            }
+        }
+
+        public NodeProbeCaptureSnapshot Snapshot()
+        {
+            lock (gate)
+            {
+                var copy = new byte[stored];
+                Array.Copy(captured, copy, stored);
+                return new NodeProbeCaptureSnapshot(
+                    totalBytes,
+                    copy,
+                    stored,
+                    eof,
+                    readFailureKind,
+                    exception);
+            }
+        }
     }
 
     private sealed class BoundedCapture
