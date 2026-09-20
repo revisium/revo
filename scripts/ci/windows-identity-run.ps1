@@ -18,14 +18,17 @@ if ([Console]::ReadLine() -cne 'GO') {
   Fail-Preflight 'parent did not authorize fixture execution'
 }
 
+$preflightStage = 'NATIVE_HELPER'
 try {
   $helper = Join-Path (Split-Path -Parent $PSCommandPath) 'windows-harness-native.cs'
   Add-Type -Path $helper -ErrorAction Stop
+  $preflightStage = 'PROCESS_IDENTITY'
   $expectedSid = $env:REVO_EXPECTED_SID
   $identity = [WindowsHarnessNative]::InspectProcess($PID)
   $identityFailure = [WindowsHarnessNative]::ValidateStandardUser($identity, $expectedSid)
   if ($identityFailure) { Fail-Preflight $identityFailure }
 
+  $preflightStage = 'PROFILE'
   $expectedProfile = $env:REVO_EXPECTED_PROFILE
   if (-not [WindowsHarnessNative]::ProfilePathsEqual($identity.ProfilePath, $expectedProfile)) {
     Fail-Preflight 'Token profile does not equal the independently created profile anchor'
@@ -34,6 +37,7 @@ try {
     Fail-Preflight 'USERPROFILE does not equal the independently created profile anchor'
   }
 
+  $preflightStage = 'FIXTURE_DIRECTORIES'
   $workspace = [IO.Path]::GetFullPath($env:REVO_WORKSPACE)
   $tempDirectory = [IO.Path]::GetFullPath($env:TEMP)
   $store = [IO.Path]::GetFullPath($env:REVO_PNPM_STORE)
@@ -57,6 +61,7 @@ try {
     [IO.File]::Delete($probePath)
   }
 
+  $preflightStage = 'SOURCE_ARCHIVE'
   $sourceArchive = $env:REVO_SOURCE_ARCHIVE
   $actualArchiveHash = (Get-FileHash -LiteralPath $sourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($actualArchiveHash -ne $env:REVO_ARCHIVE_SHA) { Fail-Preflight 'source archive checksum mismatch' }
@@ -76,7 +81,9 @@ try {
       $expectedNpmVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
     Fail-Preflight 'invalid tool-cache runtime metadata'
   }
+  $preflightStage = 'NODE_INVOKE'
   $nodeOutput = @(& $node -p "process.version + '|' + process.platform + '|' + process.arch" 2>$null)
+  $preflightStage = 'NODE_RESULT'
   $nodeExit = $LASTEXITCODE
   if ($nodeExit -ne 0 -or $nodeOutput.Count -ne 1) { Fail-Preflight 'Node runtime probe failed' }
   $nodeInfo = [string]$nodeOutput[0]
@@ -84,7 +91,9 @@ try {
   if ($nodeInfo -ne $expectedNodeInfo) { Fail-Preflight 'unexpected Node runtime' }
   Write-Output 'NODE_RUNTIME versionMatch=true platformMatch=true archMatch=true exit=0'
 
+  $preflightStage = 'NPM_INVOKE'
   $npmOutput = @(& $npm --version 2>$null)
+  $preflightStage = 'NPM_RESULT'
   $npmExit = $LASTEXITCODE
   if ($npmExit -ne 0 -or $npmOutput.Count -ne 1) { Fail-Preflight 'npm runtime probe failed' }
   $npmVersion = [string]$npmOutput[0]
@@ -97,6 +106,7 @@ try {
   $pnpmCli = Join-Path $pnpmPrefix 'node_modules/pnpm/bin/pnpm.cjs'
   $pnpmStore = $env:REVO_PNPM_STORE
   $npmCache = $env:NPM_CONFIG_CACHE
+  $preflightStage = 'PNPM_SETUP'
   Push-Location $workspace
   try {
     & $npm install --global --prefix $pnpmPrefix --cache $npmCache --no-audit --no-fund 'pnpm@12.4.1'
@@ -129,6 +139,15 @@ try {
     Pop-Location
   }
 } catch {
-  [Console]::Error.WriteLine('WINDOWS_IDENTITY_PREFLIGHT_FAILED: code=PREFLIGHT_EXCEPTION')
+  $nativeErrorCode = 'none'
+  $exception = $_.Exception
+  while ($null -ne $exception) {
+    if ($exception -is [System.ComponentModel.Win32Exception]) {
+      $nativeErrorCode = $exception.NativeErrorCode.ToString([Globalization.CultureInfo]::InvariantCulture)
+      break
+    }
+    $exception = $exception.InnerException
+  }
+  [Console]::Error.WriteLine("WINDOWS_IDENTITY_PREFLIGHT_FAILED: code=PREFLIGHT_EXCEPTION stage=$preflightStage nativeError=$nativeErrorCode")
   exit 90
 }

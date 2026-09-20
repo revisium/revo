@@ -183,6 +183,177 @@ function Get-DirectoryOwnerSid([string]$Path) {
   return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 }
 
+function Get-FixtureProcessScanState([string]$ExpectedSid) {
+  try {
+    if ([string]::IsNullOrWhiteSpace($ExpectedSid)) {
+      return 'unknown'
+    }
+    if ($IsWindows) {
+      try {
+        $ExpectedSid = [System.Security.Principal.SecurityIdentifier]::new($ExpectedSid).Value
+      } catch {
+        return 'unknown'
+      }
+    } elseif ($ExpectedSid -notmatch '^S-1-\d+(?:-\d+){1,15}$') {
+      return 'unknown'
+    }
+
+    $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    foreach ($process in $processes) {
+      if ($null -eq $process) {
+        return 'unknown'
+      }
+      $ownerResults = @(Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop)
+      if ($ownerResults.Count -ne 1 -or $null -eq $ownerResults[0]) {
+        return 'unknown'
+      }
+      $owner = $ownerResults[0]
+      $returnProperty = $owner.PSObject.Properties['ReturnValue']
+      $sidProperty = $owner.PSObject.Properties['Sid']
+      if ($null -eq $returnProperty -or $null -eq $sidProperty) {
+        return 'unknown'
+      }
+      $returnValue = $returnProperty.Value
+      if (($returnValue -isnot [uint32] -and $returnValue -isnot [int32]) -or $returnValue -ne 0) {
+        return 'unknown'
+      }
+      $sidValue = $sidProperty.Value
+      if ($sidValue -isnot [string] -or [string]::IsNullOrWhiteSpace($sidValue)) {
+        return 'unknown'
+      }
+      if ($IsWindows) {
+        try {
+          $sidValue = [System.Security.Principal.SecurityIdentifier]::new($sidValue).Value
+        } catch {
+          return 'unknown'
+        }
+      } elseif ($sidValue -notmatch '^S-1-\d+(?:-\d+){1,15}$') {
+        return 'unknown'
+      }
+      if ($sidValue -ceq $ExpectedSid) {
+        return 'remaining'
+      }
+    }
+    return 'clear'
+  } catch {
+    return 'unknown'
+  }
+}
+
+function Get-WindowsFixturePathState([string]$Path) {
+  try {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      return 'unsafe'
+    }
+    return 'directory'
+  } catch {
+    if ($_.Exception -is [System.Management.Automation.ItemNotFoundException] -and
+        $_.FullyQualifiedErrorId -like 'PathNotFound,*') {
+      return 'missing'
+    }
+    return 'unknown'
+  }
+}
+
+function Complete-WindowsHarnessFixture(
+  [bool]$RetentionRequired,
+  [string]$AccountSid,
+  [string]$AccountName,
+  [string]$FixtureRoot,
+  [string]$RunnerTempRoot
+) {
+  if ($RetentionRequired) {
+    return [pscustomobject]@{ Status = 'retained'; Reason = 'PROCESS_CLEANUP_UNCONFIRMED'; CleanupFailed = $true }
+  }
+  if ([string]::IsNullOrWhiteSpace($AccountSid)) {
+    return [pscustomobject]@{ Status = 'not-needed'; Reason = 'NO_ACCOUNT'; CleanupFailed = $false }
+  }
+
+  $processScan = Get-FixtureProcessScanState $AccountSid
+  if ($processScan -ne 'clear') {
+    return [pscustomobject]@{
+      Status = 'retained'
+      Reason = "OWNER_SCAN_$processScan"
+      CleanupFailed = $true
+    }
+  }
+
+  try {
+    if ([string]::IsNullOrWhiteSpace($AccountName)) {
+      throw 'ACCOUNT_NAME_MISSING'
+    }
+    Remove-LocalUser -Name $AccountName -ErrorAction Stop | Out-Null
+    $remainingAccounts = @(
+      Get-LocalUser -ErrorAction Stop | Where-Object { $_.SID.Value -ceq $AccountSid }
+    )
+    if ($remainingAccounts.Count -ne 0) {
+      return [pscustomobject]@{
+        Status = 'retained'
+        Reason = 'ACCOUNT_REMOVAL_UNCONFIRMED'
+        CleanupFailed = $true
+      }
+    }
+  } catch {
+    return [pscustomobject]@{
+      Status = 'retained'
+      Reason = 'ACCOUNT_REMOVAL_UNCONFIRMED'
+      CleanupFailed = $true
+    }
+  }
+
+  if ([string]::IsNullOrWhiteSpace($FixtureRoot)) {
+    return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false }
+  }
+  $fixturePathState = Get-WindowsFixturePathState $FixtureRoot
+  if ($fixturePathState -eq 'missing') {
+    return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false }
+  }
+  if ($fixturePathState -ne 'directory') {
+    return [pscustomobject]@{
+      Status = 'failed'
+      Reason = 'FIXTURE_PATH_UNSAFE'
+      CleanupFailed = $true
+    }
+  }
+  try {
+    $resolvedTemp = [IO.Path]::GetFullPath($RunnerTempRoot)
+    $resolvedFixture = [IO.Path]::GetFullPath($FixtureRoot)
+    $relative = [IO.Path]::GetRelativePath($resolvedTemp, $resolvedFixture)
+    $separator = [IO.Path]::DirectorySeparatorChar.ToString()
+    if ($relative -eq '.' -or
+        $relative -eq '..' -or
+        $relative.StartsWith("..$separator", [StringComparison]::Ordinal) -or
+        [IO.Path]::IsPathRooted($relative) -or
+        (Split-Path -Leaf $resolvedFixture) -notlike 'revo-windows-identity-*') {
+      throw 'FIXTURE_PATH_NOT_UNIQUE_RUNNER_TEMP'
+    }
+    Remove-Item -LiteralPath $resolvedFixture -Recurse -Force -ErrorAction Stop | Out-Null
+  } catch {
+    return [pscustomobject]@{
+      Status = 'failed'
+      Reason = 'FIXTURE_REMOVAL_FAILED'
+      CleanupFailed = $true
+    }
+  }
+  if ((Get-WindowsFixturePathState $resolvedFixture) -ne 'missing') {
+    return [pscustomobject]@{
+      Status = 'failed'
+      Reason = 'FIXTURE_REMOVAL_UNCONFIRMED'
+      CleanupFailed = $true
+    }
+  }
+  return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false }
+}
+
+function Get-FinalWindowsHarnessExitCode([int]$ChildExitCode, [bool]$CleanupFailed) {
+  if ($ChildExitCode -eq 0 -and $CleanupFailed) {
+    return 1
+  }
+  return $ChildExitCode
+}
+
 function Assert-NodeToolCacheItem([string]$Path, [bool]$Directory) {
   $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
   if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
@@ -261,6 +432,7 @@ $accountSid = $null
 $fixtureRoot = $null
 $securePassword = $null
 $cleanupFailure = $false
+$scriptExitCode = 0
 $retainFixtureForProcess = $false
 
 try {
@@ -958,48 +1130,33 @@ try {
   }
   Write-Output "STANDARD_USER_TOKEN=PASS sid=$($nativeResult.Token.Sid) elevated=$($nativeResult.Token.IsElevated) adminGroup=$($nativeResult.Token.HasAdministratorsSid) integrity=$($nativeResult.Token.IntegritySid) profileLoaded=$($nativeResult.Token.ProfileHiveLoaded)"
   if ($nativeResult.ExitCode -ne 0) {
-    exit $nativeResult.ExitCode
+    $scriptExitCode = $nativeResult.ExitCode
   }
 } finally {
   if ($securePassword) {
-    $securePassword.Dispose()
-  }
-
-  if ($retainFixtureForProcess) {
-    $cleanupFailure = $true
-    Write-Output 'WINDOWS_FIXTURE_RETENTION=REQUIRED'
-  } elseif ($accountSid) {
-    $remainingProcesses = @(
-      Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
-        $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue
-        if ($owner.Sid -eq $accountSid) { $_ }
-      }
-    )
-    if ($remainingProcesses.Count -gt 0) {
-      Write-Error 'Fixture-owned processes remain; leaving account and files for disposal with the hosted runner.'
+    try {
+      $securePassword.Dispose()
+    } catch {
       $cleanupFailure = $true
-    } else {
-      if ($accountName -and (Get-LocalUser -Name $accountName -ErrorAction SilentlyContinue)) {
-        Remove-LocalUser -Name $accountName -ErrorAction Stop
-      }
-      if ($accountName -and (Get-LocalUser -Name $accountName -ErrorAction SilentlyContinue)) {
-        Write-Error 'Disposable local account removal was not confirmed.'
-        $cleanupFailure = $true
-      }
-      if ($fixtureRoot -and (Test-Path -LiteralPath $fixtureRoot)) {
-        $resolvedFixture = [IO.Path]::GetFullPath($fixtureRoot)
-        if ($resolvedFixture.StartsWith([IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -and
-            (Split-Path -Leaf $resolvedFixture) -like 'revo-windows-identity-*') {
-          Remove-Item -LiteralPath $resolvedFixture -Recurse -Force -ErrorAction Stop
-        } else {
-          Write-Error 'Refusing to remove a fixture path outside the unique runner temporary root.'
-          $cleanupFailure = $true
-        }
-      }
+      Write-Output 'WINDOWS_HARNESS_PASSWORD_DISPOSE=FAILED'
     }
   }
+
+  $fixtureCleanup = Complete-WindowsHarnessFixture `
+    -RetentionRequired $retainFixtureForProcess `
+    -AccountSid $accountSid `
+    -AccountName $accountName `
+    -FixtureRoot $fixtureRoot `
+    -RunnerTempRoot $env:RUNNER_TEMP
+  if ($fixtureCleanup.CleanupFailed) {
+    $cleanupFailure = $true
+  }
+  if ($fixtureCleanup.Status -eq 'retained' -or $fixtureCleanup.Status -eq 'failed') {
+    Write-Output "WINDOWS_FIXTURE_RETENTION=REQUIRED reason=$($fixtureCleanup.Reason)"
+  } elseif ($fixtureCleanup.Status -eq 'cleaned') {
+    Write-Output 'WINDOWS_FIXTURE_CLEANUP=CONFIRMED'
+  }
 }
 
-if ($cleanupFailure) {
-  exit 1
-}
+$scriptExitCode = Get-FinalWindowsHarnessExitCode $scriptExitCode $cleanupFailure
+exit $scriptExitCode
