@@ -183,6 +183,79 @@ function Get-DirectoryOwnerSid([string]$Path) {
   return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 }
 
+function Assert-NodeToolCacheItem([string]$Path, [bool]$Directory) {
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+      ($Directory -and -not $item.PSIsContainer) -or
+      (-not $Directory -and $item.PSIsContainer)) {
+    throw 'Node tool-cache entry is not a regular expected filesystem item.'
+  }
+}
+
+function Assert-NodeToolCacheRoot([string]$Path) {
+  if ($IsWindows -and $Path -notmatch '^[A-Za-z]:\\') {
+    throw 'RUNNER_TOOL_CACHE must be a local drive path.'
+  }
+  $root = [IO.Path]::GetPathRoot($Path)
+  if ([string]::IsNullOrEmpty($root)) {
+    throw 'RUNNER_TOOL_CACHE has no filesystem root.'
+  }
+  $current = $root
+  foreach ($component in $Path.Substring($root.Length).Split([IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries)) {
+    $current = Join-Path $current $component
+    Assert-NodeToolCacheItem $current $true
+  }
+}
+
+function Get-NodeToolCacheInstallation([string]$RepositoryRoot) {
+  $versionFile = Join-Path $RepositoryRoot '.nvmrc'
+  $nodeVersion = [IO.File]::ReadAllText($versionFile).Trim()
+  if ($nodeVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw 'Node version file does not contain one exact semantic version.'
+  }
+  if ($nodeVersion -cne '26.8.2') {
+    throw 'Node version file does not match the Windows test target.'
+  }
+  if ([string]::IsNullOrWhiteSpace($env:RUNNER_TOOL_CACHE) -or
+      -not [IO.Path]::IsPathFullyQualified($env:RUNNER_TOOL_CACHE)) {
+    throw 'RUNNER_TOOL_CACHE is missing or is not absolute.'
+  }
+
+  $cacheRoot = [IO.Path]::GetFullPath($env:RUNNER_TOOL_CACHE)
+  Assert-NodeToolCacheRoot $cacheRoot
+  $nodeRoot = Join-Path $cacheRoot 'node'
+  $versionRoot = Join-Path $nodeRoot $nodeVersion
+  $nodeDirectory = Join-Path $versionRoot 'x64'
+  $completeMarker = "$nodeDirectory.complete"
+  $nodePath = Join-Path $nodeDirectory 'node.exe'
+  $npmPath = Join-Path $nodeDirectory 'npm.cmd'
+  $nodeModules = Join-Path $nodeDirectory 'node_modules'
+  $npmRoot = Join-Path $nodeModules 'npm'
+  $npmPackagePath = Join-Path $npmRoot 'package.json'
+  $npmCliPath = Join-Path $npmRoot 'bin/npm-cli.js'
+
+  foreach ($directory in @($cacheRoot, $nodeRoot, $versionRoot, $nodeDirectory, $nodeModules, $npmRoot, (Join-Path $npmRoot 'bin'))) {
+    Assert-NodeToolCacheItem $directory $true
+  }
+  foreach ($file in @($completeMarker, $nodePath, $npmPath, $npmPackagePath, $npmCliPath)) {
+    Assert-NodeToolCacheItem $file $false
+  }
+
+  $npmPackage = [IO.File]::ReadAllText($npmPackagePath) | ConvertFrom-Json -ErrorAction Stop
+  $npmVersion = [string]$npmPackage.version
+  if ($npmPackage.name -cne 'npm' -or $npmVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+    throw 'Bundled npm package version is invalid.'
+  }
+
+  return [pscustomobject]@{
+    NodeVersion = $nodeVersion
+    NodeDirectory = $nodeDirectory
+    NodePath = $nodePath
+    NpmPath = $npmPath
+    NpmVersion = $npmVersion
+  }
+}
+
 $accountName = $null
 $accountSid = $null
 $fixtureRoot = $null
@@ -239,10 +312,19 @@ try {
   $tree = (& git -C $sourceRoot rev-parse 'HEAD^{tree}').Trim()
   Assert-NativeSuccess 'git rev-parse tree'
 
-  $nodePath = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source
-  $npmPath = (Get-Command npm.cmd -CommandType Application -ErrorAction Stop).Source
-  $pwshPath = [IO.Path]::GetFullPath((Get-Command pwsh.exe -CommandType Application -ErrorAction Stop).Source)
-  $nodeDirectory = Split-Path -Parent $nodePath
+  try {
+    $nodeInstallation = Get-NodeToolCacheInstallation $sourceRoot
+  } catch {
+    throw 'NODE_TOOLCACHE_PREFLIGHT_FAILED'
+  }
+  Write-Output "NODE_SELECTION source=toolcache version=$($nodeInstallation.NodeVersion) arch=x64 pairValid=true"
+  $nodePath = $nodeInstallation.NodePath
+  $npmPath = $nodeInstallation.NpmPath
+  $nodeDirectory = $nodeInstallation.NodeDirectory
+  $pwshPath = [IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
+  if (-not (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
+    throw 'Current PowerShell executable is missing.'
+  }
   $powershellDirectory = $PSHOME
   $windowsDirectory = $env:SystemRoot
   $systemDirectory = Join-Path $windowsDirectory 'System32'
@@ -501,6 +583,8 @@ try {
   $environment['REVO_PNPM_STORE'] = $pnpmStore
   $environment['REVO_NODE_EXE'] = $nodePath
   $environment['REVO_NPM_CMD'] = $npmPath
+  $environment['REVO_EXPECTED_NODE_VERSION'] = "v$($nodeInstallation.NodeVersion)"
+  $environment['REVO_EXPECTED_NPM_VERSION'] = $nodeInstallation.NpmVersion
   $environment['REVO_PWSH_EXE'] = $pwshPath
   $environment['REVO_TOKEN_PROBE_SCRIPT'] = Join-Path $bootstrap 'windows-token-probe.ps1'
   $environment['REVO_RUN_ID'] = $env:GITHUB_RUN_ID

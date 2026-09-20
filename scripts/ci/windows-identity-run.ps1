@@ -5,6 +5,7 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
 
 function Fail-Preflight([string]$Message) {
   [Console]::Error.WriteLine("WINDOWS_IDENTITY_PREFLIGHT_FAILED: $Message")
@@ -69,10 +70,27 @@ try {
 
   $node = $env:REVO_NODE_EXE
   $npm = $env:REVO_NPM_CMD
-  $nodeInfo = (& $node -p "process.version + '|' + process.platform + '|' + process.arch").Trim()
-  if ($LASTEXITCODE -ne 0) { Fail-Preflight "Node runtime probe failed with exit code $LASTEXITCODE" }
-  if ($nodeInfo -ne 'v26.8.2|win32|x64') { Fail-Preflight "unexpected Node runtime: $nodeInfo" }
-  Write-Output "WINDOWS_IDENTITY_PREFLIGHT=PASS sid=$expectedSid node=$nodeInfo profileLoaded=$($identity.ProfileHiveLoaded)"
+  $expectedNodeVersion = $env:REVO_EXPECTED_NODE_VERSION
+  $expectedNpmVersion = $env:REVO_EXPECTED_NPM_VERSION
+  if ($expectedNodeVersion -notmatch '^v\d+\.\d+\.\d+$' -or
+      $expectedNpmVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+    Fail-Preflight 'invalid tool-cache runtime metadata'
+  }
+  $nodeOutput = @(& $node -p "process.version + '|' + process.platform + '|' + process.arch" 2>$null)
+  $nodeExit = $LASTEXITCODE
+  if ($nodeExit -ne 0 -or $nodeOutput.Count -ne 1) { Fail-Preflight 'Node runtime probe failed' }
+  $nodeInfo = [string]$nodeOutput[0]
+  $expectedNodeInfo = "$expectedNodeVersion|win32|x64"
+  if ($nodeInfo -ne $expectedNodeInfo) { Fail-Preflight 'unexpected Node runtime' }
+  Write-Output 'NODE_RUNTIME versionMatch=true platformMatch=true archMatch=true exit=0'
+
+  $npmOutput = @(& $npm --version 2>$null)
+  $npmExit = $LASTEXITCODE
+  if ($npmExit -ne 0 -or $npmOutput.Count -ne 1) { Fail-Preflight 'npm runtime probe failed' }
+  $npmVersion = [string]$npmOutput[0]
+  if ($npmVersion -cne $expectedNpmVersion) { Fail-Preflight 'npm runtime version mismatch' }
+  Write-Output 'NPM_RUNTIME versionMatch=true exit=0'
+  Write-Output "WINDOWS_IDENTITY_PREFLIGHT=PASS sid=$expectedSid node=$nodeInfo npm=$npmVersion profileLoaded=$($identity.ProfileHiveLoaded)"
   Write-Output "SOURCE_PROVENANCE=PASS commit=$($env:REVO_SOURCE_SHA) tree=$($env:REVO_TREE_SHA) archiveSha256=$actualArchiveHash"
 
   $pnpmPrefix = Join-Path $workspace '.tools'
@@ -111,6 +129,6 @@ try {
     Pop-Location
   }
 } catch {
-  [Console]::Error.WriteLine("WINDOWS_IDENTITY_PREFLIGHT_FAILED: $($_.Exception.Message)")
+  [Console]::Error.WriteLine('WINDOWS_IDENTITY_PREFLIGHT_FAILED: code=PREFLIGHT_EXCEPTION')
   exit 90
 }
