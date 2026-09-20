@@ -13,6 +13,7 @@ export const TUI_LAUNCHER = Symbol('TUI_LAUNCHER');
 export const TUI_TERMINAL = Symbol('TUI_TERMINAL');
 
 export interface TuiTerminal {
+  readonly platform: NodeJS.Platform;
   readonly stdin: boolean;
   readonly stdout: boolean;
 }
@@ -33,6 +34,9 @@ export class TuiCommandService {
 
   async run(flags: Readonly<ConfigurationFlags>): Promise<void> {
     const terminal = this.terminal();
+    if (terminal.platform !== 'linux' && terminal.platform !== 'darwin') {
+      throw new Error('revo tui is supported only on Linux and macOS.');
+    }
     if (!terminal.stdin || !terminal.stdout) {
       throw new Error('revo tui requires a TTY on stdin and stdout.');
     }
@@ -50,6 +54,7 @@ export class TuiCommandService {
 }
 
 export const readTuiTerminal: TuiTerminalReader = () => ({
+  platform: process.platform,
   stdin: process.stdin.isTTY ?? false,
   stdout: process.stdout.isTTY ?? false,
 });

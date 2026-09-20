@@ -43,6 +43,7 @@ const FIXTURE_CONFIGURATION = (
 });
 
 export interface TuiCommandFixture {
+  readonly platform?: NodeJS.Platform;
   readonly stdinTTY?: boolean;
   readonly stdoutTTY?: boolean;
   readonly outcome?: ServerLaunchResult;
@@ -85,6 +86,7 @@ export class TuiCommandScenario {
       return fixture.exitCode ?? 0;
     };
     const terminal = (): TuiTerminal => ({
+      platform: fixture.platform ?? 'linux',
       stdin: fixture.stdinTTY ?? true,
       stdout: fixture.stdoutTTY ?? true,
     });

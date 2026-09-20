@@ -58,7 +58,8 @@ node dist/bin/revo.js server stop
 Running `revo` without arguments ensures the server is running and prints one verified URL. `--web`
 also opens that URL in the default browser. `revo tui` starts or reuses the selected local server,
 then opens the terminal client against its verified GraphQL endpoint. It requires an interactive
-stdin/stdout; exiting the TUI leaves the server running. `--channel`, `--config`, `--data-dir`, and
+stdin/stdout and is supported on Linux and macOS only; other platforms fail before the server is
+started. Exiting the TUI leaves the server running. `--channel`, `--config`, `--data-dir`, and
 `--startup-timeout` select the same Revo configuration used by the server commands. Other server
 settings, including host, port, public URL, database URL, and log directory, come from the selected
 configuration file or environment. Unknown arguments and options fail with exit code 2. The package

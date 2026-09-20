@@ -58,6 +58,50 @@ describe('revo tui command', () => {
   });
 
   it.each([
+    { stdinTTY: false, stdoutTTY: false },
+    { stdinTTY: false, stdoutTTY: true },
+    { stdinTTY: true, stdoutTTY: false },
+    { stdinTTY: true, stdoutTTY: true },
+  ])(
+    'rejects Windows before inspecting TTY or starting the server: $stdinTTY/$stdoutTTY',
+    async (tty) => {
+      const result = await run([], { ...tty, platform: 'win32' });
+
+      expect(result).toMatchObject({
+        exitCode: 1,
+        stderr: 'revo tui is supported only on Linux and macOS.\n',
+        stdout: '',
+      });
+      expect(result.events).toEqual([]);
+      expect(result.ensures).toEqual([]);
+      expect(result.launches).toEqual([]);
+    },
+  );
+
+  it('rejects unsupported POSIX platforms before starting the server', async () => {
+    const result = await run([], { platform: 'freebsd' });
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      stderr: 'revo tui is supported only on Linux and macOS.\n',
+      stdout: '',
+    });
+    expect(result.events).toEqual([]);
+    expect(result.ensures).toEqual([]);
+    expect(result.launches).toEqual([]);
+  });
+
+  it.each(['linux', 'darwin'] as const)(
+    'continues to launch on supported platform %s',
+    async (platform) => {
+      const result = await run([], { platform });
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '', stdout: '' });
+      expect(result.events).toEqual(['ensure', 'launch']);
+    },
+  );
+
+  it.each([
     { stdinTTY: false, stdoutTTY: true },
     { stdinTTY: true, stdoutTTY: false },
   ])(
