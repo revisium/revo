@@ -69,6 +69,52 @@ function ConvertTo-HarnessDiagnosticInt32($Value) {
   return ([int]$Value).ToString([Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Write-NewUtf8TextFile([string]$Path, [string]$Text) {
+  $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+  $stream = $null
+  try {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    if ($null -ne $stream) {
+      $stream.Dispose()
+    }
+  }
+}
+
+function Get-WindowsCredentialedCommandLineBound([string]$Executable, [string[]]$Arguments) {
+  if ([string]::IsNullOrEmpty($Executable)) {
+    throw 'Credentialed process executable is empty.'
+  }
+  $values = @($Executable) + @($Arguments)
+  foreach ($value in $values) {
+    if ($null -eq $value -or
+        $value.IndexOf([char]0) -ge 0 -or
+        $value.Contains([char]34) -or
+        $value.EndsWith('\', [StringComparison]::Ordinal)) {
+      throw 'Credentialed process command contains an unsupported argument.'
+    }
+  }
+
+  $bound = [long]1 + $Executable.Length + 2
+  foreach ($argument in $Arguments) {
+    $bound += [long]$argument.Length + 3
+  }
+  return $bound
+}
+
+function Assert-WindowsCredentialedCommandLineBound([string]$Executable, [string[]]$Arguments) {
+  $bound = Get-WindowsCredentialedCommandLineBound $Executable $Arguments
+  if ($bound -gt 1000) {
+    throw 'Credentialed process command-length bound exceeds 1000 UTF-16 characters.'
+  }
+  return [pscustomobject]@{
+    CommandLengthBound = $bound
+    WithinLimit = $true
+  }
+}
+
 function Format-DescendantHarnessDiagnostic($Result, [bool]$AckExists, [long]$ElapsedMs) {
   $failureCodes = @(
     'DESCENDANTS_REMAINED', 'EARLY_EXIT', 'EXECUTION_TIMEOUT', 'GO_WRITE_FAILED',
@@ -142,6 +188,7 @@ $accountSid = $null
 $fixtureRoot = $null
 $securePassword = $null
 $cleanupFailure = $false
+$retainFixtureForProcess = $false
 
 try {
   if (-not $IsWindows -or [Environment]::Is64BitProcess -ne $true) {
@@ -462,7 +509,11 @@ try {
 
   $probePrefix = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command')
   $exitZero = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; exit 0'
+  $retainFixtureForProcess = $true
   $zeroResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $exitZero), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 30)
+  if ($null -ne $zeroResult -and $zeroResult.CleanupConfirmed -is [bool] -and $zeroResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Assert-HarnessSuccess $zeroResult 0 'Harness exit-code control for child exit 0'
   if ($null -eq $zeroResult.Token) { throw 'Successful harness result did not include token evidence.' }
   if ($zeroResult.Token.Sid -cne $accountSid -or
@@ -474,6 +525,7 @@ try {
   Write-Output 'STANDARD_USER_LOADED_PROFILE_PROBE=PASS'
 
   $earlyExitCommand = '[Console]::WriteLine("RVW_EARLY_EXIT_FIXTURE"); [Console]::Out.Flush(); exit 17'
+  $retainFixtureForProcess = $true
   $earlyExitResult = [WindowsHarnessNative]::RunAsUser(
     $pwshPath,
     ($probePrefix + $earlyExitCommand),
@@ -486,6 +538,9 @@ try {
     'RVW_HARNESS_READY',
     30
   )
+  if ($null -ne $earlyExitResult -and $earlyExitResult.CleanupConfirmed -is [bool] -and $earlyExitResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Assert-HarnessResultSchema $earlyExitResult 'A1 early-exit control'
   if ($earlyExitResult.FailureCode -ne 'EARLY_EXIT' -or
       $earlyExitResult.CleanupFailureCode -or
@@ -500,11 +555,16 @@ try {
   Write-Output 'CHILD_EARLY_EXIT_BEFORE_READY_PROBE=PASS'
 
   $exitSeventeen = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; exit 17'
+  $retainFixtureForProcess = $true
   $seventeenResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $exitSeventeen), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 30)
+  if ($null -ne $seventeenResult -and $seventeenResult.CleanupConfirmed -is [bool] -and $seventeenResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Assert-HarnessSuccess $seventeenResult 17 'Harness exit-code control for child exit 17'
   Write-Output 'CHILD_EXIT_CODE_17_PROBE=PASS'
 
   $noReadyCommand = 'Start-Sleep -Seconds 60'
+  $retainFixtureForProcess = $true
   $noReadyResult = [WindowsHarnessNative]::RunAsUser(
     $pwshPath,
     ($probePrefix + $noReadyCommand),
@@ -519,6 +579,9 @@ try {
     30,
     10
   )
+  if ($null -ne $noReadyResult -and $noReadyResult.CleanupConfirmed -is [bool] -and $noReadyResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Assert-HarnessResultSchema $noReadyResult 'Ready-timeout control'
   if ($noReadyResult.FailureCode -ne 'READY_TIMEOUT' -or
       $noReadyResult.CleanupFailureCode -or
@@ -533,7 +596,11 @@ try {
   Write-Output 'READY_TIMEOUT_PROBE=PASS'
 
   $timeoutCommand = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; Start-Sleep -Seconds 60'
+  $retainFixtureForProcess = $true
   $timeoutResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $timeoutCommand), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 3)
+  if ($null -ne $timeoutResult -and $timeoutResult.CleanupConfirmed -is [bool] -and $timeoutResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Assert-HarnessResultSchema $timeoutResult 'Execution-timeout control'
   if ($timeoutResult.FailureCode -ne 'EXECUTION_TIMEOUT' -or
       $timeoutResult.CleanupFailureCode -or
@@ -552,10 +619,137 @@ try {
     throw 'Generated descendant acknowledgement path already exists.'
   }
   $descendantCommand = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; $childInfo = [Diagnostics.ProcessStartInfo]::new($env:REVO_PWSH_EXE); $childInfo.UseShellExecute = $false; $childInfo.CreateNoWindow = $true; $childInfo.ArgumentList.Add("-NoLogo"); $childInfo.ArgumentList.Add("-NoProfile"); $childInfo.ArgumentList.Add("-NonInteractive"); $childInfo.ArgumentList.Add("-Command"); $childInfo.ArgumentList.Add("[Console]::Out.WriteLine(''RVW_DESCENDANT_STDOUT''); [Console]::Out.Flush(); [Console]::Error.WriteLine(''RVW_DESCENDANT_STDERR''); [Console]::Error.Flush(); [IO.File]::WriteAllText(`$env:REVO_DESCENDANT_ACK, ''ready''); Start-Sleep -Seconds 120"); $child = [Diagnostics.Process]::Start($childInfo); if ($null -eq $child) { exit 91 }; $wait = [Diagnostics.Stopwatch]::StartNew(); while (-not (Test-Path -LiteralPath $env:REVO_DESCENDANT_ACK -PathType Leaf) -and $wait.ElapsedMilliseconds -lt 8000) { Start-Sleep -Milliseconds 50 }; if (-not (Test-Path -LiteralPath $env:REVO_DESCENDANT_ACK -PathType Leaf)) { exit 92 }; exit 0'
+
+  $descendantStagePath = Join-Path $bootstrap 'descendant-probe-stage.ps1'
+  $descendantPreparationPath = Join-Path $bootstrap 'prepare-descendant-probe.ps1'
+  $descendantScriptPath = Join-Path $tempDirectory 'descendant-probe.ps1'
+  foreach ($generatedScriptPath in @($descendantStagePath, $descendantPreparationPath, $descendantScriptPath)) {
+    if (Test-Path -LiteralPath $generatedScriptPath) {
+      throw 'Generated descendant script path already exists.'
+    }
+  }
+
+  $descendantPreparationScript = @'
+$ErrorActionPreference = 'Stop'
+
+function Copy-StagedDescendantScript([string]$SourcePath, [string]$DestinationPath) {
+  $sourceStream = $null
+  $destinationStream = $null
+  try {
+    $sourceStream = [IO.File]::Open($SourcePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $destinationStream = [IO.File]::Open($DestinationPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $sourceStream.CopyTo($destinationStream)
+    $destinationStream.Flush($true)
+  } finally {
+    try {
+      if ($null -ne $destinationStream) { $destinationStream.Dispose() }
+    } finally {
+      if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+    }
+  }
+}
+
+[Console]::WriteLine('RVW_HARNESS_READY')
+[Console]::Out.Flush()
+if ([Console]::ReadLine() -cne 'GO') { exit 90 }
+try {
+  Copy-StagedDescendantScript $env:REVO_DESCENDANT_SCRIPT_STAGE $env:REVO_DESCENDANT_SCRIPT_DESTINATION
+  [Console]::Out.WriteLine('RVW_DESCENDANT_STAGE_READY')
+  [Console]::Out.Flush()
+  exit 0
+} catch {
+  [Console]::Error.WriteLine('RVW_DESCENDANT_STAGE_FAILED')
+  [Console]::Error.Flush()
+  exit 93
+}
+'@
+
+  Write-NewUtf8TextFile $descendantStagePath $descendantCommand
+  Write-NewUtf8TextFile $descendantPreparationPath $descendantPreparationScript
+  $preparationEnvironment = [System.Collections.Generic.Dictionary[string, string]]::new($environment, [StringComparer]::OrdinalIgnoreCase)
+  $preparationEnvironment['REVO_DESCENDANT_SCRIPT_STAGE'] = $descendantStagePath
+  $preparationEnvironment['REVO_DESCENDANT_SCRIPT_DESTINATION'] = $descendantScriptPath
+
+  $preparationArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $descendantPreparationPath)
+  $preparationCommandBound = Assert-WindowsCredentialedCommandLineBound $pwshPath $preparationArguments
+  Write-Output "DESCENDANT_PREPARATION_COMMAND commandLengthBound=$($preparationCommandBound.CommandLengthBound) withinLimit=true"
+  $retainFixtureForProcess = $true
+  $preparationResult = [WindowsHarnessNative]::RunAsUser(
+    $pwshPath,
+    $preparationArguments,
+    $accountName,
+    $env:COMPUTERNAME,
+    $securePassword,
+    $fixtureRoot,
+    $preparationEnvironment,
+    $accountSid,
+    'RVW_HARNESS_READY',
+    30
+  )
+  if ($null -ne $preparationResult -and $preparationResult.CleanupConfirmed -is [bool] -and $preparationResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
+  Assert-HarnessSuccess $preparationResult 0 'Descendant-script preparation'
+  if ($null -eq $preparationResult.Token -or
+      $preparationResult.Token.Sid -cne $accountSid -or
+      -not $preparationResult.StandardOutput.Contains('RVW_DESCENDANT_STAGE_READY')) {
+    throw 'Descendant-script preparation did not confirm the standard user and copy completion.'
+  }
+
+  $expectedTempPath = [IO.Path]::GetFullPath($tempDirectory)
+  $actualScriptParent = [IO.Path]::GetFullPath([IO.Path]::GetDirectoryName($descendantScriptPath))
+  if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualScriptParent, $expectedTempPath)) {
+    throw 'Descendant script was not created directly inside the private temporary directory.'
+  }
+  $descendantScriptItem = Get-Item -LiteralPath $descendantScriptPath -Force
+  if ($descendantScriptItem.PSIsContainer -or
+      ($descendantScriptItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw 'Descendant script destination is not an ordinary file.'
+  }
+  $descendantScriptAcl = Get-Acl -LiteralPath $descendantScriptPath
+  if ($descendantScriptAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -cne $accountSid) {
+    throw 'Descendant script is not owned by the verified standard user.'
+  }
+  $allowedFileSids = @($accountSid, 'S-1-5-18', 'S-1-5-32-544')
+  $standardUserReadGranted = $false
+  foreach ($rule in @($descendantScriptAcl.Access)) {
+    $ruleSid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    if ($ruleSid -notin $allowedFileSids -or
+        $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+      throw 'Descendant script DACL contains an unexpected principal or rule.'
+    }
+    if ($ruleSid -ceq $accountSid -and
+        ($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadData) -ne 0) {
+      $standardUserReadGranted = $true
+    }
+  }
+  if (-not $standardUserReadGranted) {
+    throw 'Descendant script DACL does not grant the standard user read access.'
+  }
+  $stagedScriptBytes = [IO.File]::ReadAllBytes($descendantStagePath)
+  $ownedScriptBytes = [IO.File]::ReadAllBytes($descendantScriptPath)
+  $scriptBytesMatch = $stagedScriptBytes.Length -eq $ownedScriptBytes.Length
+  if ($scriptBytesMatch) {
+    for ($byteIndex = 0; $byteIndex -lt $stagedScriptBytes.Length; $byteIndex++) {
+      if ($stagedScriptBytes[$byteIndex] -ne $ownedScriptBytes[$byteIndex]) {
+        $scriptBytesMatch = $false
+        break
+      }
+    }
+  }
+  if (-not $scriptBytesMatch) {
+    throw 'Standard-user descendant script bytes did not match the staged source.'
+  }
+  Write-Output 'DESCENDANT_SCRIPT_FILE=PASS userOwned=true privateAcl=true bytesMatch=true reparsePoint=false'
+
+  $descendantArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $descendantScriptPath)
+  $descendantCommandBound = Assert-WindowsCredentialedCommandLineBound $pwshPath $descendantArguments
+  Write-Output "DESCENDANT_PROBE_COMMAND commandLengthBound=$($descendantCommandBound.CommandLengthBound) withinLimit=true"
   $descendantWatch = [Diagnostics.Stopwatch]::StartNew()
+  $retainFixtureForProcess = $true
   $descendantResult = [WindowsHarnessNative]::RunAsUser(
     $pwshPath,
-    ($probePrefix + $descendantCommand),
+    $descendantArguments,
     $accountName,
     $env:COMPUTERNAME,
     $securePassword,
@@ -567,6 +761,9 @@ try {
     10,
     15
   )
+  if ($null -ne $descendantResult -and $descendantResult.CleanupConfirmed -is [bool] -and $descendantResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   $descendantWatch.Stop()
   Assert-HarnessResultSchema $descendantResult 'Descendant-held-pipe control'
   $descendantAckExists = Test-Path -LiteralPath $environment['REVO_DESCENDANT_ACK'] -PathType Leaf
@@ -581,12 +778,14 @@ try {
       -not $descendantResult.CleanupConfirmed -or
       -not $descendantResult.StandardOutput.Contains('RVW_DESCENDANT_STDOUT') -or
       -not $descendantResult.StandardError.Contains('RVW_DESCENDANT_STDERR') -or
+      -not $descendantAckExists -or
       $descendantWatch.ElapsedMilliseconds -gt 60000) {
     throw 'Descendant-held-pipe control did not prove inherited output, detect the descendant, and bound cleanup.'
   }
   Write-Output 'DESCENDANTS_HELD_PIPE_CLEANUP_PROBE=PASS'
 
   $missingExecutable = Join-Path $fixtureRoot 'missing-harness-child.exe'
+  $retainFixtureForProcess = $true
   $startFailureResult = [WindowsHarnessNative]::RunAsUser(
     $missingExecutable,
     @(),
@@ -599,6 +798,9 @@ try {
     'RVW_HARNESS_READY',
     30
   )
+  if ($null -ne $startFailureResult -and $startFailureResult.CleanupConfirmed -is [bool] -and $startFailureResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Assert-HarnessResultSchema $startFailureResult 'Process-start failure control'
   if ($startFailureResult.FailureCode -ne 'PROCESS_START_FAILED' -or
       $startFailureResult.CleanupFailureCode -or
@@ -613,6 +815,7 @@ try {
   Write-Output 'PROCESS_START_FAILURE_PROBE=PASS'
 
   $wrongSid = 'S-1-5-21-1-2-3-98765'
+  $retainFixtureForProcess = $true
   $tokenFailureResult = [WindowsHarnessNative]::RunAsUser(
     $pwshPath,
     ($probePrefix + $exitZero),
@@ -625,6 +828,9 @@ try {
     'RVW_HARNESS_READY',
     30
   )
+  if ($null -ne $tokenFailureResult -and $tokenFailureResult.CleanupConfirmed -is [bool] -and $tokenFailureResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Assert-HarnessResultSchema $tokenFailureResult 'Token-preflight failure control'
   if ($tokenFailureResult.FailureCode -ne 'TOKEN_PREFLIGHT_FAILED' -or
       $tokenFailureResult.CleanupFailureCode -or
@@ -641,6 +847,7 @@ try {
     '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
     (Join-Path $bootstrap 'windows-identity-run.ps1')
   )
+  $retainFixtureForProcess = $true
   $nativeResult = [WindowsHarnessNative]::RunAsUser(
     $pwshPath,
     $runArguments,
@@ -653,6 +860,9 @@ try {
     'RVW_HARNESS_READY',
     1800
   )
+  if ($null -ne $nativeResult -and $nativeResult.CleanupConfirmed -is [bool] -and $nativeResult.CleanupConfirmed) {
+    $retainFixtureForProcess = $false
+  }
   Write-Output "WINDOWS_NATIVE_TARGET os=$($os.Caption) arch=x64 node=26.8.2 source=$head tree=$tree"
   Write-Output "WINDOWS_NATIVE_CHILD_EXIT=$($nativeResult.ExitCode) timedOut=$($nativeResult.TimedOut) cleanupConfirmed=$($nativeResult.CleanupConfirmed)"
   Write-Output "WINDOWS_NATIVE_SUPERVISOR_FAILURE=$($nativeResult.FailureCode) cleanupFailure=$($nativeResult.CleanupFailureCode) exitObserved=$($nativeResult.ExitObserved) goAttempted=$($nativeResult.GoAttempted) goSent=$($nativeResult.GoSent)"
@@ -671,7 +881,10 @@ try {
     $securePassword.Dispose()
   }
 
-  if ($accountSid) {
+  if ($retainFixtureForProcess) {
+    $cleanupFailure = $true
+    Write-Output 'WINDOWS_FIXTURE_RETENTION=REQUIRED'
+  } elseif ($accountSid) {
     $remainingProcesses = @(
       Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
         $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue
