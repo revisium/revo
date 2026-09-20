@@ -1,4 +1,4 @@
-import type { ReleaseChannel, RevoLayout } from '../layout.js';
+import type { ReleaseChannel, RevoLayout, SupportedPlatform } from '../layout.js';
 
 /** Largest startup budget a launch deadline and the server host protocol can represent. */
 export const MAX_STARTUP_TIMEOUT_MILLISECONDS = 2_147_483_647;
@@ -20,7 +20,7 @@ export interface ConfigurationInput {
   readonly flags: Readonly<ConfigurationFlags>;
   readonly homeDir: string;
   readonly packageVersion: string;
-  readonly platform: 'darwin' | 'linux';
+  readonly platform: SupportedPlatform;
   readonly wrapperChannel?: ReleaseChannel;
 }
 
