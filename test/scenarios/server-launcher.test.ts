@@ -279,6 +279,39 @@ describe('server launcher composition', () => {
     expect(attempt.start).not.toHaveBeenCalled();
   });
 
+  it('returns the single configuration snapshot used for the start decision and launch message', async () => {
+    const resolved = configuration({
+      databaseUrl: 'postgresql://user:secret@db.example/revo',
+      host: '192.0.2.10',
+      logDir: '/fixture/logs-a',
+      port: 4321,
+      publicUrl: 'https://revo.example/a',
+      startupTimeout: 12_345,
+    });
+    const resolve = vi.fn<ResolveConfiguration>(async () => resolved);
+    const read = vi.fn<ReadStatus>(async () => ({ kind: 'stopped' }));
+    const started: StartedServer = { kind: 'started', url: resolved.publicUrl };
+    attempt.start.mockResolvedValue(started);
+    const input = request();
+    const service = new ServerLauncherService({ resolve }, { read }, processesFor(fakePort()));
+
+    const result = await service.launchWithConfiguration(input);
+
+    expect(result).toEqual({ configuration: resolved, outcome: started });
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(input);
+    expect(read).toHaveBeenCalledExactlyOnceWith(resolved.layout.dataDir);
+    expect(attempt.start.mock.calls[0]?.[0].configuration).toMatchObject({
+      databaseUrl: 'postgresql://user:secret@db.example/revo',
+      dataDir: resolved.layout.dataDir,
+      host: resolved.host,
+      logDir: resolved.logDir,
+      port: resolved.port,
+      publicUrl: resolved.publicUrl,
+      runtimeDir: resolved.layout.runtimeDir,
+      startupTimeout: resolved.startupTimeout,
+    });
+  });
+
   it.each([
     { label: 'an external database URL', databaseUrl: 'postgresql://user:secret@db/revo' },
     { label: 'no database URL', databaseUrl: undefined },

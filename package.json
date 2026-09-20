@@ -41,6 +41,7 @@
     "@nestjs/core": "11.1.28",
     "@revisium/revo-admin": "0.0.0",
     "@revisium/revo-core": "0.0.0",
+    "@revisium/revo-tui": "0.1.0-alpha.1",
     "koffi": "3.2.1",
     "nest-commander": "3.21.0",
     "pg": "8.22.0",

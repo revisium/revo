@@ -11,6 +11,7 @@ import type {
 import { DEFAULT_CONTROL_LIMITS } from '../processes/control-endpoint.types.js';
 import {
   ServerLauncherService,
+  type ServerLaunchContext,
   type ServerLaunchResult,
 } from '../server/server-launcher.service.js';
 import type { ServerProgressSink } from '../server/server-startup-observer.js';
@@ -50,7 +51,7 @@ export interface ServerStartFlags extends ConfigurationFlags {
 export class ServerCommandService {
   constructor(
     @Inject(ServerLauncherService)
-    private readonly launcher: Pick<ServerLauncherService, 'launch'>,
+    private readonly launcher: Pick<ServerLauncherService, 'launch' | 'launchWithConfiguration'>,
     @Inject(ConfigurationResolver)
     private readonly configuration: Pick<ConfigurationResolver, 'resolve'>,
     @Inject(ServerStatusService)
@@ -86,6 +87,13 @@ export class ServerCommandService {
 
   async ensureRunning(flags: Readonly<ConfigurationFlags>): Promise<ServerLaunchResult> {
     return this.launch(this.input(flags));
+  }
+
+  async ensureRunningWithConfiguration(
+    flags: Readonly<ConfigurationFlags>,
+  ): Promise<ServerLaunchContext> {
+    const input = this.input(flags);
+    return this.withSignal((signal) => this.launcher.launchWithConfiguration({ ...input, signal }));
   }
 
   private presentStartOutcome(outcome: ServerLaunchResult): void {
@@ -134,16 +142,22 @@ export class ServerCommandService {
     input: Readonly<ConfigurationInput>,
     onProgress?: ServerProgressSink,
   ): Promise<ServerLaunchResult> {
+    return this.withSignal((signal) =>
+      this.launcher.launch({
+        ...input,
+        signal,
+        ...(onProgress ? { onProgress } : {}),
+      }),
+    );
+  }
+
+  private async withSignal<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     const abort = (): void => controller.abort();
     process.on('SIGINT', abort);
     process.on('SIGTERM', abort);
     try {
-      return await this.launcher.launch({
-        ...input,
-        signal: controller.signal,
-        ...(onProgress ? { onProgress } : {}),
-      });
+      return await operation(controller.signal);
     } catch (error) {
       throw diagnose(error);
     } finally {

@@ -8,6 +8,10 @@ allowBuilds:
   '@prisma/engines@7.9.1': true
   '@scarf/scarf@1.4.0': false
   '@swc/core@1.15.47': true
+  'bun@1.4.2': true
   'koffi@3.2.1': true
   'prisma@7.9.1': true
   'sharp@0.34.5': false
+
+minimumReleaseAgeExclude:
+  - '@revisium/*'

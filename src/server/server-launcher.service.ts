@@ -29,6 +29,11 @@ export interface ServerLaunchRequest extends ConfigurationInput {
 
 export type ServerLaunchResult = ServerStatus | StartedServer;
 
+export interface ServerLaunchContext {
+  readonly configuration: Readonly<RevoConfiguration>;
+  readonly outcome: ServerLaunchResult;
+}
+
 @Injectable()
 export class ServerLauncherService {
   constructor(
@@ -49,6 +54,12 @@ export class ServerLauncherService {
   ) {}
 
   async launch(request: Readonly<ServerLaunchRequest>): Promise<ServerLaunchResult> {
+    return (await this.launchWithConfiguration(request)).outcome;
+  }
+
+  async launchWithConfiguration(
+    request: Readonly<ServerLaunchRequest>,
+  ): Promise<ServerLaunchContext> {
     const resolved = await this.configuration.resolve(request);
     const current = await this.status.read(resolved.layout.dataDir);
     if (current.kind !== 'stopped') {
@@ -59,7 +70,7 @@ export class ServerLauncherService {
           randomBytes(16).toString('hex'),
         );
       }
-      return current;
+      return { configuration: resolved, outcome: current };
     }
     const environment = buildCoreChildEnvironment(request.env).env;
     const operationId = randomBytes(16).toString('hex');
@@ -78,14 +89,15 @@ export class ServerLauncherService {
       this.startMessage(request, resolved, operationId, environment),
       { deadline, signal: request.signal },
     );
-    return request.onProgress
+    const outcome = await (request.onProgress
       ? this.observer.observe(attempt, {
           dataDir: resolved.layout.dataDir,
           operationId,
           deadline,
           sink: request.onProgress,
         })
-      : attempt;
+      : attempt);
+    return { configuration: resolved, outcome };
   }
 
   private startMessage(
