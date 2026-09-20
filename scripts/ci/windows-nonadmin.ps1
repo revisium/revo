@@ -183,60 +183,143 @@ function Get-DirectoryOwnerSid([string]$Path) {
   return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 }
 
-function Get-FixtureProcessScanState([string]$ExpectedSid) {
+function New-FixtureProcessScanResult(
+  [string]$State,
+  [string]$Reason,
+  [string]$Phase,
+  [int]$ExaminedCount = 0,
+  [int]$ResultCount = 0,
+  [bool]$ReturnPresent = $false,
+  [string]$ReturnType = 'none',
+  [string]$ReturnValue = 'none',
+  [bool]$SidPresent = $false,
+  [string]$SidKind = 'none',
+  [string]$Category = 'none',
+  [string]$HResult = 'none'
+) {
+  return [pscustomobject]@{
+    State = $State
+    Reason = $Reason
+    Phase = $Phase
+    ExaminedCount = $ExaminedCount
+    ResultCount = $ResultCount
+    ReturnPresent = $ReturnPresent
+    ReturnType = $ReturnType
+    ReturnValue = $ReturnValue
+    SidPresent = $SidPresent
+    SidKind = $SidKind
+    Category = $Category
+    HResult = $HResult
+  }
+}
+
+function Get-FixtureSafeValueType($Value) {
+  if ($null -eq $Value) { return 'null' }
+  if ($Value -is [uint32]) { return 'uint32' }
+  if ($Value -is [int32]) { return 'int32' }
+  if ($Value -is [string]) { return 'string' }
+  return 'other'
+}
+
+function Get-FixtureSafeErrorMetadata([System.Management.Automation.ErrorRecord]$Record) {
+  $category = 'unknown'
+  $hresult = 'none'
+  try { $category = $Record.CategoryInfo.Category.ToString() } catch {}
+  try { $hresult = $Record.Exception.HResult.ToString([Globalization.CultureInfo]::InvariantCulture) } catch {}
+  return [pscustomobject]@{ Category = $category; HResult = $hresult }
+}
+
+function Get-FixtureProcessScanResult([string]$ExpectedSid) {
+  $phase = 'expected-sid'
+  $examinedCount = 0
+  $resultCount = 0
   try {
     if ([string]::IsNullOrWhiteSpace($ExpectedSid)) {
-      return 'unknown'
+      return New-FixtureProcessScanResult 'unknown' 'EXPECTED_SID_INVALID' $phase
     }
     if ($IsWindows) {
       try {
         $ExpectedSid = [System.Security.Principal.SecurityIdentifier]::new($ExpectedSid).Value
       } catch {
-        return 'unknown'
+        return New-FixtureProcessScanResult 'unknown' 'EXPECTED_SID_INVALID' $phase
       }
     } elseif ($ExpectedSid -notmatch '^S-1-\d+(?:-\d+){1,15}$') {
-      return 'unknown'
+      return New-FixtureProcessScanResult 'unknown' 'EXPECTED_SID_INVALID' $phase
     }
 
-    $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    $phase = 'process-query'
+    $processes = [System.Collections.Generic.List[object]]::new()
+    try {
+      Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | ForEach-Object {
+        [void]$processes.Add($_)
+      }
+    } catch {
+      $metadata = Get-FixtureSafeErrorMetadata $_
+      return New-FixtureProcessScanResult 'unknown' 'QUERY_EXCEPTION' $phase $processes.Count 0 $false 'none' 'none' $false 'none' $metadata.Category $metadata.HResult
+    }
+
     foreach ($process in $processes) {
       if ($null -eq $process) {
-        return 'unknown'
+        return New-FixtureProcessScanResult 'unknown' 'PROCESS_ENTRY_INVALID' 'process-entry' $examinedCount 0
       }
-      $ownerResults = @(Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop)
-      if ($ownerResults.Count -ne 1 -or $null -eq $ownerResults[0]) {
-        return 'unknown'
+      $examinedCount++
+      $phase = 'owner-method'
+      try {
+        $ownerResults = @(Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop)
+      } catch {
+        $metadata = Get-FixtureSafeErrorMetadata $_
+        return New-FixtureProcessScanResult 'unknown' 'METHOD_EXCEPTION' $phase $examinedCount 0 $false 'none' 'none' $false 'none' $metadata.Category $metadata.HResult
       }
+      $resultCount = $ownerResults.Count
+      if ($resultCount -ne 1 -or $null -eq $ownerResults[0]) {
+        return New-FixtureProcessScanResult 'unknown' 'METHOD_RESULT_INVALID' $phase $examinedCount $resultCount
+      }
+
+      $phase = 'owner-result'
       $owner = $ownerResults[0]
       $returnProperty = $owner.PSObject.Properties['ReturnValue']
       $sidProperty = $owner.PSObject.Properties['Sid']
-      if ($null -eq $returnProperty -or $null -eq $sidProperty) {
-        return 'unknown'
+      $returnPresent = $null -ne $returnProperty
+      $sidPresent = $null -ne $sidProperty
+      if (-not $returnPresent) {
+        return New-FixtureProcessScanResult 'unknown' 'RETURN_VALUE_MISSING' $phase $examinedCount $resultCount $false 'none' 'none' $sidPresent
       }
+
       $returnValue = $returnProperty.Value
-      if (($returnValue -isnot [uint32] -and $returnValue -isnot [int32]) -or $returnValue -ne 0) {
-        return 'unknown'
+      $returnType = Get-FixtureSafeValueType $returnValue
+      if ($returnType -ne 'uint32' -and $returnType -ne 'int32') {
+        return New-FixtureProcessScanResult 'unknown' 'RETURN_VALUE_TYPE' $phase $examinedCount $resultCount $true $returnType 'none' $sidPresent
       }
+      $safeReturnValue = $returnValue.ToString([Globalization.CultureInfo]::InvariantCulture)
+      if ($returnValue -ne 0) {
+        return New-FixtureProcessScanResult 'unknown' 'METHOD_NONZERO' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $sidPresent
+      }
+      if (-not $sidPresent) {
+        return New-FixtureProcessScanResult 'unknown' 'SID_MISSING' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $false
+      }
+
       $sidValue = $sidProperty.Value
-      if ($sidValue -isnot [string] -or [string]::IsNullOrWhiteSpace($sidValue)) {
-        return 'unknown'
+      $sidKind = Get-FixtureSafeValueType $sidValue
+      if ($sidKind -ne 'string' -or [string]::IsNullOrWhiteSpace($sidValue)) {
+        return New-FixtureProcessScanResult 'unknown' 'SID_VALUE_INVALID' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $true $sidKind
       }
       if ($IsWindows) {
         try {
           $sidValue = [System.Security.Principal.SecurityIdentifier]::new($sidValue).Value
         } catch {
-          return 'unknown'
+          return New-FixtureProcessScanResult 'unknown' 'SID_PARSE_FAILED' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $true $sidKind
         }
       } elseif ($sidValue -notmatch '^S-1-\d+(?:-\d+){1,15}$') {
-        return 'unknown'
+        return New-FixtureProcessScanResult 'unknown' 'SID_PARSE_FAILED' $phase $examinedCount $resultCount $true $returnType $safeReturnValue $true $sidKind
       }
       if ($sidValue -ceq $ExpectedSid) {
-        return 'remaining'
+        return New-FixtureProcessScanResult 'remaining' 'MATCHING_PROCESS' 'owner-match' $examinedCount $resultCount $true $returnType $safeReturnValue $true $sidKind
       }
     }
-    return 'clear'
+    return New-FixtureProcessScanResult 'clear' 'NONE' 'complete' $examinedCount $resultCount
   } catch {
-    return 'unknown'
+    $metadata = Get-FixtureSafeErrorMetadata $_
+    return New-FixtureProcessScanResult 'unknown' 'SCAN_EXCEPTION' $phase $examinedCount $resultCount $false 'none' 'none' $false 'none' $metadata.Category $metadata.HResult
   }
 }
 
@@ -265,18 +348,19 @@ function Complete-WindowsHarnessFixture(
   [string]$RunnerTempRoot
 ) {
   if ($RetentionRequired) {
-    return [pscustomobject]@{ Status = 'retained'; Reason = 'PROCESS_CLEANUP_UNCONFIRMED'; CleanupFailed = $true }
+    return [pscustomobject]@{ Status = 'retained'; Reason = 'PROCESS_CLEANUP_UNCONFIRMED'; CleanupFailed = $true; OwnerScan = $null }
   }
   if ([string]::IsNullOrWhiteSpace($AccountSid)) {
-    return [pscustomobject]@{ Status = 'not-needed'; Reason = 'NO_ACCOUNT'; CleanupFailed = $false }
+    return [pscustomobject]@{ Status = 'not-needed'; Reason = 'NO_ACCOUNT'; CleanupFailed = $false; OwnerScan = $null }
   }
 
-  $processScan = Get-FixtureProcessScanState $AccountSid
-  if ($processScan -ne 'clear') {
+  $processScan = Get-FixtureProcessScanResult $AccountSid
+  if ($processScan.State -ne 'clear') {
     return [pscustomobject]@{
       Status = 'retained'
-      Reason = "OWNER_SCAN_$processScan"
+      Reason = "OWNER_SCAN_$($processScan.State)"
       CleanupFailed = $true
+      OwnerScan = $processScan
     }
   }
 
@@ -293,6 +377,7 @@ function Complete-WindowsHarnessFixture(
         Status = 'retained'
         Reason = 'ACCOUNT_REMOVAL_UNCONFIRMED'
         CleanupFailed = $true
+        OwnerScan = $processScan
       }
     }
   } catch {
@@ -300,21 +385,23 @@ function Complete-WindowsHarnessFixture(
       Status = 'retained'
       Reason = 'ACCOUNT_REMOVAL_UNCONFIRMED'
       CleanupFailed = $true
+      OwnerScan = $processScan
     }
   }
 
   if ([string]::IsNullOrWhiteSpace($FixtureRoot)) {
-    return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false }
+    return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false; OwnerScan = $processScan }
   }
   $fixturePathState = Get-WindowsFixturePathState $FixtureRoot
   if ($fixturePathState -eq 'missing') {
-    return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false }
+    return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false; OwnerScan = $processScan }
   }
   if ($fixturePathState -ne 'directory') {
     return [pscustomobject]@{
       Status = 'failed'
       Reason = 'FIXTURE_PATH_UNSAFE'
       CleanupFailed = $true
+      OwnerScan = $processScan
     }
   }
   try {
@@ -335,6 +422,7 @@ function Complete-WindowsHarnessFixture(
       Status = 'failed'
       Reason = 'FIXTURE_REMOVAL_FAILED'
       CleanupFailed = $true
+      OwnerScan = $processScan
     }
   }
   if ((Get-WindowsFixturePathState $resolvedFixture) -ne 'missing') {
@@ -342,9 +430,10 @@ function Complete-WindowsHarnessFixture(
       Status = 'failed'
       Reason = 'FIXTURE_REMOVAL_UNCONFIRMED'
       CleanupFailed = $true
+      OwnerScan = $processScan
     }
   }
-  return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false }
+  return [pscustomobject]@{ Status = 'cleaned'; Reason = 'none'; CleanupFailed = $false; OwnerScan = $processScan }
 }
 
 function Get-FinalWindowsHarnessExitCode([int]$ChildExitCode, [bool]$CleanupFailed) {
@@ -431,6 +520,7 @@ $accountName = $null
 $accountSid = $null
 $fixtureRoot = $null
 $securePassword = $null
+$nativeResult = $null
 $cleanupFailure = $false
 $scriptExitCode = 0
 $retainFixtureForProcess = $false
@@ -1148,6 +1238,10 @@ try {
     -AccountName $accountName `
     -FixtureRoot $fixtureRoot `
     -RunnerTempRoot $env:RUNNER_TEMP
+  if ($null -ne $fixtureCleanup.OwnerScan) {
+    $ownerScan = $fixtureCleanup.OwnerScan
+    Write-Output "WINDOWS_FIXTURE_OWNER_SCAN state=$($ownerScan.State) reason=$($ownerScan.Reason) phase=$($ownerScan.Phase) examinedCount=$($ownerScan.ExaminedCount) resultCount=$($ownerScan.ResultCount) returnPresent=$($ownerScan.ReturnPresent.ToString().ToLowerInvariant()) returnType=$($ownerScan.ReturnType) returnValue=$($ownerScan.ReturnValue) sidPresent=$($ownerScan.SidPresent.ToString().ToLowerInvariant()) sidKind=$($ownerScan.SidKind) category=$($ownerScan.Category) hresult=$($ownerScan.HResult)"
+  }
   if ($fixtureCleanup.CleanupFailed) {
     $cleanupFailure = $true
   }
@@ -1159,4 +1253,9 @@ try {
 }
 
 $scriptExitCode = Get-FinalWindowsHarnessExitCode $scriptExitCode $cleanupFailure
+$childExitForLog = 'none'
+if ($null -ne $nativeResult -and $nativeResult.ExitCode -is [int]) {
+  $childExitForLog = $nativeResult.ExitCode.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+Write-Output "WINDOWS_HARNESS_EXIT child=$childExitForLog cleanupFailed=$($cleanupFailure.ToString().ToLowerInvariant()) final=$scriptExitCode"
 exit $scriptExitCode

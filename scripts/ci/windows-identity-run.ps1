@@ -12,6 +12,50 @@ function Fail-Preflight([string]$Message) {
   exit 90
 }
 
+function Get-PreflightErrorKind([System.Management.Automation.ErrorRecord]$Record) {
+  $identifier = [string]$Record.FullyQualifiedErrorId
+  if ($identifier -match 'VariableIsUndefined|VariableNotFound') { return 'variable-undefined' }
+  if ($identifier -match 'PropertyNotFound') { return 'property-missing' }
+  if ($identifier -match 'NativeCommand') { return 'native-command' }
+  if ($identifier -match 'CommandNotFound') { return 'command-not-found' }
+  return 'other'
+}
+
+function Get-PreflightExceptionDiagnostic([System.Management.Automation.ErrorRecord]$Record) {
+  $category = 'unknown'
+  $line = 0
+  $outerHResult = 'none'
+  $innerHResult = 'none'
+  $nativeErrorCode = 'none'
+  try { $category = $Record.CategoryInfo.Category.ToString() } catch {}
+  try {
+    if ($Record.InvocationInfo.ScriptLineNumber -is [int] -and $Record.InvocationInfo.ScriptLineNumber -gt 0) {
+      $line = $Record.InvocationInfo.ScriptLineNumber
+    }
+  } catch {}
+
+  $exception = $Record.Exception
+  $level = 0
+  while ($null -ne $exception -and $level -lt 4) {
+    try {
+      if ($level -eq 0) {
+        $outerHResult = $exception.HResult.ToString([Globalization.CultureInfo]::InvariantCulture)
+      } elseif ($innerHResult -eq 'none') {
+        $innerHResult = $exception.HResult.ToString([Globalization.CultureInfo]::InvariantCulture)
+      }
+      if ($exception -is [System.ComponentModel.Win32Exception] -and $nativeErrorCode -eq 'none') {
+        $nativeErrorCode = $exception.NativeErrorCode.ToString([Globalization.CultureInfo]::InvariantCulture)
+      }
+      $exception = $exception.InnerException
+    } catch {
+      break
+    }
+    $level++
+  }
+
+  return "category=$category errorKind=$(Get-PreflightErrorKind $Record) line=$line outerHResult=$outerHResult innerHResult=$innerHResult nativeError=$nativeErrorCode"
+}
+
 [Console]::WriteLine('RVW_HARNESS_READY')
 [Console]::Out.Flush()
 if ([Console]::ReadLine() -cne 'GO') {
@@ -83,9 +127,35 @@ try {
   }
   $preflightStage = 'NODE_INVOKE'
   $nodeOutput = @(& $node -p "process.version + '|' + process.platform + '|' + process.arch" 2>$null)
-  $preflightStage = 'NODE_RESULT'
-  $nodeExit = $LASTEXITCODE
-  if ($nodeExit -ne 0 -or $nodeOutput.Count -ne 1) { Fail-Preflight 'Node runtime probe failed' }
+  $nodeInvokeSucceeded = $?
+  $preflightStage = 'NODE_EXIT_READ'
+  $nodeExitVariable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+  $nodeExitPresent = $null -ne $nodeExitVariable
+  $nodeExitType = 'none'
+  $nodeExit = $null
+  if ($nodeExitPresent) {
+    if ($nodeExitVariable.Value -is [int32]) {
+      $nodeExitType = 'int32'
+    } else {
+      $nodeExitType = 'other'
+    }
+    $nodeExit = $nodeExitVariable.Value
+  }
+  $preflightStage = 'NODE_OUTPUT_VALIDATE'
+  $nodeOutputCount = $nodeOutput.Count
+  $loggedNodeExit = 'none'
+  if ($nodeExitType -eq 'int32') {
+    $loggedNodeExit = $nodeExit.ToString([Globalization.CultureInfo]::InvariantCulture)
+  }
+  Write-Output "NODE_PROBE invokeSucceeded=$($nodeInvokeSucceeded.ToString().ToLowerInvariant()) exitPresent=$($nodeExitPresent.ToString().ToLowerInvariant()) exitType=$nodeExitType exitCode=$loggedNodeExit outputCount=$nodeOutputCount"
+  if (-not $nodeInvokeSucceeded -or
+      -not $nodeExitPresent -or
+      $nodeExitType -ne 'int32' -or
+      $nodeExit -ne 0 -or
+      $nodeOutputCount -ne 1) {
+    Fail-Preflight 'Node runtime probe failed'
+  }
+  $preflightStage = 'NODE_OUTPUT_COMPARE'
   $nodeInfo = [string]$nodeOutput[0]
   $expectedNodeInfo = "$expectedNodeVersion|win32|x64"
   if ($nodeInfo -ne $expectedNodeInfo) { Fail-Preflight 'unexpected Node runtime' }
@@ -139,15 +209,12 @@ try {
     Pop-Location
   }
 } catch {
-  $nativeErrorCode = 'none'
-  $exception = $_.Exception
-  while ($null -ne $exception) {
-    if ($exception -is [System.ComponentModel.Win32Exception]) {
-      $nativeErrorCode = $exception.NativeErrorCode.ToString([Globalization.CultureInfo]::InvariantCulture)
-      break
-    }
-    $exception = $exception.InnerException
+  $errorRecord = $_
+  $errorDiagnostic = 'category=unknown errorKind=other line=0 outerHResult=none innerHResult=none nativeError=none'
+  try {
+    $errorDiagnostic = Get-PreflightExceptionDiagnostic $errorRecord
+  } catch {
   }
-  [Console]::Error.WriteLine("WINDOWS_IDENTITY_PREFLIGHT_FAILED: code=PREFLIGHT_EXCEPTION stage=$preflightStage nativeError=$nativeErrorCode")
+  [Console]::Error.WriteLine("WINDOWS_IDENTITY_PREFLIGHT_FAILED: code=PREFLIGHT_EXCEPTION stage=$preflightStage $errorDiagnostic")
   exit 90
 }
