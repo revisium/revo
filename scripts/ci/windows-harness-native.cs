@@ -26,6 +26,11 @@ public sealed class WindowsHarnessRunResult
     public int ExitCode { get; set; }
     public bool TimedOut { get; set; }
     public bool CleanupConfirmed { get; set; }
+    public string FailureCode { get; set; }
+    public string CleanupFailureCode { get; set; }
+    public bool ExitObserved { get; set; }
+    public bool GoAttempted { get; set; }
+    public bool GoSent { get; set; }
     public string StandardOutput { get; set; }
     public string StandardError { get; set; }
     public WindowsHarnessTokenReport Token { get; set; }
@@ -166,21 +171,64 @@ public static class WindowsHarnessNative
         string readyMarker,
         int timeoutSeconds)
     {
+        return RunAsUser(
+            executable,
+            arguments,
+            userName,
+            domain,
+            password,
+            workingDirectory,
+            environment,
+            expectedSid,
+            readyMarker,
+            30,
+            timeoutSeconds,
+            15);
+    }
+
+    public static WindowsHarnessRunResult RunAsUser(
+        string executable,
+        string[] arguments,
+        string userName,
+        string domain,
+        SecureString password,
+        string workingDirectory,
+        IDictionary<string, string> environment,
+        string expectedSid,
+        string readyMarker,
+        int readyTimeoutSeconds,
+        int executionTimeoutSeconds,
+        int cleanupTimeoutSeconds)
+    {
+        if (readyTimeoutSeconds <= 0) throw new ArgumentOutOfRangeException("readyTimeoutSeconds");
+        if (executionTimeoutSeconds <= 0) throw new ArgumentOutOfRangeException("executionTimeoutSeconds");
+        if (cleanupTimeoutSeconds <= 0) throw new ArgumentOutOfRangeException("cleanupTimeoutSeconds");
+        var readyTimeoutMilliseconds = checked(readyTimeoutSeconds * 1000);
+        var executionTimeoutMilliseconds = checked(executionTimeoutSeconds * 1000);
+        var cleanupTimeoutMilliseconds = checked(cleanupTimeoutSeconds * 1000);
+
         IntPtr job = CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero)
         {
             throw new InvalidOperationException("CreateJobObject failed: " + Marshal.GetLastWin32Error());
         }
 
+        var result = new WindowsHarnessRunResult { ExitCode = -1 };
         Process process = null;
         var output = new BoundedCapture();
         var error = new BoundedCapture();
         var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var exited = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var standardOutputEof = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var standardErrorEof = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var assignedToJob = false;
-        var cleanupConfirmed = false;
-        var timedOut = false;
-        var exitCode = -1;
+        var processStarted = false;
+        var standardOutputReaderStarted = false;
+        var standardErrorReaderStarted = false;
         WindowsHarnessTokenReport token = null;
+        DataReceivedEventHandler outputHandler = null;
+        DataReceivedEventHandler errorHandler = null;
+        EventHandler exitHandler = null;
 
         try
         {
@@ -191,9 +239,9 @@ public static class WindowsHarnessNative
             try
             {
                 Marshal.StructureToPtr(limits, limitsBuffer, false);
-            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformationClass, limitsBuffer, (uint)limitsSize))
+                if (!SetInformationJobObject(job, JobObjectExtendedLimitInformationClass, limitsBuffer, (uint)limitsSize))
                 {
-                    throw new InvalidOperationException("SetInformationJobObject failed: " + Marshal.GetLastWin32Error());
+                    result.FailureCode = "JOB_CONFIGURATION_FAILED";
                 }
             }
             finally
@@ -201,135 +249,369 @@ public static class WindowsHarnessNative
                 Marshal.FreeHGlobal(limitsBuffer);
             }
 
-            var start = new ProcessStartInfo
+            if (result.FailureCode == null)
             {
-                FileName = executable,
-                UseShellExecute = false,
-                WorkingDirectory = workingDirectory,
-                UserName = userName,
-                Domain = domain,
-                Password = password,
-                LoadUserProfile = true,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            };
-            start.Environment.Clear();
-            foreach (var entry in environment)
-            {
-                start.Environment[entry.Key] = entry.Value;
-            }
-            foreach (var argument in arguments)
-            {
-                start.ArgumentList.Add(argument);
-            }
-
-            process = Process.Start(start);
-            if (process == null)
-            {
-                throw new InvalidOperationException("Could not start standard-user harness process");
-            }
-
-            process.OutputDataReceived += (sender, eventArgs) =>
-            {
-                if (eventArgs.Data == null) return;
-                output.AppendLine(eventArgs.Data);
-                if (String.Equals(eventArgs.Data, readyMarker, StringComparison.Ordinal)) ready.TrySetResult(true);
-            };
-            process.ErrorDataReceived += (sender, eventArgs) =>
-            {
-                if (eventArgs.Data != null) error.AppendLine(eventArgs.Data);
-            };
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            if (!ready.Task.Wait(TimeSpan.FromSeconds(timeoutSeconds)))
-            {
-                timedOut = !process.HasExited;
-                throw new TimeoutException("Standard-user harness did not reach its ready handshake");
-            }
-
-            token = InspectHandle(process.Handle);
-            var tokenFailure = ValidateStandardUser(token, expectedSid);
-            if (tokenFailure != null)
-            {
-                throw new InvalidOperationException("Standard-user token or loaded profile preflight failed: " + tokenFailure);
-            }
-
-            if (!AssignProcessToJobObject(job, process.Handle))
-            {
-                throw new InvalidOperationException("AssignProcessToJobObject failed: " + Marshal.GetLastWin32Error());
-            }
-            assignedToJob = true;
-            process.StandardInput.WriteLine("GO");
-            process.StandardInput.Flush();
-
-            if (!process.WaitForExit(checked(timeoutSeconds * 1000)))
-            {
-                timedOut = true;
-                TerminateJobObject(job, 124);
-                if (!process.WaitForExit(15000))
+                var start = new ProcessStartInfo
                 {
-                    throw new InvalidOperationException("Timed-out fixture process did not exit after job termination");
+                    FileName = executable,
+                    UseShellExecute = false,
+                    WorkingDirectory = workingDirectory,
+                    UserName = userName,
+                    Domain = domain,
+                    Password = password,
+                    LoadUserProfile = true,
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                };
+                start.Environment.Clear();
+                foreach (var entry in environment)
+                {
+                    start.Environment[entry.Key] = entry.Value;
+                }
+                foreach (var argument in arguments)
+                {
+                    start.ArgumentList.Add(argument);
+                }
+
+                process = new Process { StartInfo = start };
+                outputHandler = (sender, eventArgs) =>
+                {
+                    if (eventArgs.Data == null)
+                    {
+                        standardOutputEof.TrySetResult(true);
+                        return;
+                    }
+                    output.AppendLine(eventArgs.Data);
+                    if (String.Equals(eventArgs.Data, readyMarker, StringComparison.Ordinal))
+                    {
+                        ready.TrySetResult(true);
+                    }
+                };
+                errorHandler = (sender, eventArgs) =>
+                {
+                    if (eventArgs.Data == null)
+                    {
+                        standardErrorEof.TrySetResult(true);
+                        return;
+                    }
+                    error.AppendLine(eventArgs.Data);
+                };
+                exitHandler = (sender, eventArgs) => exited.TrySetResult(true);
+                process.OutputDataReceived += outputHandler;
+                process.ErrorDataReceived += errorHandler;
+                process.Exited += exitHandler;
+                process.EnableRaisingEvents = true;
+
+                try
+                {
+                    processStarted = process.Start();
+                    if (!processStarted)
+                    {
+                        result.FailureCode = "PROCESS_START_FAILED";
+                    }
+                }
+                catch (Exception)
+                {
+                    result.FailureCode = "PROCESS_START_FAILED";
+                }
+
+                if (processStarted)
+                {
+                    var assignmentSucceeded = AssignProcessToJobObject(job, process.Handle);
+                    if (assignmentSucceeded)
+                    {
+                        assignedToJob = true;
+                    }
+                    else
+                    {
+                        result.FailureCode = TryRecordExit(process, result)
+                            ? "EARLY_EXIT"
+                            : "JOB_ASSIGN_FAILED";
+                    }
+
+                    try
+                    {
+                        process.BeginOutputReadLine();
+                        standardOutputReaderStarted = true;
+                    }
+                    catch (Exception)
+                    {
+                        if (result.FailureCode == null) result.FailureCode = "SUPERVISOR_FAILURE";
+                    }
+                    try
+                    {
+                        process.BeginErrorReadLine();
+                        standardErrorReaderStarted = true;
+                    }
+                    catch (Exception)
+                    {
+                        if (result.FailureCode == null) result.FailureCode = "SUPERVISOR_FAILURE";
+                    }
+
+                    if (assignmentSucceeded && result.FailureCode == null)
+                    {
+                        var readyDeadline = Environment.TickCount64 + readyTimeoutMilliseconds;
+                        var readyDelay = Task.Delay(readyTimeoutMilliseconds);
+                        Task.WhenAny(ready.Task, exited.Task, readyDelay).GetAwaiter().GetResult();
+
+                        if (TryRecordExit(process, result))
+                        {
+                            result.FailureCode = "EARLY_EXIT";
+                        }
+                        else if (!ready.Task.IsCompleted || Environment.TickCount64 >= readyDeadline)
+                        {
+                            result.FailureCode = "READY_TIMEOUT";
+                            result.TimedOut = true;
+                        }
+                        else
+                        {
+                            try
+                            {
+                                token = InspectHandle(process.Handle);
+                                result.Token = token;
+                                if (ValidateStandardUser(token, expectedSid) != null)
+                                {
+                                    result.FailureCode = "TOKEN_PREFLIGHT_FAILED";
+                                }
+                            }
+                            catch (Exception)
+                            {
+                                result.FailureCode = "TOKEN_PREFLIGHT_FAILED";
+                            }
+
+                            if (result.FailureCode == null && TryRecordExit(process, result))
+                            {
+                                result.FailureCode = "EARLY_EXIT";
+                            }
+                            else if (result.FailureCode == null)
+                            {
+                                result.GoAttempted = true;
+                                try
+                                {
+                                    process.StandardInput.WriteLine("GO");
+                                    process.StandardInput.Flush();
+                                    result.GoSent = true;
+                                }
+                                catch (Exception)
+                                {
+                                    result.FailureCode = "GO_WRITE_FAILED";
+                                }
+
+                                if (result.GoSent)
+                                {
+                                    var executionDelay = Task.Delay(executionTimeoutMilliseconds);
+                                    Task.WhenAny(exited.Task, executionDelay).GetAwaiter().GetResult();
+                                    if (!TryRecordExit(process, result))
+                                    {
+                                        result.FailureCode = "EXECUTION_TIMEOUT";
+                                        result.TimedOut = true;
+                                    }
+                                    else if (ActiveProcesses(job) > 0)
+                                    {
+                                        result.FailureCode = "DESCENDANTS_REMAINED";
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            process.WaitForExit();
-            exitCode = process.ExitCode;
-
-            var active = ActiveProcesses(job);
-            if (active != 0)
-            {
-                TerminateJobObject(job, 125);
-                if (!WaitForNoActiveProcesses(job, 15000))
-                {
-                    throw new InvalidOperationException("Fixture job retained processes after termination");
-                }
-                throw new InvalidOperationException("Fixture job left descendant processes running");
-            }
-
-            cleanupConfirmed = true;
         }
-        catch
+        catch (Exception)
         {
-            if (process != null && !process.HasExited)
-            {
-                if (assignedToJob)
-                {
-                    TerminateJobObject(job, 126);
-                    process.WaitForExit(15000);
-                }
-                else
-                {
-                    process.Kill(true);
-                    process.WaitForExit(15000);
-                }
-            }
-            if (assignedToJob && ActiveProcesses(job) == 0) cleanupConfirmed = true;
-            throw;
+            if (result.FailureCode == null) result.FailureCode = "SUPERVISOR_FAILURE";
         }
         finally
         {
+            var cleanupDeadline = Environment.TickCount64 + cleanupTimeoutMilliseconds;
+            var rootExitConfirmed = !processStarted;
+            var jobEmptyConfirmed = false;
+            var standardOutputEofConfirmed = !standardOutputReaderStarted;
+            var standardErrorEofConfirmed = !standardErrorReaderStarted;
+            var jobCloseConfirmed = false;
+
+            if (processStarted && process != null)
+            {
+                var jobStateKnown = false;
+                uint activeProcesses = 0;
+                try
+                {
+                    activeProcesses = ActiveProcesses(job);
+                    jobStateKnown = true;
+                    jobEmptyConfirmed = activeProcesses == 0;
+                }
+                catch (Exception)
+                {
+                    RecordCleanupFailure(result, "JOB_QUERY_FAILED");
+                }
+
+                try
+                {
+                    rootExitConfirmed = TryRecordExit(process, result);
+                }
+                catch (Exception)
+                {
+                    RecordCleanupFailure(result, "ROOT_EXIT_QUERY_FAILED");
+                }
+
+                if (assignedToJob && (!rootExitConfirmed || !jobStateKnown || activeProcesses > 0))
+                {
+                    if (!TerminateJobObject(job, 124))
+                    {
+                        RecordCleanupFailure(result, "JOB_TERMINATION_FAILED");
+                    }
+                }
+                else if (!assignedToJob && !rootExitConfirmed)
+                {
+                    try
+                    {
+                        process.Kill();
+                    }
+                    catch (Exception)
+                    {
+                        try
+                        {
+                            if (!TryRecordExit(process, result))
+                            {
+                                RecordCleanupFailure(result, "ROOT_TERMINATION_FAILED");
+                            }
+                        }
+                        catch (Exception)
+                        {
+                            RecordCleanupFailure(result, "ROOT_TERMINATION_FAILED");
+                        }
+                    }
+                }
+
+                if (!rootExitConfirmed)
+                {
+                    WaitForTaskUntil(exited.Task, cleanupDeadline);
+                    try
+                    {
+                        rootExitConfirmed = TryRecordExit(process, result);
+                    }
+                    catch (Exception)
+                    {
+                        RecordCleanupFailure(result, "ROOT_EXIT_QUERY_FAILED");
+                    }
+                }
+                if (!rootExitConfirmed)
+                {
+                    RecordCleanupFailure(result, "ROOT_EXIT_UNCONFIRMED");
+                }
+
+                try
+                {
+                    jobEmptyConfirmed = WaitForNoActiveProcessesUntil(job, cleanupDeadline);
+                }
+                catch (Exception)
+                {
+                    RecordCleanupFailure(result, "JOB_QUERY_FAILED");
+                    jobEmptyConfirmed = false;
+                }
+                if (!jobEmptyConfirmed)
+                {
+                    RecordCleanupFailure(result, "JOB_NOT_EMPTY");
+                }
+
+                if (!standardOutputReaderStarted || !standardErrorReaderStarted)
+                {
+                    RecordCleanupFailure(result, "OUTPUT_DRAIN_NOT_STARTED");
+                }
+
+                var readers = new List<Task>();
+                if (standardOutputReaderStarted) readers.Add(standardOutputEof.Task);
+                if (standardErrorReaderStarted) readers.Add(standardErrorEof.Task);
+                if (readers.Count > 0)
+                {
+                    var drain = Task.WhenAll(readers.ToArray());
+                    WaitForTaskUntil(drain, cleanupDeadline);
+                    standardOutputEofConfirmed = standardOutputReaderStarted &&
+                        standardOutputEof.Task.Status == TaskStatus.RanToCompletion;
+                    standardErrorEofConfirmed = standardErrorReaderStarted &&
+                        standardErrorEof.Task.Status == TaskStatus.RanToCompletion;
+                    if ((standardOutputReaderStarted && !standardOutputEofConfirmed) ||
+                        (standardErrorReaderStarted && !standardErrorEofConfirmed))
+                    {
+                        RecordCleanupFailure(result, "OUTPUT_EOF_UNCONFIRMED");
+                    }
+                }
+                else
+                {
+                    standardOutputEofConfirmed = false;
+                    standardErrorEofConfirmed = false;
+                }
+            }
+            else
+            {
+                try
+                {
+                    jobEmptyConfirmed = ActiveProcesses(job) == 0;
+                }
+                catch (Exception)
+                {
+                    RecordCleanupFailure(result, "JOB_QUERY_FAILED");
+                }
+                rootExitConfirmed = true;
+            }
+
             if (process != null)
             {
-                if (process.HasExited) process.WaitForExit();
-                process.Dispose();
+                try
+                {
+                    if (outputHandler != null) process.OutputDataReceived -= outputHandler;
+                    if (errorHandler != null) process.ErrorDataReceived -= errorHandler;
+                    if (exitHandler != null) process.Exited -= exitHandler;
+                }
+                catch (Exception)
+                {
+                    RecordCleanupFailure(result, "PROCESS_EVENT_HANDLER_RELEASE_FAILED");
+                }
             }
+
             if (!CloseHandle(job))
             {
-                throw new InvalidOperationException("CloseHandle for fixture job failed: " + Marshal.GetLastWin32Error());
+                RecordCleanupFailure(result, "JOB_HANDLE_CLOSE_FAILED");
             }
+            else
+            {
+                jobCloseConfirmed = true;
+            }
+
+            if (process != null)
+            {
+                if (processStarted)
+                {
+                    try
+                    {
+                        process.StandardInput.Dispose();
+                    }
+                    catch (Exception)
+                    {
+                        RecordCleanupFailure(result, "PROCESS_INPUT_RELEASE_FAILED");
+                    }
+                }
+                try
+                {
+                    process.Dispose();
+                }
+                catch (Exception)
+                {
+                    RecordCleanupFailure(result, "PROCESS_HANDLE_RELEASE_FAILED");
+                }
+            }
+
+            result.CleanupConfirmed = rootExitConfirmed && jobEmptyConfirmed &&
+                standardOutputEofConfirmed && standardErrorEofConfirmed && jobCloseConfirmed &&
+                result.CleanupFailureCode == null;
         }
 
-        return new WindowsHarnessRunResult
-        {
-            ExitCode = exitCode,
-            TimedOut = timedOut,
-            CleanupConfirmed = cleanupConfirmed,
-            StandardOutput = output.ToString(),
-            StandardError = error.ToString(),
-            Token = token,
-        };
+        result.StandardOutput = output.ToString();
+        result.StandardError = error.ToString();
+        result.Token = token;
+        return result;
     }
 
     private static void AddRule(DirectorySecurity security, string sid, string rights)
@@ -613,15 +895,46 @@ public static class WindowsHarnessNative
         }
     }
 
-    private static bool WaitForNoActiveProcesses(IntPtr job, int timeoutMilliseconds)
+    private static bool TryRecordExit(Process process, WindowsHarnessRunResult result)
     {
-        var deadline = Environment.TickCount64 + timeoutMilliseconds;
-        do
+        if (result.ExitObserved) return true;
+        if (!process.HasExited) return false;
+        var exitCode = process.ExitCode;
+        result.ExitCode = exitCode;
+        result.ExitObserved = true;
+        return true;
+    }
+
+    private static bool WaitForTaskUntil(Task task, long deadline)
+    {
+        if (task.IsCompleted) return task.Status == TaskStatus.RanToCompletion;
+        var remaining = deadline - Environment.TickCount64;
+        if (remaining <= 0) return false;
+        try
+        {
+            return task.Wait((int)Math.Min(Int32.MaxValue, remaining)) &&
+                task.Status == TaskStatus.RanToCompletion;
+        }
+        catch (AggregateException)
+        {
+            return false;
+        }
+    }
+
+    private static bool WaitForNoActiveProcessesUntil(IntPtr job, long deadline)
+    {
+        while (true)
         {
             if (ActiveProcesses(job) == 0) return true;
-            System.Threading.Thread.Sleep(50);
-        } while (Environment.TickCount64 < deadline);
-        return ActiveProcesses(job) == 0;
+            var remaining = deadline - Environment.TickCount64;
+            if (remaining <= 0) return ActiveProcesses(job) == 0;
+            System.Threading.Thread.Sleep((int)Math.Min(50, remaining));
+        }
+    }
+
+    private static void RecordCleanupFailure(WindowsHarnessRunResult result, string code)
+    {
+        if (result.CleanupFailureCode == null) result.CleanupFailureCode = code;
     }
 
     private sealed class BoundedCapture

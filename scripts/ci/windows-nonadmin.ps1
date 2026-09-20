@@ -17,6 +17,34 @@ function Assert-NativeSuccess([string]$Stage) {
   }
 }
 
+function Assert-HarnessResultSchema($Result, [string]$Label) {
+  if ($null -eq $Result) {
+    throw "$Label returned no harness result."
+  }
+  $required = @('FailureCode', 'CleanupFailureCode', 'ExitObserved', 'GoAttempted', 'GoSent')
+  $properties = @($Result.PSObject.Properties.Name)
+  if ($required | Where-Object { $_ -notin $properties }) {
+    throw "$Label result schema is incomplete."
+  }
+}
+
+function Assert-HarnessExecution($Result, [string]$Label) {
+  Assert-HarnessResultSchema $Result $Label
+  if ($Result.FailureCode -or $Result.CleanupFailureCode -or
+      -not $Result.ExitObserved -or $Result.TimedOut -or
+      -not $Result.GoAttempted -or -not $Result.GoSent -or
+      -not $Result.CleanupConfirmed) {
+    throw "$Label did not preserve supervisor, child-exit, GO, and cleanup evidence."
+  }
+}
+
+function Assert-HarnessSuccess($Result, [int]$ExpectedExitCode, [string]$Label) {
+  Assert-HarnessExecution $Result $Label
+  if ($Result.ExitCode -ne $ExpectedExitCode) {
+    throw "$Label returned child exit $($Result.ExitCode), expected $ExpectedExitCode."
+  }
+}
+
 function Get-DirectoryOwnerSid([string]$Path) {
   $acl = Get-Acl -LiteralPath $Path
   return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
@@ -345,9 +373,8 @@ try {
   $probePrefix = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command')
   $exitZero = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; exit 0'
   $zeroResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $exitZero), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 30)
-  if ($zeroResult.ExitCode -ne 0 -or $zeroResult.TimedOut -or -not $zeroResult.CleanupConfirmed) {
-    throw 'Harness exit-code control for child exit 0 failed.'
-  }
+  Assert-HarnessSuccess $zeroResult 0 'Harness exit-code control for child exit 0'
+  if ($null -eq $zeroResult.Token) { throw 'Successful harness result did not include token evidence.' }
   if ($zeroResult.Token.Sid -cne $accountSid -or
       -not $zeroResult.Token.ProfileHiveLoaded -or
       -not [WindowsHarnessNative]::ProfilePathsEqual($zeroResult.Token.ProfilePath, $profilePath)) {
@@ -357,33 +384,19 @@ try {
   Write-Output 'STANDARD_USER_LOADED_PROFILE_PROBE=PASS'
 
   $earlyExitCommand = '[Console]::WriteLine("RVW_EARLY_EXIT_FIXTURE"); [Console]::Out.Flush(); exit 17'
-  $earlyExitResult = $null
-  try {
-    $earlyExitResult = [WindowsHarnessNative]::RunAsUser(
-      $pwshPath,
-      ($probePrefix + $earlyExitCommand),
-      $accountName,
-      $env:COMPUTERNAME,
-      $securePassword,
-      $fixtureRoot,
-      $environment,
-      $accountSid,
-      'RVW_HARNESS_READY',
-      30
-    )
-  } catch [TimeoutException] {
-    if ($_.Exception.Message -ceq 'Standard-user harness did not reach its ready handshake') {
-      throw [InvalidOperationException]::new('A1 early-exit control failed: expected EARLY_EXIT with exit 17 and no GO; observed the current ready-handshake timeout.')
-    }
-    throw
-  }
-  if ($null -eq $earlyExitResult) {
-    throw 'A1 early-exit control returned neither an outcome nor the expected RED.'
-  }
-  $earlyExitProperties = @($earlyExitResult.PSObject.Properties.Name)
-  if (@('FailureCode', 'CleanupFailureCode', 'ExitObserved', 'GoAttempted', 'GoSent') | Where-Object { $_ -notin $earlyExitProperties }) {
-    throw 'A1 early-exit result schema is incomplete; the control did not produce meaningful evidence.'
-  }
+  $earlyExitResult = [WindowsHarnessNative]::RunAsUser(
+    $pwshPath,
+    ($probePrefix + $earlyExitCommand),
+    $accountName,
+    $env:COMPUTERNAME,
+    $securePassword,
+    $fixtureRoot,
+    $environment,
+    $accountSid,
+    'RVW_HARNESS_READY',
+    30
+  )
+  Assert-HarnessResultSchema $earlyExitResult 'A1 early-exit control'
   if ($earlyExitResult.FailureCode -ne 'EARLY_EXIT' -or
       $earlyExitResult.CleanupFailureCode -or
       -not $earlyExitResult.ExitObserved -or
@@ -398,17 +411,139 @@ try {
 
   $exitSeventeen = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; exit 17'
   $seventeenResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $exitSeventeen), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 30)
-  if ($seventeenResult.ExitCode -ne 17 -or $seventeenResult.TimedOut -or -not $seventeenResult.CleanupConfirmed) {
-    throw 'Harness exit-code control did not preserve child exit code 17.'
-  }
+  Assert-HarnessSuccess $seventeenResult 17 'Harness exit-code control for child exit 17'
   Write-Output 'CHILD_EXIT_CODE_17_PROBE=PASS'
+
+  $noReadyCommand = 'Start-Sleep -Seconds 60'
+  $noReadyResult = [WindowsHarnessNative]::RunAsUser(
+    $pwshPath,
+    ($probePrefix + $noReadyCommand),
+    $accountName,
+    $env:COMPUTERNAME,
+    $securePassword,
+    $fixtureRoot,
+    $environment,
+    $accountSid,
+    'RVW_HARNESS_READY',
+    3,
+    30,
+    10
+  )
+  Assert-HarnessResultSchema $noReadyResult 'Ready-timeout control'
+  if ($noReadyResult.FailureCode -ne 'READY_TIMEOUT' -or
+      $noReadyResult.CleanupFailureCode -or
+      -not $noReadyResult.ExitObserved -or
+      $noReadyResult.ExitCode -eq -1 -or
+      -not $noReadyResult.TimedOut -or
+      $noReadyResult.GoAttempted -or
+      $noReadyResult.GoSent -or
+      -not $noReadyResult.CleanupConfirmed) {
+    throw 'Ready-timeout control did not preserve timeout, handshake, exit, and cleanup evidence.'
+  }
+  Write-Output 'READY_TIMEOUT_PROBE=PASS'
 
   $timeoutCommand = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; Start-Sleep -Seconds 60'
   $timeoutResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $timeoutCommand), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 3)
-  if (-not $timeoutResult.TimedOut -or -not $timeoutResult.CleanupConfirmed) {
-    throw 'Harness timeout probe did not terminate and confirm its fixture job.'
+  Assert-HarnessResultSchema $timeoutResult 'Execution-timeout control'
+  if ($timeoutResult.FailureCode -ne 'EXECUTION_TIMEOUT' -or
+      $timeoutResult.CleanupFailureCode -or
+      -not $timeoutResult.ExitObserved -or
+      $timeoutResult.ExitCode -eq -1 -or
+      -not $timeoutResult.TimedOut -or
+      -not $timeoutResult.GoAttempted -or
+      -not $timeoutResult.GoSent -or
+      -not $timeoutResult.CleanupConfirmed) {
+    throw 'Execution-timeout control did not preserve timeout, GO, exit, and cleanup evidence.'
   }
-  Write-Output 'FIXTURE_JOB_TIMEOUT_PROBE=PASS'
+  Write-Output 'EXECUTION_TIMEOUT_PROBE=PASS'
+
+  $environment['REVO_DESCENDANT_ACK'] = Join-Path $tempDirectory ('revo-descendant-ack-' + [Guid]::NewGuid().ToString('N') + '.txt')
+  if (Test-Path -LiteralPath $environment['REVO_DESCENDANT_ACK']) {
+    throw 'Generated descendant acknowledgement path already exists.'
+  }
+  $descendantCommand = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; $childInfo = [Diagnostics.ProcessStartInfo]::new($env:REVO_PWSH_EXE); $childInfo.UseShellExecute = $false; $childInfo.CreateNoWindow = $true; $childInfo.ArgumentList.Add("-NoLogo"); $childInfo.ArgumentList.Add("-NoProfile"); $childInfo.ArgumentList.Add("-NonInteractive"); $childInfo.ArgumentList.Add("-Command"); $childInfo.ArgumentList.Add("[Console]::Out.WriteLine(''RVW_DESCENDANT_STDOUT''); [Console]::Out.Flush(); [Console]::Error.WriteLine(''RVW_DESCENDANT_STDERR''); [Console]::Error.Flush(); [IO.File]::WriteAllText(`$env:REVO_DESCENDANT_ACK, ''ready''); Start-Sleep -Seconds 120"); $child = [Diagnostics.Process]::Start($childInfo); if ($null -eq $child) { exit 91 }; $wait = [Diagnostics.Stopwatch]::StartNew(); while (-not (Test-Path -LiteralPath $env:REVO_DESCENDANT_ACK -PathType Leaf) -and $wait.ElapsedMilliseconds -lt 8000) { Start-Sleep -Milliseconds 50 }; if (-not (Test-Path -LiteralPath $env:REVO_DESCENDANT_ACK -PathType Leaf)) { exit 92 }; exit 0'
+  $descendantWatch = [Diagnostics.Stopwatch]::StartNew()
+  $descendantResult = [WindowsHarnessNative]::RunAsUser(
+    $pwshPath,
+    ($probePrefix + $descendantCommand),
+    $accountName,
+    $env:COMPUTERNAME,
+    $securePassword,
+    $fixtureRoot,
+    $environment,
+    $accountSid,
+    'RVW_HARNESS_READY',
+    30,
+    10,
+    15
+  )
+  $descendantWatch.Stop()
+  Assert-HarnessResultSchema $descendantResult 'Descendant-held-pipe control'
+  if ($descendantResult.FailureCode -ne 'DESCENDANTS_REMAINED' -or
+      $descendantResult.CleanupFailureCode -or
+      -not $descendantResult.ExitObserved -or
+      $descendantResult.ExitCode -ne 0 -or
+      $descendantResult.TimedOut -or
+      -not $descendantResult.GoAttempted -or
+      -not $descendantResult.GoSent -or
+      -not $descendantResult.CleanupConfirmed -or
+      -not $descendantResult.StandardOutput.Contains('RVW_DESCENDANT_STDOUT') -or
+      -not $descendantResult.StandardError.Contains('RVW_DESCENDANT_STDERR') -or
+      $descendantWatch.ElapsedMilliseconds -gt 60000) {
+    throw 'Descendant-held-pipe control did not prove inherited output, detect the descendant, and bound cleanup.'
+  }
+  Write-Output 'DESCENDANTS_HELD_PIPE_CLEANUP_PROBE=PASS'
+
+  $missingExecutable = Join-Path $fixtureRoot 'missing-harness-child.exe'
+  $startFailureResult = [WindowsHarnessNative]::RunAsUser(
+    $missingExecutable,
+    @(),
+    $accountName,
+    $env:COMPUTERNAME,
+    $securePassword,
+    $fixtureRoot,
+    $environment,
+    $accountSid,
+    'RVW_HARNESS_READY',
+    30
+  )
+  Assert-HarnessResultSchema $startFailureResult 'Process-start failure control'
+  if ($startFailureResult.FailureCode -ne 'PROCESS_START_FAILED' -or
+      $startFailureResult.CleanupFailureCode -or
+      $startFailureResult.ExitObserved -or
+      $startFailureResult.ExitCode -ne -1 -or
+      $startFailureResult.TimedOut -or
+      $startFailureResult.GoAttempted -or
+      $startFailureResult.GoSent -or
+      -not $startFailureResult.CleanupConfirmed) {
+    throw 'Process-start failure control did not preserve failure and handle-release evidence.'
+  }
+  Write-Output 'PROCESS_START_FAILURE_PROBE=PASS'
+
+  $wrongSid = 'S-1-5-21-1-2-3-98765'
+  $tokenFailureResult = [WindowsHarnessNative]::RunAsUser(
+    $pwshPath,
+    ($probePrefix + $exitZero),
+    $accountName,
+    $env:COMPUTERNAME,
+    $securePassword,
+    $fixtureRoot,
+    $environment,
+    $wrongSid,
+    'RVW_HARNESS_READY',
+    30
+  )
+  Assert-HarnessResultSchema $tokenFailureResult 'Token-preflight failure control'
+  if ($tokenFailureResult.FailureCode -ne 'TOKEN_PREFLIGHT_FAILED' -or
+      $tokenFailureResult.CleanupFailureCode -or
+      -not $tokenFailureResult.ExitObserved -or
+      $tokenFailureResult.TimedOut -or
+      $tokenFailureResult.GoAttempted -or
+      $tokenFailureResult.GoSent -or
+      -not $tokenFailureResult.CleanupConfirmed) {
+    throw 'Token-preflight failure control did not refuse GO and confirm cleanup.'
+  }
+  Write-Output 'TOKEN_PREFLIGHT_FAILURE_PROBE=PASS'
 
   $runArguments = @(
     '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
@@ -427,13 +562,15 @@ try {
     1800
   )
   Write-Output "WINDOWS_NATIVE_TARGET os=$($os.Caption) arch=x64 node=26.8.2 source=$head tree=$tree"
-  Write-Output "STANDARD_USER_TOKEN=PASS sid=$($nativeResult.Token.Sid) elevated=$($nativeResult.Token.IsElevated) adminGroup=$($nativeResult.Token.HasAdministratorsSid) integrity=$($nativeResult.Token.IntegritySid) profileLoaded=$($nativeResult.Token.ProfileHiveLoaded)"
   Write-Output "WINDOWS_NATIVE_CHILD_EXIT=$($nativeResult.ExitCode) timedOut=$($nativeResult.TimedOut) cleanupConfirmed=$($nativeResult.CleanupConfirmed)"
+  Write-Output "WINDOWS_NATIVE_SUPERVISOR_FAILURE=$($nativeResult.FailureCode) cleanupFailure=$($nativeResult.CleanupFailureCode) exitObserved=$($nativeResult.ExitObserved) goAttempted=$($nativeResult.GoAttempted) goSent=$($nativeResult.GoSent)"
   if ($nativeResult.StandardOutput) { Write-Output $nativeResult.StandardOutput }
   if ($nativeResult.StandardError) { Write-Output $nativeResult.StandardError }
-  if ($nativeResult.TimedOut -or -not $nativeResult.CleanupConfirmed) {
-    throw 'Windows native identity child timed out or fixture cleanup was not confirmed.'
+  Assert-HarnessExecution $nativeResult 'Windows native identity child'
+  if ($null -eq $nativeResult.Token) {
+    throw 'Windows native identity child did not provide token evidence.'
   }
+  Write-Output "STANDARD_USER_TOKEN=PASS sid=$($nativeResult.Token.Sid) elevated=$($nativeResult.Token.IsElevated) adminGroup=$($nativeResult.Token.HasAdministratorsSid) integrity=$($nativeResult.Token.IntegritySid) profileLoaded=$($nativeResult.Token.ProfileHiveLoaded)"
   if ($nativeResult.ExitCode -ne 0) {
     exit $nativeResult.ExitCode
   }
