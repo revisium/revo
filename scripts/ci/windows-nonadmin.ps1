@@ -148,7 +148,6 @@ try {
   if (-not [IO.Path]::IsPathFullyQualified($profilePath) -or -not (Test-Path -LiteralPath $profilePath -PathType Container)) {
     throw 'Windows did not create a usable standard-user profile.'
   }
-  Assert-Equal (Get-DirectoryOwnerSid $profilePath) $accountSid 'Profile owner SID'
 
   $profileWithCaseChange = $profilePath.ToUpperInvariant()
   $profileWithSeparator = $profilePath.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
@@ -300,6 +299,19 @@ try {
   $environment['CI'] = 'true'
 
   $probePrefix = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command')
+  $exitZero = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; exit 0'
+  $zeroResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $exitZero), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 30)
+  if ($zeroResult.ExitCode -ne 0 -or $zeroResult.TimedOut -or -not $zeroResult.CleanupConfirmed) {
+    throw 'Harness exit-code control for child exit 0 failed.'
+  }
+  if ($zeroResult.Token.Sid -cne $accountSid -or
+      -not $zeroResult.Token.ProfileHiveLoaded -or
+      -not [WindowsHarnessNative]::ProfilePathsEqual($zeroResult.Token.ProfilePath, $profilePath)) {
+    throw 'Harness did not confirm the standard user SID, loaded hive, and anchored profile path.'
+  }
+  Write-Output 'CHILD_EXIT_CODE_0_PROBE=PASS'
+  Write-Output 'STANDARD_USER_LOADED_PROFILE_PROBE=PASS'
+
   $earlyExitCommand = '[Console]::WriteLine("RVW_EARLY_EXIT_FIXTURE"); [Console]::Out.Flush(); exit 17'
   $earlyExitResult = $null
   try {
@@ -339,13 +351,6 @@ try {
     throw 'A1 early-exit control did not preserve the expected outcome, exit code, handshake state, and cleanup evidence.'
   }
   Write-Output 'CHILD_EARLY_EXIT_BEFORE_READY_PROBE=PASS'
-
-  $exitZero = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; exit 0'
-  $zeroResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $exitZero), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 30)
-  if ($zeroResult.ExitCode -ne 0 -or $zeroResult.TimedOut -or -not $zeroResult.CleanupConfirmed) {
-    throw 'Harness exit-code control for child exit 0 failed.'
-  }
-  Write-Output 'CHILD_EXIT_CODE_0_PROBE=PASS'
 
   $exitSeventeen = '[Console]::WriteLine("RVW_HARNESS_READY"); [Console]::Out.Flush(); if ([Console]::ReadLine() -cne "GO") { exit 90 }; exit 17'
   $seventeenResult = [WindowsHarnessNative]::RunAsUser($pwshPath, ($probePrefix + $exitSeventeen), $accountName, $env:COMPUTERNAME, $securePassword, $fixtureRoot, $environment, $accountSid, 'RVW_HARNESS_READY', 30)
