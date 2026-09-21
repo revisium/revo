@@ -95,9 +95,13 @@ try {
   $identityMatch = $false
 }
 
-$pathExt = [Environment]::GetEnvironmentVariable('PATHEXT', [EnvironmentVariableTarget]::Process)
+$processEnvironment = [Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process)
+$pathExtPresent = $processEnvironment.Contains('PATHEXT')
+$pathExt = if ($pathExtPresent) { [string]$processEnvironment['PATHEXT'] } else { $null }
+$pathExtState = if (-not $pathExtPresent) { 'absent' } elseif ($pathExt.Length -eq 0) { 'empty' } else { 'nonempty' }
+$pathExtLength = if ($null -eq $pathExt) { 0 } else { $pathExt.Length }
 $extensions = @()
-if ($null -ne $pathExt) {
+if ($pathExtPresent -and $pathExt.Length -gt 0) {
   $extensions = @($pathExt -split ';' | ForEach-Object { $_.Trim().ToUpperInvariant() })
 }
 $argumentPassing = 'unknown'
@@ -141,7 +145,8 @@ if (-not $identityMatch -or -not $profileMatch -or -not $cwdMatch -or -not $exec
     schemaVersion = 1; mode = $Mode; measurement = 'exception'; exceptionKind = 'invalid-operation'
     identityMatch = $identityMatch; profileMatch = $profileMatch; cwdMatch = $cwdMatch; executableMatch = $executableMatch
     powershellVersion = $PSVersionTable.PSVersion.ToString(); runtimeVersion = [Environment]::Version.ToString()
-    pathextPresent = $null -ne $pathExt; pathextHasExe = $extensions -contains '.EXE'; pathextHasCmd = $extensions -contains '.CMD'
+    pathextPresent = $pathExtPresent; pathextState = $pathExtState; pathextLength = $pathExtLength
+    pathextHasExe = $extensions -contains '.EXE'; pathextHasCmd = $extensions -contains '.CMD'
     pathextExactExe = [string]::Equals($pathExt, '.EXE', [StringComparison]::OrdinalIgnoreCase)
     argumentPassing = $argumentPassing; nativeErrorPreference = $errorPreference
     lastExitBeforePresent = $before.Present; lastExitBeforeType = $before.Type; lastExitBeforeCode = $before.Code
@@ -262,7 +267,8 @@ $receipt = [pscustomobject]@{
   schemaVersion = 1; mode = $Mode; measurement = $measurement; exceptionKind = $exceptionKind
   identityMatch = $identityMatch; profileMatch = $profileMatch; cwdMatch = $cwdMatch; executableMatch = $executableMatch
   powershellVersion = $PSVersionTable.PSVersion.ToString(); runtimeVersion = [Environment]::Version.ToString()
-  pathextPresent = $null -ne $pathExt; pathextHasExe = $extensions -contains '.EXE'; pathextHasCmd = $extensions -contains '.CMD'
+  pathextPresent = $pathExtPresent; pathextState = $pathExtState; pathextLength = $pathExtLength
+  pathextHasExe = $extensions -contains '.EXE'; pathextHasCmd = $extensions -contains '.CMD'
   pathextExactExe = [string]::Equals($pathExt, '.EXE', [StringComparison]::OrdinalIgnoreCase)
   argumentPassing = $argumentPassing; nativeErrorPreference = $errorPreference
   lastExitBeforePresent = $before.Present; lastExitBeforeType = $before.Type; lastExitBeforeCode = $before.Code

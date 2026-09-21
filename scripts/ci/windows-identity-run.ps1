@@ -28,9 +28,13 @@ function Get-LastExitCodeEvidence {
 }
 
 function Get-NodeInvocationEnvironmentEvidence {
-  $pathExt = [Environment]::GetEnvironmentVariable('PATHEXT', [EnvironmentVariableTarget]::Process)
+  $processEnvironment = [Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process)
+  $pathExtPresent = $processEnvironment.Contains('PATHEXT')
+  $pathExt = if ($pathExtPresent) { [string]$processEnvironment['PATHEXT'] } else { $null }
+  $pathExtState = if (-not $pathExtPresent) { 'absent' } elseif ($pathExt.Length -eq 0) { 'empty' } else { 'nonempty' }
+  $pathExtLength = if ($null -eq $pathExt) { 0 } else { $pathExt.Length }
   $extensions = @()
-  if ($null -ne $pathExt) {
+  if ($pathExtPresent -and $pathExt.Length -gt 0) {
     $extensions = @($pathExt -split ';' | ForEach-Object { $_.Trim().ToUpperInvariant() })
   }
   $argumentPassing = 'unknown'
@@ -49,7 +53,9 @@ function Get-NodeInvocationEnvironmentEvidence {
   return [pscustomobject]@{
     PowerShellVersion = $PSVersionTable.PSVersion.ToString()
     RuntimeVersion = [Environment]::Version.ToString()
-    PathExtPresent = $null -ne $pathExt
+    PathExtPresent = $pathExtPresent
+    PathExtState = $pathExtState
+    PathExtLength = $pathExtLength
     PathExtHasExe = $extensions -contains '.EXE'
     PathExtHasCmd = $extensions -contains '.CMD'
     PathExtExactExe = [string]::Equals($pathExt, '.EXE', [StringComparison]::OrdinalIgnoreCase)
@@ -412,7 +418,7 @@ try {
   $loggedNodeExit = $nodeExitAfter.Code
   $expectedNodeInfo = "$expectedNodeVersion|win32|x64"
   $loggedNodeExitBefore = $nodeExitBefore.Code
-  Write-Output "NODE_PROBE_CONTEXT powershellVersion=$($nodeInvocationEnvironment.PowerShellVersion) runtimeVersion=$($nodeInvocationEnvironment.RuntimeVersion) pathextPresent=$($nodeInvocationEnvironment.PathExtPresent.ToString().ToLowerInvariant()) pathextHasExe=$($nodeInvocationEnvironment.PathExtHasExe.ToString().ToLowerInvariant()) pathextHasCmd=$($nodeInvocationEnvironment.PathExtHasCmd.ToString().ToLowerInvariant()) pathextExactExe=$($nodeInvocationEnvironment.PathExtExactExe.ToString().ToLowerInvariant()) argumentPassing=$($nodeInvocationEnvironment.ArgumentPassing) nativeErrorPreference=$($nodeInvocationEnvironment.ErrorActionPreference) lastExitBeforePresent=$($nodeExitBefore.Present.ToString().ToLowerInvariant()) lastExitBeforeType=$($nodeExitBefore.Type) lastExitBeforeCode=$loggedNodeExitBefore lastExitAfterPresent=$($nodeExitAfter.Present.ToString().ToLowerInvariant()) lastExitAfterType=$($nodeExitAfter.Type) lastExitAfterCode=$loggedNodeExit"
+  Write-Output "NODE_PROBE_CONTEXT powershellVersion=$($nodeInvocationEnvironment.PowerShellVersion) runtimeVersion=$($nodeInvocationEnvironment.RuntimeVersion) pathextPresent=$($nodeInvocationEnvironment.PathExtPresent.ToString().ToLowerInvariant()) pathextState=$($nodeInvocationEnvironment.PathExtState) pathextLength=$($nodeInvocationEnvironment.PathExtLength) pathextHasExe=$($nodeInvocationEnvironment.PathExtHasExe.ToString().ToLowerInvariant()) pathextHasCmd=$($nodeInvocationEnvironment.PathExtHasCmd.ToString().ToLowerInvariant()) pathextExactExe=$($nodeInvocationEnvironment.PathExtExactExe.ToString().ToLowerInvariant()) argumentPassing=$($nodeInvocationEnvironment.ArgumentPassing) nativeErrorPreference=$($nodeInvocationEnvironment.ErrorActionPreference) lastExitBeforePresent=$($nodeExitBefore.Present.ToString().ToLowerInvariant()) lastExitBeforeType=$($nodeExitBefore.Type) lastExitBeforeCode=$loggedNodeExitBefore lastExitAfterPresent=$($nodeExitAfter.Present.ToString().ToLowerInvariant()) lastExitAfterType=$($nodeExitAfter.Type) lastExitAfterCode=$loggedNodeExit"
   Write-Output "NODE_PROBE invokeSucceeded=$($nodeInvokeSucceeded.ToString().ToLowerInvariant()) exitPresent=$($nodeExitPresent.ToString().ToLowerInvariant()) exitType=$nodeExitType exitCode=$loggedNodeExit outputCount=$nodeOutputCount"
   $preflightStage = 'NODE_OUTPUT_COMPARE'
   $nodeInfo = Assert-NodeRuntimeProbe `

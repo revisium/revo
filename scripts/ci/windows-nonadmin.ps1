@@ -576,7 +576,7 @@ function ConvertFrom-WindowsNodeDiagnosticReceipt(
     }
   $allowedKeys = @(
     'schemaVersion', 'mode', 'measurement', 'exceptionKind', 'identityMatch', 'profileMatch', 'cwdMatch', 'executableMatch',
-    'powershellVersion', 'runtimeVersion', 'pathextPresent', 'pathextHasExe', 'pathextHasCmd', 'pathextExactExe',
+    'powershellVersion', 'runtimeVersion', 'pathextPresent', 'pathextState', 'pathextLength', 'pathextHasExe', 'pathextHasCmd', 'pathextExactExe',
     'argumentPassing', 'nativeErrorPreference', 'lastExitBeforePresent', 'lastExitBeforeType', 'lastExitBeforeCode',
     'invokeSucceeded', 'outputCount', 'runtimeMatch', 'lastExitAfterPresent', 'lastExitAfterType', 'lastExitAfterCode',
     'stderrBytes', 'stderrReadSucceeded', 'stderrTruncated', 'stderrCleanupConfirmed',
@@ -616,6 +616,7 @@ function ConvertFrom-WindowsNodeDiagnosticReceipt(
   if (($receipt.schemaVersion -isnot [int] -and $receipt.schemaVersion -isnot [long]) -or $receipt.schemaVersion -ne 1 -or
       $receipt.mode -cne $ExpectedMode -or $receipt.measurement -notin @('match', 'mismatch', 'exception') -or
       $receipt.exceptionKind -notin @('none', 'command-not-found', 'native-command', 'access-denied', 'io', 'invalid-operation', 'other') -or
+      $receipt.pathextState -notin @('absent', 'empty', 'nonempty') -or
       $receipt.argumentPassing -notin @('Legacy', 'Standard', 'Windows', 'unknown') -or
       $receipt.nativeErrorPreference -notin @('true', 'false', 'unknown') -or
       $receipt.lastExitBeforeType -notin @('none', 'int32', 'other') -or
@@ -631,9 +632,9 @@ function ConvertFrom-WindowsNodeDiagnosticReceipt(
   foreach ($name in $booleanNames) {
     if ($receipt[$name] -isnot [bool]) { return $invalid }
   }
-  foreach ($name in @('outputCount', 'stderrBytes', 'directStdoutBytes', 'directStderrBytes')) {
+  foreach ($name in @('outputCount', 'pathextLength', 'stderrBytes', 'directStdoutBytes', 'directStderrBytes')) {
     if ($receipt[$name] -isnot [int] -and $receipt[$name] -isnot [long]) { return $invalid }
-    if ($receipt[$name] -lt 0) { return $invalid }
+    if ($receipt[$name] -lt 0 -or ($name -eq 'pathextLength' -and $receipt[$name] -gt 32767)) { return $invalid }
   }
   foreach ($name in @('powershellVersion', 'runtimeVersion', 'lastExitBeforeCode', 'lastExitAfterCode', 'directExitCode', 'directFailure')) {
     if ($receipt[$name] -isnot [string] -or $receipt[$name].Length -gt 64 -or
@@ -641,6 +642,9 @@ function ConvertFrom-WindowsNodeDiagnosticReceipt(
   }
   if ($receipt.powershellVersion -notmatch '^\d+(?:\.\d+){1,3}$' -or
       $receipt.runtimeVersion -notmatch '^\d+(?:\.\d+){1,3}$' -or
+      ($receipt.pathextState -eq 'absent' -and ($receipt.pathextPresent -or $receipt.pathextLength -ne 0)) -or
+      ($receipt.pathextState -eq 'empty' -and (-not $receipt.pathextPresent -or $receipt.pathextLength -ne 0)) -or
+      ($receipt.pathextState -eq 'nonempty' -and (-not $receipt.pathextPresent -or $receipt.pathextLength -eq 0)) -or
       -not (Test-WindowsNodeExitEvidence $receipt.lastExitBeforePresent $receipt.lastExitBeforeType $receipt.lastExitBeforeCode) -or
       -not (Test-WindowsNodeExitEvidence $receipt.lastExitAfterPresent $receipt.lastExitAfterType $receipt.lastExitAfterCode)) {
     return $invalid
@@ -652,11 +656,13 @@ function ConvertFrom-WindowsNodeDiagnosticReceipt(
       $receipt.stderrBytes -gt 16777216 -or $receipt.outputCount -gt 2) {
     return $invalid
   }
-  $expectedPathExt = $ExpectedCase -in @('B', 'E')
-  if ($receipt.pathextPresent -ne $expectedPathExt -or
-      $receipt.pathextHasExe -ne $expectedPathExt -or
-      $receipt.pathextHasCmd -or
-      $receipt.pathextExactExe -ne $expectedPathExt) {
+  $expectedPathExtOverride = $ExpectedCase -in @('B', 'E')
+  if ($expectedPathExtOverride) {
+    if ($receipt.pathextState -ne 'nonempty' -or $receipt.pathextLength -ne 4 -or
+        -not $receipt.pathextHasExe -or $receipt.pathextHasCmd -or -not $receipt.pathextExactExe) {
+      return $invalid
+    }
+  } elseif ($receipt.pathextHasExe -or $receipt.pathextExactExe) {
     return $invalid
   }
   if ($ExpectedMode -in @('runtime-null', 'runtime-file')) {
@@ -796,6 +802,7 @@ function Invoke-WindowsNodeInvocationDiagnostics(
   )
   [Console]::Out.WriteLine("WINDOWS_NODE_DIAGNOSTIC_PROVENANCE sourceSha=$SourceSha treeSha=$TreeSha archiveSha256=$ArchiveSha256 diagnosticScriptHashMatch=$($DiagnosticScriptHashMatch.ToString().ToLowerInvariant()) runId=$RunId runAttempt=$RunAttempt")
   $bMatched = $false
+  $baselinePathExtEvidence = $null
   foreach ($item in $plan) {
     if ($item.Case -eq 'E' -and -not $bMatched) {
       $result.Cases.Add([pscustomobject]@{
@@ -847,6 +854,21 @@ function Invoke-WindowsNodeInvocationDiagnostics(
       return $result
     }
     $receipt = $parsed.Receipt
+    $pathExtEvidence = @(
+      $receipt.pathextPresent.ToString().ToLowerInvariant(),
+      $receipt.pathextState,
+      $receipt.pathextLength.ToString([Globalization.CultureInfo]::InvariantCulture),
+      $receipt.pathextHasExe.ToString().ToLowerInvariant(),
+      $receipt.pathextHasCmd.ToString().ToLowerInvariant(),
+      $receipt.pathextExactExe.ToString().ToLowerInvariant()
+    ) -join '|'
+    if ($item.Case -eq 'A') {
+      $baselinePathExtEvidence = $pathExtEvidence
+    } elseif ($item.Case -in @('A2', 'C', 'D') -and
+        ($null -eq $baselinePathExtEvidence -or $pathExtEvidence -cne $baselinePathExtEvidence)) {
+      $result.StopReason = 'baseline-pathext-mutated'
+      return $result
+    }
     if ($item.Case -eq 'B') { $bMatched = $receipt.measurement -eq 'match' }
     $caseResult = [pscustomobject]@{
       Case = $item.Case
@@ -859,7 +881,7 @@ function Invoke-WindowsNodeInvocationDiagnostics(
       Result = $receipt
     }
     $result.Cases.Add($caseResult)
-    [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=$environmentDelta measurement=$($receipt.measurement) supervision=confirmed receipt=complete cleanupConfirmed=true identityMatch=$($receipt.identityMatch.ToString().ToLowerInvariant()) profileMatch=$($receipt.profileMatch.ToString().ToLowerInvariant()) cwdMatch=$($receipt.cwdMatch.ToString().ToLowerInvariant()) executableMatch=$($receipt.executableMatch.ToString().ToLowerInvariant()) powershellVersion=$($receipt.powershellVersion) runtimeVersion=$($receipt.runtimeVersion) pathextPresent=$($receipt.pathextPresent.ToString().ToLowerInvariant()) pathextHasExe=$($receipt.pathextHasExe.ToString().ToLowerInvariant()) pathextHasCmd=$($receipt.pathextHasCmd.ToString().ToLowerInvariant()) pathextExactExe=$($receipt.pathextExactExe.ToString().ToLowerInvariant()) argumentPassing=$($receipt.argumentPassing) nativeErrorPreference=$($receipt.nativeErrorPreference) lastExitBeforePresent=$($receipt.lastExitBeforePresent.ToString().ToLowerInvariant()) lastExitBeforeType=$($receipt.lastExitBeforeType) lastExitBeforeCode=$($receipt.lastExitBeforeCode) invokeSucceeded=$($receipt.invokeSucceeded.ToString().ToLowerInvariant()) outputCount=$($receipt.outputCount) runtimeMatch=$($receipt.runtimeMatch.ToString().ToLowerInvariant()) lastExitAfterPresent=$($receipt.lastExitAfterPresent.ToString().ToLowerInvariant()) lastExitAfterType=$($receipt.lastExitAfterType) lastExitAfterCode=$($receipt.lastExitAfterCode) stderrBytes=$($receipt.stderrBytes) stderrReadSucceeded=$($receipt.stderrReadSucceeded.ToString().ToLowerInvariant()) stderrTruncated=$($receipt.stderrTruncated.ToString().ToLowerInvariant()) directStarted=$($receipt.directStarted.ToString().ToLowerInvariant()) directExitObserved=$($receipt.directExitObserved.ToString().ToLowerInvariant()) directExitCode=$($receipt.directExitCode) directStdoutBytes=$($receipt.directStdoutBytes) directStderrBytes=$($receipt.directStderrBytes) directStdoutEof=$($receipt.directStdoutEof.ToString().ToLowerInvariant()) directStderrEof=$($receipt.directStderrEof.ToString().ToLowerInvariant()) directCleanupConfirmed=$($receipt.directCleanupConfirmed.ToString().ToLowerInvariant()) directFailure=$($receipt.directFailure)")
+    [Console]::Out.WriteLine("WINDOWS_NODE_INVOCATION case=$($item.Case) mode=$($item.Mode) environmentDelta=$environmentDelta measurement=$($receipt.measurement) supervision=confirmed receipt=complete cleanupConfirmed=true identityMatch=$($receipt.identityMatch.ToString().ToLowerInvariant()) profileMatch=$($receipt.profileMatch.ToString().ToLowerInvariant()) cwdMatch=$($receipt.cwdMatch.ToString().ToLowerInvariant()) executableMatch=$($receipt.executableMatch.ToString().ToLowerInvariant()) powershellVersion=$($receipt.powershellVersion) runtimeVersion=$($receipt.runtimeVersion) pathextPresent=$($receipt.pathextPresent.ToString().ToLowerInvariant()) pathextState=$($receipt.pathextState) pathextLength=$($receipt.pathextLength) pathextHasExe=$($receipt.pathextHasExe.ToString().ToLowerInvariant()) pathextHasCmd=$($receipt.pathextHasCmd.ToString().ToLowerInvariant()) pathextExactExe=$($receipt.pathextExactExe.ToString().ToLowerInvariant()) argumentPassing=$($receipt.argumentPassing) nativeErrorPreference=$($receipt.nativeErrorPreference) lastExitBeforePresent=$($receipt.lastExitBeforePresent.ToString().ToLowerInvariant()) lastExitBeforeType=$($receipt.lastExitBeforeType) lastExitBeforeCode=$($receipt.lastExitBeforeCode) invokeSucceeded=$($receipt.invokeSucceeded.ToString().ToLowerInvariant()) outputCount=$($receipt.outputCount) runtimeMatch=$($receipt.runtimeMatch.ToString().ToLowerInvariant()) lastExitAfterPresent=$($receipt.lastExitAfterPresent.ToString().ToLowerInvariant()) lastExitAfterType=$($receipt.lastExitAfterType) lastExitAfterCode=$($receipt.lastExitAfterCode) stderrBytes=$($receipt.stderrBytes) stderrReadSucceeded=$($receipt.stderrReadSucceeded.ToString().ToLowerInvariant()) stderrTruncated=$($receipt.stderrTruncated.ToString().ToLowerInvariant()) directStarted=$($receipt.directStarted.ToString().ToLowerInvariant()) directExitObserved=$($receipt.directExitObserved.ToString().ToLowerInvariant()) directExitCode=$($receipt.directExitCode) directStdoutBytes=$($receipt.directStdoutBytes) directStderrBytes=$($receipt.directStderrBytes) directStdoutEof=$($receipt.directStdoutEof.ToString().ToLowerInvariant()) directStderrEof=$($receipt.directStderrEof.ToString().ToLowerInvariant()) directCleanupConfirmed=$($receipt.directCleanupConfirmed.ToString().ToLowerInvariant()) directFailure=$($receipt.directFailure)")
   }
   if (-not (Test-FixtureEnvironmentEqual $BaseEnvironment $baselineBefore)) {
     $result.StopReason = 'baseline-environment-mutated'
@@ -1017,6 +1039,9 @@ function Invoke-WindowsNodeDiagnosticsFailClosed([int]$BaselineExitCode, [object
     Complete = $false
     RetentionRequired = $retentionRequired
     Reason = 'gate-unavailable'
+    FailureStage = 'none'
+    FailureKind = 'none'
+    MissingFunction = $false
   }
   if ($null -ne $Gate -and $null -ne $Gate.PSObject.Properties['Reason'] -and $Gate.Reason -is [string]) {
     $attempt.Reason = $Gate.Reason
@@ -1047,8 +1072,45 @@ function Invoke-WindowsNodeDiagnosticsFailClosed([int]$BaselineExitCode, [object
     return $attempt
   } catch {
     $attempt.Reason = 'diagnostic-exception'
+    $attempt.FailureStage = 'invoker'
+    if ($_.Exception -is [Management.Automation.CommandNotFoundException]) {
+      $attempt.FailureKind = 'command-not-found'
+      $attempt.MissingFunction = $true
+    } else {
+      $attempt.FailureKind = 'other'
+    }
     return $attempt
   }
+}
+
+function Invoke-WindowsDiagnosticNativeRunAsUser(
+  [string]$Executable,
+  [string[]]$Arguments,
+  [string]$UserName,
+  [string]$Domain,
+  [Security.SecureString]$Password,
+  [string]$WorkingDirectory,
+  [System.Collections.IDictionary]$Environment,
+  [string]$ExpectedSid,
+  [string]$ReadyMarker,
+  [int]$ReadyTimeoutSeconds,
+  [int]$ExecutionTimeoutSeconds,
+  [int]$CleanupTimeoutSeconds
+) {
+  return [WindowsHarnessNative]::RunAsUser(
+    $Executable,
+    $Arguments,
+    $UserName,
+    $Domain,
+    $Password,
+    $WorkingDirectory,
+    $Environment,
+    $ExpectedSid,
+    $ReadyMarker,
+    $ReadyTimeoutSeconds,
+    $ExecutionTimeoutSeconds,
+    $CleanupTimeoutSeconds
+  )
 }
 
 function Get-WindowsFixturePathState([string]$Path) {
@@ -2028,21 +2090,20 @@ try {
       $diagnosticRunner = {
         param($Executable, $Arguments, $WorkingDirectory, $ChildEnvironment, $ReadyTimeout, $ExecutionTimeout, $CleanupTimeout)
         [void](Assert-WindowsCredentialedCommandLineBound $Executable $Arguments)
-        return [WindowsHarnessNative]::RunAsUser(
-          $Executable,
-          $Arguments,
-          $accountName,
-          $env:COMPUTERNAME,
-          $securePassword,
-          $WorkingDirectory,
-          $ChildEnvironment,
-          $accountSid,
-          'RVW_NODE_DIAGNOSTIC_READY',
-          $ReadyTimeout,
-          $ExecutionTimeout,
-          $CleanupTimeout
-        )
-      }.GetNewClosure()
+        return Invoke-WindowsDiagnosticNativeRunAsUser `
+          -Executable $Executable `
+          -Arguments $Arguments `
+          -UserName $accountName `
+          -Domain $env:COMPUTERNAME `
+          -Password $securePassword `
+          -WorkingDirectory $WorkingDirectory `
+          -Environment $ChildEnvironment `
+          -ExpectedSid $accountSid `
+          -ReadyMarker 'RVW_NODE_DIAGNOSTIC_READY' `
+          -ReadyTimeoutSeconds $ReadyTimeout `
+          -ExecutionTimeoutSeconds $ExecutionTimeout `
+          -CleanupTimeoutSeconds $CleanupTimeout
+      }
       return Invoke-WindowsNodeInvocationDiagnostics `
         -BaseEnvironment $environment `
         -PowerShellPath $pwshPath `
@@ -2057,7 +2118,7 @@ try {
         -DiagnosticScriptHashMatch $diagnosticBootstrap.Ready `
         -RunId ([string]$env:GITHUB_RUN_ID) `
         -RunAttempt ([string]$env:GITHUB_RUN_ATTEMPT)
-    }.GetNewClosure()
+    }
     try {
       $diagnosticAttempt = Invoke-WindowsNodeDiagnosticsFailClosed $baselineExitCode $diagnosticGate $diagnosticInvoker
       $scriptExitCode = $diagnosticAttempt.ExitCode
@@ -2067,7 +2128,7 @@ try {
       } elseif ($diagnosticAttempt.Reason -eq 'diagnostic-bootstrap-unverified') {
         Write-Output "WINDOWS_NODE_DIAGNOSTICS=skipped reason=$($diagnosticAttempt.Reason) baselineExit=90"
       } else {
-        Write-Output "WINDOWS_NODE_DIAGNOSTICS=failed reason=$($diagnosticAttempt.Reason) baselineExit=90"
+        Write-Output "WINDOWS_NODE_DIAGNOSTICS=failed reason=$($diagnosticAttempt.Reason) stage=$($diagnosticAttempt.FailureStage) kind=$($diagnosticAttempt.FailureKind) missingFunction=$($diagnosticAttempt.MissingFunction.ToString().ToLowerInvariant()) baselineExit=90"
       }
     } catch {
       $scriptExitCode = $baselineExitCode

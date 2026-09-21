@@ -9,13 +9,16 @@ $requiredFunctions = @(
   'Copy-FixtureEnvironment',
   'Test-FixtureEnvironmentEqual',
   'Get-FixtureEnvironmentDelta',
+  'Get-WindowsCredentialedCommandLineBound',
+  'Assert-WindowsCredentialedCommandLineBound',
   'Test-WindowsNodeExitEvidence',
   'ConvertFrom-WindowsNodeDiagnosticReceipt',
   'Test-WindowsNodeDiagnosticSupervision',
   'Invoke-WindowsNodeInvocationDiagnostics',
   'New-WindowsNodeDiagnosticBootstrap',
   'Get-WindowsNodeDiagnosticGate',
-  'Invoke-WindowsNodeDiagnosticsFailClosed'
+  'Invoke-WindowsNodeDiagnosticsFailClosed',
+  'Invoke-WindowsDiagnosticNativeRunAsUser'
 )
 
 function Assert-DiagnosticTest([bool]$Condition, [string]$Message) {
@@ -37,6 +40,22 @@ foreach ($name in $requiredFunctions) {
   if (-not $found.ContainsKey($name)) { throw "WINDOWS_HARNESS_DIAGNOSTIC_TEST_FAILED: missing function $name" }
   Invoke-Expression $found[$name]
 }
+$productionInvokerAssignments = @($ast.FindAll({
+      param($node)
+      $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left.Extent.Text -eq '$diagnosticInvoker'
+    }, $true))
+Assert-DiagnosticTest ($productionInvokerAssignments.Count -eq 1) 'production diagnostic invoker wiring was not unique'
+$productionInvokerAssignment = $productionInvokerAssignments[0]
+Assert-DiagnosticTest (-not $productionInvokerAssignment.Right.Extent.Text.Contains('.GetNewClosure()')) 'production diagnostic invoker must remain in its live script scope'
+$productionInvokerBlocks = @($productionInvokerAssignment.Right.FindAll({
+      param($node)
+      $node -is [Management.Automation.Language.ScriptBlockExpressionAst]
+    }, $true))
+$productionInvokerBlocks = @($productionInvokerBlocks | Where-Object {
+    $_.Extent.Text.Contains('Invoke-WindowsNodeInvocationDiagnostics')
+  })
+Assert-DiagnosticTest ($productionInvokerBlocks.Count -eq 1) 'outer production diagnostic scriptblock was not uniquely found'
 if ($IsWindows -and $null -eq ('WindowsHarnessNative' -as [type])) {
   Add-Type -Path (Join-Path $PSScriptRoot 'windows-harness-native.cs') -ErrorAction Stop
 }
@@ -95,6 +114,8 @@ function New-TestNodeReceipt(
     powershellVersion = '7.6.5'
     runtimeVersion = '10.0.11'
     pathextPresent = $Case -in @('B', 'E')
+    pathextState = if ($Case -in @('B', 'E')) { 'nonempty' } else { 'absent' }
+    pathextLength = if ($Case -in @('B', 'E')) { [long]4 } else { [long]0 }
     pathextHasExe = $Case -in @('B', 'E')
     pathextHasCmd = $false
     pathextExactExe = $Case -in @('B', 'E')
@@ -345,6 +366,9 @@ $successfulAttempt = Invoke-WindowsNodeDiagnosticsFailClosed 90 $gate { [pscusto
 Assert-DiagnosticTest ($successfulAttempt.ExitCode -eq 90 -and $successfulAttempt.Complete -and -not $successfulAttempt.RetentionRequired) 'successful diagnostics changed baseline exit 90 or retained unnecessarily'
 $throwingAttempt = Invoke-WindowsNodeDiagnosticsFailClosed 90 $gate { throw 'SENTINEL_DIAGNOSTIC_EXCEPTION' }
 Assert-DiagnosticTest ($throwingAttempt.ExitCode -eq 90 -and -not $throwingAttempt.Complete -and $throwingAttempt.RetentionRequired -and $throwingAttempt.Reason -eq 'diagnostic-exception') 'runner exception changed exit 90 or did not retain'
+Assert-DiagnosticTest ($throwingAttempt.FailureStage -eq 'invoker' -and $throwingAttempt.FailureKind -eq 'other' -and -not $throwingAttempt.MissingFunction) 'diagnostic exception was not classified without leaking its message'
+$missingFunctionAttempt = Invoke-WindowsNodeDiagnosticsFailClosed 90 $gate { Invoke-NonexistentWindowsDiagnosticFunction }
+Assert-DiagnosticTest ($missingFunctionAttempt.ExitCode -eq 90 -and $missingFunctionAttempt.RetentionRequired -and $missingFunctionAttempt.FailureKind -eq 'command-not-found' -and $missingFunctionAttempt.MissingFunction) 'missing diagnostic function was not safely identified'
 $invalidResultAttempt = Invoke-WindowsNodeDiagnosticsFailClosed 90 $gate { [pscustomobject]@{ Complete = $false; RetentionRequired = $true } }
 Assert-DiagnosticTest ($invalidResultAttempt.ExitCode -eq 90 -and -not $invalidResultAttempt.Complete -and $invalidResultAttempt.RetentionRequired) 'invalid/parser result changed exit 90 or did not retain'
 $invokerCalls = 0
@@ -353,7 +377,7 @@ Assert-DiagnosticTest ($provenanceFailureAttempt.ExitCode -eq 90 -and $provenanc
 Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=baseline-exit-and-retention-invariant result=PASS'
 Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=exact-baseline-gate result=PASS'
 
-$callState = [pscustomobject]@{ Count = 0; Calls = [System.Collections.Generic.List[object]]::new(); MutateFirst = $false; ThrowFirst = $false; LastResult = $null }
+$callState = [pscustomobject]@{ Count = 0; Calls = [System.Collections.Generic.List[object]]::new(); MutateFirst = $false; MutateBaselinePathExt = $false; ThrowFirst = $false; LastResult = $null }
 $caseNames = @('A', 'B', 'A2', 'C', 'D', 'E')
 $caseMatches = @{ A = $false; B = $true; A2 = $false; C = $false; D = $true; E = $true }
 $runner = {
@@ -371,7 +395,13 @@ $runner = {
     })
   if ($callState.ThrowFirst -and $callState.Count -eq 1) { throw 'SENTINEL_RUNNER_EXCEPTION' }
   $exitCode = if ($caseMatches[$caseName]) { 0 } else { 90 }
-  $result = New-TestRunResult (New-TestNodeReceipt $Arguments[-1] $caseName $caseMatches[$caseName]) $exitCode
+  $receipt = New-TestNodeReceipt $Arguments[-1] $caseName $caseMatches[$caseName]
+  if ($callState.MutateBaselinePathExt -and $caseName -eq 'A2') {
+    $receipt.pathextPresent = $true
+    $receipt.pathextState = 'nonempty'
+    $receipt.pathextLength = [long]4
+  }
+  $result = New-TestRunResult $receipt $exitCode
   if ($callState.MutateFirst -and $callState.Count -eq 1) { $Environment['INJECTED'] = 'mutation' }
   $supervisedResult = [pscustomobject]@{
     FailureCode = ''
@@ -389,7 +419,7 @@ $runner = {
   }
   $callState.LastResult = $supervisedResult
   return $supervisedResult
-}.GetNewClosure()
+}
 
 $diagnosticPath = Join-Path $PSScriptRoot 'windows-node-invocation-diagnostic.ps1'
 $diagnosticOutput = @(Invoke-WindowsNodeInvocationDiagnostics `
@@ -425,6 +455,28 @@ foreach ($call in $callState.Calls) {
 }
 Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=ab-a2-and-single-result result=PASS'
 
+$emptyPathExtReceipt = New-TestNodeReceipt 'runtime-null' 'A' $false
+$emptyPathExtReceipt.pathextPresent = $true
+$emptyPathExtReceipt.pathextState = 'empty'
+$emptyPathExtReceipt.pathextLength = [long]0
+$emptyPathExt = ConvertFrom-WindowsNodeDiagnosticReceipt (New-TestRunResult $emptyPathExtReceipt 90) 'runtime-null' 'A'
+Assert-DiagnosticTest ($emptyPathExt.Valid) 'present-but-empty PATHEXT was not distinguished from absence'
+$otherPathExtReceipt = New-TestNodeReceipt 'runtime-null' 'A' $false
+$otherPathExtReceipt.pathextPresent = $true
+$otherPathExtReceipt.pathextState = 'nonempty'
+$otherPathExtReceipt.pathextLength = [long]4
+$otherPathExt = ConvertFrom-WindowsNodeDiagnosticReceipt (New-TestRunResult $otherPathExtReceipt 90) 'runtime-null' 'A'
+Assert-DiagnosticTest ($otherPathExt.Valid) 'nonempty baseline PATHEXT without .EXE was rejected'
+$confoundedPathExtReceipt = New-TestNodeReceipt 'runtime-null' 'A' $false
+$confoundedPathExtReceipt.pathextPresent = $true
+$confoundedPathExtReceipt.pathextState = 'nonempty'
+$confoundedPathExtReceipt.pathextLength = [long]4
+$confoundedPathExtReceipt.pathextHasExe = $true
+$confoundedPathExtReceipt.pathextExactExe = $true
+$confoundedPathExt = ConvertFrom-WindowsNodeDiagnosticReceipt (New-TestRunResult $confoundedPathExtReceipt 90) 'runtime-null' 'A'
+Assert-DiagnosticTest (-not $confoundedPathExt.Valid) 'baseline already containing .EXE was accepted as an A/B contrast'
+Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=pathext-state-contract result=PASS'
+
 $callState.Count = 0
 $callState.Calls.Clear()
 $callState.LastResult = $null
@@ -447,6 +499,29 @@ Assert-DiagnosticTest ($bMismatchOutput.Count -eq 1 -and $bMismatchOutput[0].Com
 Assert-DiagnosticTest ($callState.Count -eq 5 -and $bMismatchOutput[0].Cases[5].Measurement -eq 'skipped' -and $bMismatchOutput[0].Cases[5].Supervision -eq 'not-run') 'E was not skipped after B mismatch'
 $caseMatches.B = $true
 Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=b-mismatch-skips-e result=PASS'
+
+$callState.Count = 0
+$callState.Calls.Clear()
+$callState.LastResult = $null
+$callState.MutateBaselinePathExt = $true
+$baselineMutationOutput = @(Invoke-WindowsNodeInvocationDiagnostics `
+    -BaseEnvironment $baseEnvironment `
+    -PowerShellPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+    -DiagnosticScriptPath $diagnosticPath `
+    -WorkingDirectory 'C:\fixture\workspace' `
+    -ExpectedSid $expectedSid `
+    -ExpectedProfile $expectedProfile `
+    -Runner $runner `
+    -SourceSha ('a' * 40) `
+    -TreeSha ('b' * 40) `
+    -ArchiveSha256 ('c' * 64) `
+    -DiagnosticScriptHashMatch $true `
+    -RunId '123456' `
+    -RunAttempt '1')
+Assert-DiagnosticTest ($baselineMutationOutput.Count -eq 1 -and -not $baselineMutationOutput[0].Complete -and $baselineMutationOutput[0].StopReason -eq 'baseline-pathext-mutated') 'A/A2 PATHEXT state mutation did not fail closed'
+Assert-DiagnosticTest ($callState.Count -eq 3) 'baseline PATHEXT mutation did not stop after A/B/A2'
+$callState.MutateBaselinePathExt = $false
+Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=baseline-pathext-repeatability result=PASS'
 
 $callState.Count = 0
 $callState.Calls.Clear()
@@ -492,4 +567,69 @@ Assert-DiagnosticTest ($exceptionOutput.Count -eq 1 -and -not $exceptionOutput[0
 Assert-DiagnosticTest ($callState.Count -eq 1) 'runner exception did not stop subsequent cases'
 Assert-DiagnosticTest (-not ($exceptionOutput | Out-String).Contains('SENTINEL_RUNNER_EXCEPTION')) 'runner exception text leaked'
 Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=runner-exception-fail-stop result=PASS'
+
+$callState.Count = 0
+$callState.Calls.Clear()
+$callState.LastResult = $null
+$callState.ThrowFirst = $false
+$script:ProductionDiagnosticRunner = $runner
+$script:ProductionNativeCalls = [System.Collections.Generic.List[object]]::new()
+function Invoke-WindowsDiagnosticNativeRunAsUser {
+  param(
+    $Executable, $Arguments, $UserName, $Domain, $Password, $WorkingDirectory,
+    $Environment, $ExpectedSid, $ReadyMarker, $ReadyTimeoutSeconds,
+    $ExecutionTimeoutSeconds, $CleanupTimeoutSeconds
+  )
+  $script:ProductionNativeCalls.Add([pscustomobject]@{
+      UserName = $UserName
+      ExpectedSid = $ExpectedSid
+      ReadyMarker = $ReadyMarker
+      ReadyTimeoutSeconds = $ReadyTimeoutSeconds
+      ExecutionTimeoutSeconds = $ExecutionTimeoutSeconds
+      CleanupTimeoutSeconds = $CleanupTimeoutSeconds
+    })
+  return & $script:ProductionDiagnosticRunner $Executable $Arguments $WorkingDirectory $Environment `
+    $ReadyTimeoutSeconds $ExecutionTimeoutSeconds $CleanupTimeoutSeconds
+}
+function Invoke-TestProductionDiagnosticInvoker([scriptblock]$Invoker) {
+  $result = & $Invoker
+  return $result
+}
+
+$accountName = 'revo-diagnostic-standard-user'
+$securePassword = [Security.SecureString]::new()
+$environment = $baseEnvironment
+$pwshPath = 'C:\Program Files\PowerShell\7\pwsh.exe'
+$diagnosticBootstrap = [pscustomobject]@{ Path = $diagnosticPath; Ready = $true }
+$fixtureRoot = 'C:\fixture\workspace'
+$accountSid = $expectedSid
+$profilePath = $expectedProfile
+$head = 'a' * 40
+$tree = 'b' * 40
+$archiveHash = 'c' * 64
+$productionInvoker = $productionInvokerBlocks[0].ScriptBlock.GetScriptBlock()
+$productionResult = @(Invoke-TestProductionDiagnosticInvoker $productionInvoker)
+$productionResultObject = if ($productionResult.Count -eq 1) { $productionResult[0] } else { $null }
+$productionCompleteProperty = if ($null -eq $productionResultObject) { $null } else { $productionResultObject.PSObject.Properties['Complete'] }
+$productionStopReason = if ($null -eq $productionResultObject -or $null -eq $productionResultObject.PSObject.Properties['StopReason']) { 'missing' } else { [string]$productionResultObject.StopReason }
+if ($null -eq $productionCompleteProperty -or -not $productionCompleteProperty.Value) {
+  $productionType = if ($null -eq $productionResultObject) { 'none' } else { $productionResultObject.GetType().FullName }
+  $productionProperties = if ($null -eq $productionResultObject) { 'none' } else { @($productionResultObject.PSObject.Properties.Name | Sort-Object) -join ',' }
+  Write-Output "WINDOWS_HARNESS_DIAGNOSTIC_TEST production-wiring-diagnostic type=$productionType properties=$productionProperties reason=$productionStopReason calls=$($script:ProductionNativeCalls.Count)"
+}
+Assert-DiagnosticTest ($productionResult.Count -eq 1 -and $null -ne $productionCompleteProperty -and
+  $productionCompleteProperty.Value -and $productionResultObject.RetentionRequired -eq $false -and
+  $productionResultObject.Cases.Count -eq 6) (
+  "production invoker wiring failed from nested script scope: count=$($productionResult.Count) " +
+    "type=$(if ($null -eq $productionResultObject) { 'none' } else { $productionResultObject.GetType().FullName }) " +
+    "reason=$productionStopReason calls=$($script:ProductionNativeCalls.Count)"
+)
+Assert-DiagnosticTest ($script:ProductionNativeCalls.Count -eq 6 -and $callState.Count -eq 6) 'production invoker did not reach the substituted native runner for all cases'
+Assert-DiagnosticTest ($script:ProductionNativeCalls[0].UserName -ceq $accountName -and
+  $script:ProductionNativeCalls[0].ExpectedSid -ceq $expectedSid -and
+  $script:ProductionNativeCalls[0].ReadyMarker -ceq 'RVW_NODE_DIAGNOSTIC_READY' -and
+  $script:ProductionNativeCalls[0].ReadyTimeoutSeconds -eq 30 -and
+  $script:ProductionNativeCalls[0].ExecutionTimeoutSeconds -eq 30 -and
+  $script:ProductionNativeCalls[0].CleanupTimeoutSeconds -eq 15) 'production wiring changed the ordinary-user identity or supervised timeouts'
+Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TEST case=nested-production-wiring result=PASS'
 Write-Output 'WINDOWS_HARNESS_DIAGNOSTIC_TESTS=PASS'
