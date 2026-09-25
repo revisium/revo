@@ -7,6 +7,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  realpath,
   rm,
   stat,
   symlink,
@@ -35,8 +36,12 @@ const emitChunks = (chunks: readonly string[] | undefined, fallback: string, fd 
     )
     .join('\n');
 
-export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unknown) {
-  const root = await mkdtemp(join(tmpdir(), 'revo-bootstrap-data-'));
+export async function pnpmBootstrapScenario(
+  enginePath: string,
+  bootstrap: unknown,
+  { temporaryParent = tmpdir() }: { readonly temporaryParent?: string } = {},
+) {
+  const root = await realpath(await mkdtemp(join(temporaryParent, 'revo-bootstrap-data-')));
   const dataPath = join(root, 'bootstrap.json');
   const receiptPath = join(root, 'install-receipt.json');
   const nodeExecutable = join(root, 'node');
@@ -141,6 +146,8 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
       stdoutChunks,
       stderrChunks,
       probeExitCode = 0,
+      probeCwd = 'isolated',
+      probeHome = 'isolated',
     }: {
       readonly hardlink?: boolean;
       readonly version?: string;
@@ -150,6 +157,8 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
       readonly stdoutChunks?: readonly string[];
       readonly stderrChunks?: readonly string[];
       readonly probeExitCode?: number;
+      readonly probeCwd?: 'isolated' | 'outside-spoofed-pwd';
+      readonly probeHome?: 'isolated' | 'wrong';
     } = {}) => {
       const source = await mkdtemp(join(root, 'payload-'));
       await mkdir(join(source, 'dist'));
@@ -161,12 +170,17 @@ if [ "$1" != "--pm-on-fail=ignore" ] || [ "$2" != "--version" ]; then
   echo "pnpm probe arguments were not isolated" >&2
   exit 91
 fi
-case "$PWD" in "${root}"/.pnpm-probe-*) ;; *) echo "pnpm probe cwd was not isolated" >&2; exit 92 ;; esac
-case "$HOME" in "${root}"/.pnpm-probe-*/home) ;; *) echo "pnpm probe home was not isolated" >&2; exit 93 ;; esac
-test -d "$XDG_CONFIG_HOME" || exit 94
-test -d "$XDG_CACHE_HOME" || exit 95
-test -d "$XDG_DATA_HOME" || exit 96
-test -d "$XDG_STATE_HOME" || exit 97
+${probeCwd === 'outside-spoofed-pwd' ? `cd /\nPWD=${shellQuote(`${root}/.pnpm-probe-spoof`)}` : ''}
+${probeHome === 'wrong' ? 'HOME=/' : ''}
+probe_cwd=$(pwd -P)
+test "\${probe_cwd%/*}" = ${shellQuote(root)} || { echo "pnpm probe cwd was not isolated" >&2; exit 92; }
+case "\${probe_cwd##*/}" in .pnpm-probe-?*) ;; *) echo "pnpm probe cwd was not isolated" >&2; exit 92 ;; esac
+test "$HOME" = "$probe_cwd/home" || { echo "pnpm probe home was not isolated" >&2; exit 93; }
+test "$TMPDIR" = "$probe_cwd" || exit 98
+test "$XDG_CONFIG_HOME" = "$probe_cwd/config" && test -d "$XDG_CONFIG_HOME" || exit 94
+test "$XDG_CACHE_HOME" = "$probe_cwd/cache" && test -d "$XDG_CACHE_HOME" || exit 95
+test "$XDG_DATA_HOME" = "$probe_cwd/data" && test -d "$XDG_DATA_HOME" || exit 96
+test "$XDG_STATE_HOME" = "$probe_cwd/state" && test -d "$XDG_STATE_HOME" || exit 97
 ${emitChunks(stdoutChunks, probeStdout ?? `${version}\n`)}
 ${emitChunks(stderrChunks, probeStderr ?? '', ' >&2')}
 exit ${probeExitCode}

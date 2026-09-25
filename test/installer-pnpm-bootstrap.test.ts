@@ -1,5 +1,15 @@
 // oxlint-disable no-unsafe-type-assertion, no-explicit-any, vitest/require-mock-type-parameters -- compact installer scenario
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -48,9 +58,12 @@ const fixture = async (
     readonly stdoutChunks?: readonly string[];
     readonly stderrChunks?: readonly string[];
     readonly probeExitCode?: number;
+    readonly probeCwd?: 'isolated' | 'outside-spoofed-pwd';
+    readonly probeHome?: 'isolated' | 'wrong';
   } = {},
+  scenarioOptions: { readonly temporaryParent?: string } = {},
 ) => {
-  const scenario = await pnpmBootstrapScenario(engine, base);
+  const scenario = await pnpmBootstrapScenario(engine, base, scenarioOptions);
   const archive = await scenario.archive({ hardlink, version, shebang, ...probeOptions });
   const value = structuredClone(base);
   const selected = value.pnpmArchives.find(
@@ -100,6 +113,73 @@ describe('managed pnpm bootstrap target', () => {
     expect(
       (await stat(join(target(data.scenario.root), 'install-receipt.json'))).mode & 0o777,
     ).toBe(0o600);
+  });
+  it('probes from a canonical scratch path when its temporary parent is a symlink', async () => {
+    const physicalParent = await mkdtemp(join(tmpdir(), 'revo-bootstrap-parent-'));
+    const aliasedParent = join(physicalParent, 'alias');
+    await symlink(physicalParent, aliasedParent);
+    try {
+      const data = await fixture(
+        false,
+        '12.5.1',
+        '#!/bin/sh',
+        {},
+        {
+          temporaryParent: aliasedParent,
+        },
+      );
+      expect(data.scenario.root).toBe(await realpath(data.scenario.root));
+      const result = await api.provisionPnpm({
+        bootstrap: data.value,
+        nodeExecutable: data.scenario.nodeExecutable,
+        channelRoot: data.channelRoot,
+        scratch: data.scenario.root,
+        platform: 'linux',
+        arch: 'x64',
+        request: request(data.archive.bytes),
+      });
+      expect(result).toMatchObject({ version: '12.5.1', reused: false });
+    } finally {
+      await rm(physicalParent, { recursive: true, force: true });
+    }
+  });
+  it('rejects a probe outside its scratch directory even when PWD is spoofed', async () => {
+    const data = await fixture(false, '12.5.1', '#!/bin/sh', {
+      probeCwd: 'outside-spoofed-pwd',
+    });
+    await expect(
+      api.provisionPnpm({
+        bootstrap: data.value,
+        nodeExecutable: data.scenario.nodeExecutable,
+        channelRoot: data.channelRoot,
+        scratch: data.scenario.root,
+        platform: 'linux',
+        arch: 'x64',
+        request: request(data.archive.bytes),
+      }),
+    ).rejects.toMatchObject({
+      diagnosticCode: 'PNPM_PROBE_FAILED',
+      diagnosticDetail: expect.stringContaining('pnpm probe cwd was not isolated'),
+    });
+    await expect(stat(target(data.scenario.root))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+  it('rejects a probe with a home outside its private scratch directory', async () => {
+    const data = await fixture(false, '12.5.1', '#!/bin/sh', { probeHome: 'wrong' });
+    await expect(
+      api.provisionPnpm({
+        bootstrap: data.value,
+        nodeExecutable: data.scenario.nodeExecutable,
+        channelRoot: data.channelRoot,
+        scratch: data.scenario.root,
+        platform: 'linux',
+        arch: 'x64',
+        request: request(data.archive.bytes),
+      }),
+    ).rejects.toMatchObject({
+      diagnosticCode: 'PNPM_PROBE_FAILED',
+      diagnosticDetail: expect.stringContaining('pnpm probe home was not isolated'),
+    });
+    await expect(stat(target(data.scenario.root))).rejects.toMatchObject({ code: 'ENOENT' });
   });
   it('probes and reuses a compatible target without downloading', async () => {
     const data = await fixture();
