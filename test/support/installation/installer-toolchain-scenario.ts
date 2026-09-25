@@ -1,8 +1,9 @@
 // oxlint-disable no-unsafe-type-assertion, typescript/unbound-method -- ordered bounded diagnostics and dynamic builder fixture
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, type Dir, lstatSync, realpathSync } from 'node:fs';
 import {
+  type FileHandle,
   appendFile,
   chmod,
   copyFile,
@@ -29,6 +30,15 @@ import { ServerStatusService } from '../../../src/server/server-status.service.j
 import { ServerStopService } from '../../../src/server/server-stop.service.js';
 import { assertActivationTestModes } from './activation-test-modes.js';
 import {
+  INITIAL_DIAGNOSTIC_OMITTED,
+  sanitizeInitialDiagnostic,
+  type InitialDiagnosticLogName,
+  type InitialDiagnosticLogRecord,
+  type InitialDiagnosticLogStatus,
+  type InitialInstallDiagnostics,
+  type InitialInstallDiagnosticsReason,
+} from './initial-install-diagnostic-sanitizer.js';
+import {
   bootstrapPolicy,
   embeddedBootstrap,
   installerBuilderScenario,
@@ -47,8 +57,35 @@ const INTEL_SUMMARY_RESERVE = 128 * 1024;
 const INTEL_COLLECTOR_KILL_AT = 4_000;
 const INTEL_COLLECTOR_DEADLINE = 5_000;
 const INITIAL_INSTALL_DIAGNOSTIC_MAX_ENTRIES = 64;
-const INITIAL_INSTALL_DIAGNOSTIC_TAIL_BYTES = 4096;
+const INITIAL_INSTALL_DIAGNOSTIC_FILE_BYTES = 16 * 1024;
 const INITIAL_INSTALL_DIAGNOSTIC_OUTPUT_BYTES = 16 * 1024;
+interface InitialDiagnosticRootState {
+  readonly readers: Set<InitialDiagnosticLeaseToken>;
+  cleanupRoot: string;
+  lifecycle: 'open' | 'closing' | 'closed';
+  closeUncertain: boolean;
+}
+
+interface InitialDiagnosticLeaseToken {
+  state: InitialDiagnosticRootState;
+}
+
+const initialDiagnosticRootStates = new Map<string, InitialDiagnosticRootState>();
+
+function registerInitialDiagnosticRoot(root: string): InitialDiagnosticRootState {
+  const lexicalRoot = resolvePath(root);
+  const canonicalRoot = realpathSync(lexicalRoot);
+  const state = initialDiagnosticRootStates.get(lexicalRoot) ??
+    initialDiagnosticRootStates.get(canonicalRoot) ?? {
+      readers: new Set<InitialDiagnosticLeaseToken>(),
+      cleanupRoot: lexicalRoot,
+      lifecycle: 'open' as const,
+      closeUncertain: false,
+    };
+  initialDiagnosticRootStates.set(lexicalRoot, state);
+  initialDiagnosticRootStates.set(canonicalRoot, state);
+  return state;
+}
 const INTEL_ENVIRONMENT_KEYS = [
   'REVO_INTEL_DIAGNOSTICS_DIR',
   'REVO_INTEL_BASE_SHA',
@@ -128,20 +165,144 @@ function redactDiagnosticText(value: string, roots: readonly string[] = []): str
   return result;
 }
 
-type InitialInstallDiagnosticStatus =
-  | 'captured'
-  | 'missing'
-  | 'ambiguous'
-  | 'unsafe'
-  | 'io-error'
-  | 'too-large';
+export interface PnpmFixtureArchiveAttempt {
+  readonly attempt: number;
+  readonly status: number | 'network-error';
+  readonly durationMs: number;
+}
+
+async function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const finish = () => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    const abort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function awaitBeforeAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error('pnpm archive request timed out'));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([operation, aborted]).finally(() => {
+    if (onAbort !== undefined) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  });
+}
+
+async function cancelResponseBodyBeforeAbort(
+  body: ReadableStream<Uint8Array> | null,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (body === null) {
+    return true;
+  }
+  let cancellation: Promise<void>;
+  try {
+    cancellation = body.cancel();
+  } catch {
+    return false;
+  }
+  try {
+    await awaitBeforeAbort(cancellation, signal);
+    return true;
+  } catch {
+    // Promise.race observes a late rejection even when the deadline wins.
+    return false;
+  }
+}
+
+export async function fetchPinnedPnpmFixtureArchive(input: {
+  readonly url: string;
+  readonly sha256: string;
+  readonly request?: typeof fetch;
+  readonly timeoutMs?: number;
+  readonly retryDelayMs?: number;
+  readonly onAttempt?: (attempt: PnpmFixtureArchiveAttempt) => void;
+}): Promise<Uint8Array> {
+  const request = input.request ?? fetch;
+  const signal = AbortSignal.timeout(input.timeoutMs ?? 120_000);
+  const retryDelayMs = input.retryDelayMs ?? 1_000;
+  const retryableStatuses = new Set([500, 502, 503, 504]);
+
+  // oxlint-disable no-await-in-loop -- each retry follows the prior status under one deadline
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const startedAt = Date.now();
+    const requestPromise = Promise.resolve().then(() => request(input.url, { signal }));
+    let response: Response;
+    try {
+      response = await awaitBeforeAbort(requestPromise, signal);
+    } catch (error) {
+      if (signal.aborted) {
+        void requestPromise.then(
+          (lateResponse) => lateResponse.body?.cancel().catch(() => undefined),
+          () => undefined,
+        );
+      }
+      input.onAttempt?.({ attempt, status: 'network-error', durationMs: Date.now() - startedAt });
+      throw error;
+    }
+    input.onAttempt?.({ attempt, status: response.status, durationMs: Date.now() - startedAt });
+
+    if (attempt === 1 && retryableStatuses.has(response.status)) {
+      if (!(await cancelResponseBodyBeforeAbort(response.body, signal))) {
+        throw new Error('pnpm archive response cancellation failed');
+      }
+      await waitForRetry(retryDelayMs, signal);
+      continue;
+    }
+    if (!response.ok) {
+      await cancelResponseBodyBeforeAbort(response.body, signal);
+      throw new Error(`pnpm archive download failed: ${response.status}`);
+    }
+
+    let body: ArrayBuffer;
+    const bodyPromise = response.arrayBuffer();
+    try {
+      body = await awaitBeforeAbort(bodyPromise, signal);
+    } catch (error) {
+      if (signal.aborted) {
+        void response.body?.cancel().catch(() => undefined);
+      }
+      throw error;
+    }
+    const bytes = new Uint8Array(body);
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    if (digest !== input.sha256) {
+      throw new Error('pnpm archive digest mismatch');
+    }
+    return bytes;
+  }
+  // oxlint-enable no-await-in-loop
+
+  throw new Error('pnpm archive download failed: retry budget exhausted');
+}
+
+type InitialInstallDiagnosticStatus = InitialDiagnosticLogStatus;
 
 interface InitialInstallDiagnosticFile {
-  readonly label: string;
+  readonly label: InitialDiagnosticLogName;
   readonly status: InitialInstallDiagnosticStatus;
   readonly sizeBytes: number | null;
-  readonly truncated: boolean;
-  readonly tail?: string;
+  readonly text?: string;
 }
 
 function initialDiagnosticErrorCode(error: unknown): string | undefined {
@@ -156,10 +317,109 @@ function isPathWithin(parent: string, candidate: string): boolean {
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${sep}`));
 }
 
+interface DirectoryIdentity {
+  readonly path: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+interface PinnedDiagnosticContext {
+  readonly root: string;
+  readonly directories: Map<string, DirectoryIdentity>;
+  readonly markCloseUncertain: () => void;
+  readonly closeOperations?: InitialDiagnosticCloseOperations;
+}
+
+export interface InitialDiagnosticCloseOperations {
+  readonly closeFile?: (handle: FileHandle) => Promise<void>;
+  readonly closeDirectory?: (handle: Dir) => Promise<void>;
+}
+
+export interface DiagnosticReadHookEvent {
+  readonly phase:
+    | 'parents-validated'
+    | 'leaf-statted'
+    | 'file-read'
+    | 'file-close'
+    | 'directory-close'
+    | 'directory-entry-read';
+  readonly label: string;
+  readonly signal?: AbortSignal;
+}
+
+export type DiagnosticReadHook = (event: DiagnosticReadHookEvent) => Promise<void>;
+
+async function closeHandleWithHook(
+  close: () => Promise<void>,
+  hook: DiagnosticReadHook | undefined,
+  event: DiagnosticReadHookEvent,
+): Promise<boolean> {
+  let failed = false;
+  try {
+    await hook?.(event);
+  } catch {
+    failed = true;
+  }
+  try {
+    await close();
+  } catch {
+    failed = true;
+  }
+  return failed;
+}
+
+async function createPinnedDiagnosticContext(
+  root: string,
+  markCloseUncertain: () => void = () => undefined,
+  closeOperations?: InitialDiagnosticCloseOperations,
+): Promise<PinnedDiagnosticContext | undefined> {
+  const metadata = await lstat(root, { bigint: true });
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    return undefined;
+  }
+  return {
+    root,
+    directories: new Map([[root, { path: root, dev: metadata.dev, ino: metadata.ino }]]),
+    markCloseUncertain,
+    ...(closeOperations ? { closeOperations } : {}),
+  };
+}
+
+async function validatePinnedDirectories(
+  context: PinnedDiagnosticContext,
+): Promise<'ok' | 'unsafe' | 'incomplete' | 'io-error'> {
+  for (const expected of context.directories.values()) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- every pinned parent must be revalidated in path order.
+      const current = await lstat(expected.path, { bigint: true });
+      if (current.isSymbolicLink() || !current.isDirectory()) {
+        return 'unsafe';
+      }
+      if (current.dev !== expected.dev || current.ino !== expected.ino) {
+        return 'incomplete';
+      }
+    } catch (error) {
+      return initialDiagnosticErrorCode(error) === 'ENOENT' ? 'incomplete' : 'io-error';
+    }
+  }
+  return 'ok';
+}
+
 async function inspectFixtureDirectory(
   canonicalRoot: string,
   segments: readonly string[],
-): Promise<{ readonly status: 'ok' | 'missing' | 'unsafe' | 'io-error'; readonly path: string }> {
+  context: PinnedDiagnosticContext,
+): Promise<{
+  readonly status: 'ok' | 'missing' | 'unsafe' | 'incomplete' | 'io-error';
+  readonly path: string;
+}> {
+  if (canonicalRoot !== context.root || !isPathWithin(context.root, canonicalRoot)) {
+    return { status: 'unsafe', path: canonicalRoot };
+  }
+  const rootStatus = await validatePinnedDirectories(context);
+  if (rootStatus !== 'ok') {
+    return { status: rootStatus, path: canonicalRoot };
+  }
   let current = canonicalRoot;
   for (const segment of segments) {
     if (!segment || segment === '.' || segment === '..' || segment.includes(sep)) {
@@ -169,319 +429,698 @@ async function inspectFixtureDirectory(
     let metadata;
     try {
       // oxlint-disable-next-line no-await-in-loop -- each path component must be validated before resolving the next one.
-      metadata = await lstat(current);
+      metadata = await lstat(current, { bigint: true });
     } catch (error) {
       return {
-        status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
+        status: context.directories.has(current)
+          ? 'incomplete'
+          : initialDiagnosticErrorCode(error) === 'ENOENT'
+            ? 'missing'
+            : 'io-error',
         path: current,
       };
     }
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
       return { status: 'unsafe', path: current };
     }
+    if (!isPathWithin(context.root, current)) {
+      return { status: 'unsafe', path: current };
+    }
+    const expected = context.directories.get(current);
+    if (expected && (metadata.dev !== expected.dev || metadata.ino !== expected.ino)) {
+      return { status: 'incomplete', path: current };
+    }
+    if (!expected) {
+      context.directories.set(current, { path: current, dev: metadata.dev, ino: metadata.ino });
+    }
   }
   return { status: 'ok', path: current };
 }
 
-async function listFixtureEntries(directory: string): Promise<{
+export interface InitialDiagnosticCollectionLease<T> {
+  readonly promise: Promise<T>;
+  readonly abort: () => void;
+}
+
+export function startInitialDiagnosticCollection<T>(
+  fixtureRoot: string,
+  collect: (signal: AbortSignal, markCloseUncertain: () => void) => Promise<T>,
+  resolveRoot: (path: string) => Promise<string> = realpath,
+): InitialDiagnosticCollectionLease<T> {
+  const lexicalRoot = resolvePath(fixtureRoot);
+  const leaseState = initialDiagnosticRootStates.get(lexicalRoot) ?? {
+    readers: new Set<InitialDiagnosticLeaseToken>(),
+    cleanupRoot: lexicalRoot,
+    lifecycle: 'open' as const,
+    closeUncertain: false,
+  };
+  if (leaseState.lifecycle !== 'open' || leaseState.closeUncertain) {
+    throw new Error('INITIAL_DIAGNOSTICS_ROOT_NOT_OPEN');
+  }
+  initialDiagnosticRootStates.set(lexicalRoot, leaseState);
+  const lease: InitialDiagnosticLeaseToken = { state: leaseState };
+  leaseState.readers.add(lease);
+
+  const controller = new AbortController();
+  const promise = Promise.resolve()
+    .then(async () => {
+      const canonicalRoot = await resolveRoot(fixtureRoot).catch(() => lexicalRoot);
+      const canonicalState = initialDiagnosticRootStates.get(canonicalRoot);
+      const reservedState = lease.state;
+      if (
+        controller.signal.aborted ||
+        reservedState.lifecycle !== 'open' ||
+        reservedState.closeUncertain ||
+        (canonicalState !== undefined &&
+          (canonicalState.lifecycle !== 'open' || canonicalState.closeUncertain))
+      ) {
+        throw new Error('INITIAL_DIAGNOSTICS_COLLECTION_NOT_ADMITTED');
+      }
+      if (canonicalState !== undefined && canonicalState !== reservedState) {
+        for (const pendingLease of reservedState.readers) {
+          pendingLease.state = canonicalState;
+          canonicalState.readers.add(pendingLease);
+        }
+        reservedState.readers.clear();
+        for (const [alias, mappedState] of initialDiagnosticRootStates) {
+          if (mappedState === reservedState) {
+            initialDiagnosticRootStates.set(alias, canonicalState);
+          }
+        }
+      } else if (canonicalState === undefined) {
+        lease.state.cleanupRoot = canonicalRoot;
+      }
+      initialDiagnosticRootStates.set(lexicalRoot, lease.state);
+      initialDiagnosticRootStates.set(canonicalRoot, lease.state);
+      return collect(controller.signal, () => {
+        lease.state.closeUncertain = true;
+      });
+    })
+    .finally(() => {
+      lease.state.readers.delete(lease);
+    });
+  return { promise, abort: () => controller.abort() };
+}
+
+function diagnosticRootState(fixtureRoot: string): InitialDiagnosticRootState {
+  const root = resolvePath(fixtureRoot);
+  const knownLexicalState = initialDiagnosticRootStates.get(root);
+  if (knownLexicalState !== undefined) {
+    return knownLexicalState;
+  }
+  const canonicalRoot = realpathSync(root);
+  let state = initialDiagnosticRootStates.get(canonicalRoot);
+  if (state === undefined) {
+    if (lstatSync(root).isSymbolicLink()) {
+      throw new Error('INITIAL_DIAGNOSTICS_UNKNOWN_ROOT_ALIAS');
+    }
+    state = {
+      readers: new Set(),
+      cleanupRoot: root,
+      lifecycle: 'open',
+      closeUncertain: false,
+    };
+  }
+  initialDiagnosticRootStates.set(root, state);
+  initialDiagnosticRootStates.set(canonicalRoot, state);
+  return state;
+}
+
+async function listFixtureEntries(
+  directory: string,
+  options: {
+    readonly onCloseUncertain?: () => void;
+    readonly hook?: DiagnosticReadHook;
+    readonly signal?: AbortSignal;
+    readonly closeDirectory?: (handle: Dir) => Promise<void>;
+  } = {},
+): Promise<{
   readonly status: 'ok' | 'missing' | 'unsafe' | 'io-error' | 'limit-reached';
   readonly names: readonly string[];
 }> {
   const names: string[] = [];
-  let handle;
+  let status: 'ok' | 'missing' | 'unsafe' | 'io-error' | 'limit-reached' = 'ok';
+  let handle: Awaited<ReturnType<typeof opendir>> | undefined;
   try {
+    options.signal?.throwIfAborted();
     handle = await opendir(directory);
-    for await (const entry of handle) {
+    options.signal?.throwIfAborted();
+    while (true) {
+      options.signal?.throwIfAborted();
+      // oxlint-disable-next-line no-await-in-loop -- one owner reads and closes this bounded directory handle.
+      const entry = await handle.read();
+      // oxlint-disable-next-line no-await-in-loop -- the deterministic hook runs between the read and abort check.
+      await options.hook?.({
+        phase: 'directory-entry-read',
+        label: directory,
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+      options.signal?.throwIfAborted();
+      if (entry === null) {
+        break;
+      }
       names.push(entry.name);
       if (names.length === INITIAL_INSTALL_DIAGNOSTIC_MAX_ENTRIES) {
-        return { status: 'limit-reached', names };
+        status = 'limit-reached';
+        break;
       }
     }
-    return { status: 'ok', names };
   } catch (error) {
-    return {
-      status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
-      names,
-    };
+    status = initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error';
+    if (options.signal?.aborted) {
+      names.length = 0;
+    }
   } finally {
     if (handle) {
-      await handle.close().catch(() => undefined);
+      const openedDirectory = handle;
+      const closeFailed = await closeHandleWithHook(
+        () =>
+          options.closeDirectory
+            ? options.closeDirectory(openedDirectory)
+            : openedDirectory.close(),
+        options.hook,
+        {
+          phase: 'directory-close',
+          label: directory,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+      );
+      if (closeFailed) {
+        options.onCloseUncertain?.();
+        status = 'io-error';
+        names.length = 0;
+      }
     }
   }
-}
-
-function cleanInitialDiagnosticText(value: string, roots: readonly string[]): string {
-  const withoutControls = value
-    // oxlint-disable-next-line no-control-regex -- remove ANSI escape sequences from untrusted diagnostic text.
-    .replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu, '')
-    // oxlint-disable-next-line no-control-regex -- strip remaining ASCII and C1 control bytes before redaction.
-    .replace(/[\u0000-\u0008\u000b-\u000d\u000e-\u001f\u007f-\u009f]/gu, '');
-  return redactDiagnosticText(withoutControls, roots);
+  return { status, names };
 }
 
 async function readInitialDiagnosticFile(
   canonicalRoot: string,
   relativeSegments: readonly string[],
-  label: string,
-  rootsToRedact: readonly string[],
+  label: InitialDiagnosticLogName,
+  context: PinnedDiagnosticContext,
+  signal?: AbortSignal,
+  hook?: DiagnosticReadHook,
 ): Promise<InitialInstallDiagnosticFile> {
-  const parent = await inspectFixtureDirectory(canonicalRoot, relativeSegments.slice(0, -1));
-  if (parent.status !== 'ok') {
-    return {
-      label,
-      status: parent.status === 'io-error' ? 'io-error' : parent.status,
-      sizeBytes: null,
-      truncated: false,
-    };
-  }
-
-  const path = join(parent.path, relativeSegments.at(-1) ?? '');
-  let metadata;
+  let closeUncertain = false;
   try {
-    metadata = await lstat(path);
-  } catch (error) {
-    return {
-      label,
-      status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
-      sizeBytes: null,
-      truncated: false,
-    };
-  }
-  if (metadata.isSymbolicLink() || !metadata.isFile()) {
-    return { label, status: 'unsafe', sizeBytes: null, truncated: false };
-  }
+    const fileResult: InitialInstallDiagnosticFile = await (async () => {
+      signal?.throwIfAborted();
+      const parent = await inspectFixtureDirectory(
+        canonicalRoot,
+        relativeSegments.slice(0, -1),
+        context,
+      );
+      signal?.throwIfAborted();
+      if (parent.status !== 'ok') {
+        return {
+          label,
+          status: parent.status === 'io-error' ? 'io-error' : parent.status,
+          sizeBytes: null,
+        };
+      }
 
-  let file;
-  try {
-    file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    const opened = await file.stat();
-    if (!opened.isFile() || !Number.isSafeInteger(opened.size) || opened.size < 0) {
-      return { label, status: 'unsafe', sizeBytes: null, truncated: false };
-    }
-    const sizeBytes = opened.size;
-    const readBytes = Math.min(sizeBytes, INITIAL_INSTALL_DIAGNOSTIC_TAIL_BYTES);
-    const offset = sizeBytes - readBytes;
-    const buffer = Buffer.alloc(readBytes);
-    const { bytesRead } = await file.read(buffer, 0, readBytes, offset);
-    if (bytesRead !== readBytes) {
-      return { label, status: 'io-error', sizeBytes, truncated: sizeBytes > readBytes };
-    }
+      try {
+        await hook?.({ phase: 'parents-validated', label, ...(signal ? { signal } : {}) });
+        signal?.throwIfAborted();
+      } catch {
+        return { label, status: 'incomplete', sizeBytes: null };
+      }
 
-    let text = buffer.subarray(0, bytesRead).toString('utf8');
-    const lines = text.split('\n');
-    if (offset > 0) {
-      lines.shift();
+      const path = join(parent.path, relativeSegments.at(-1) ?? '');
+      let metadata;
+      try {
+        metadata = await lstat(path, { bigint: true });
+      } catch (error) {
+        const directoryStatus = await validatePinnedDirectories(context);
+        if (directoryStatus !== 'ok') {
+          return { label, status: directoryStatus, sizeBytes: null };
+        }
+        return {
+          label,
+          status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
+          sizeBytes: null,
+        };
+      }
+      if (metadata.isSymbolicLink() || !metadata.isFile()) {
+        return { label, status: 'unsafe', sizeBytes: null };
+      }
+      try {
+        await hook?.({ phase: 'leaf-statted', label, ...(signal ? { signal } : {}) });
+        signal?.throwIfAborted();
+      } catch {
+        return { label, status: 'incomplete', sizeBytes: null };
+      }
+      const beforeOpenStatus = await validatePinnedDirectories(context);
+      if (beforeOpenStatus !== 'ok') {
+        return { label, status: beforeOpenStatus, sizeBytes: null };
+      }
+
+      let file: FileHandle | undefined;
+      try {
+        signal?.throwIfAborted();
+        file = await open(
+          path,
+          fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+        );
+        signal?.throwIfAborted();
+        const opened = await file.stat({ bigint: true });
+        if (
+          !opened.isFile() ||
+          opened.size < 0n ||
+          opened.dev !== metadata.dev ||
+          opened.ino !== metadata.ino
+        ) {
+          return { label, status: 'unsafe', sizeBytes: null };
+        }
+        if (opened.size > BigInt(INITIAL_INSTALL_DIAGNOSTIC_FILE_BYTES)) {
+          return { label, status: 'too-large', sizeBytes: Number(opened.size) };
+        }
+
+        const original = {
+          dev: opened.dev,
+          ino: opened.ino,
+          size: opened.size,
+          mtimeNs: opened.mtimeNs,
+          ctimeNs: opened.ctimeNs,
+        };
+        const beforeReadStatus = await validatePinnedDirectories(context);
+        if (beforeReadStatus !== 'ok') {
+          return { label, status: beforeReadStatus, sizeBytes: null };
+        }
+        const buffer = Buffer.alloc(INITIAL_INSTALL_DIAGNOSTIC_FILE_BYTES + 1);
+        let bytesRead = 0;
+        while (bytesRead < buffer.length) {
+          signal?.throwIfAborted();
+          // oxlint-disable-next-line no-await-in-loop -- sequential short reads are required to establish a complete bounded capture.
+          const result = await file.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+          if (result.bytesRead === 0) {
+            break;
+          }
+          bytesRead += result.bytesRead;
+        }
+
+        signal?.throwIfAborted();
+        try {
+          await hook?.({ phase: 'file-read', label, ...(signal ? { signal } : {}) });
+          signal?.throwIfAborted();
+        } catch {
+          return { label, status: 'incomplete', sizeBytes: null };
+        }
+        const afterRead = await file.stat({ bigint: true });
+        const pathAfterRead = await lstat(path, { bigint: true });
+        const parentStatus = await validatePinnedDirectories(context);
+        if (parentStatus !== 'ok') {
+          return { label, status: parentStatus, sizeBytes: null };
+        }
+        const stable =
+          afterRead.dev === original.dev &&
+          afterRead.ino === original.ino &&
+          afterRead.size === original.size &&
+          afterRead.mtimeNs === original.mtimeNs &&
+          afterRead.ctimeNs === original.ctimeNs &&
+          pathAfterRead.isFile() &&
+          !pathAfterRead.isSymbolicLink() &&
+          pathAfterRead.dev === original.dev &&
+          pathAfterRead.ino === original.ino &&
+          bytesRead === Number(original.size);
+        if (!stable) {
+          return { label, status: 'incomplete', sizeBytes: Number(afterRead.size) };
+        }
+
+        let text: string;
+        try {
+          text = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
+        } catch {
+          return { label, status: 'invalid-utf8', sizeBytes: bytesRead };
+        }
+        return {
+          label,
+          status: 'captured',
+          sizeBytes: bytesRead,
+          text,
+        };
+      } catch (error) {
+        const directoryStatus = await validatePinnedDirectories(context);
+        if (directoryStatus !== 'ok') {
+          return { label, status: directoryStatus, sizeBytes: null };
+        }
+        return {
+          label,
+          status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
+          sizeBytes: null,
+        };
+      } finally {
+        if (file) {
+          const openedFile = file;
+          const closeFailed = await closeHandleWithHook(
+            () =>
+              context.closeOperations?.closeFile
+                ? context.closeOperations.closeFile(openedFile)
+                : openedFile.close(),
+            hook,
+            { phase: 'file-close', label, ...(signal ? { signal } : {}) },
+          );
+          if (closeFailed) {
+            closeUncertain = true;
+          }
+        }
+      }
+    })();
+    if (closeUncertain) {
+      context.markCloseUncertain();
+      return { label, status: 'io-error', sizeBytes: null };
     }
-    if (lines.at(-1) === '') {
-      lines.pop();
-    } else if (lines.length > 0) {
-      lines.pop();
+    return fileResult;
+  } catch {
+    if (signal?.aborted) {
+      return { label, status: 'incomplete', sizeBytes: null };
     }
-    text = lines.join('\n');
-    const tail = cleanInitialDiagnosticText(text, rootsToRedact);
-    return {
-      label,
-      status: 'captured',
-      sizeBytes,
-      truncated: offset > 0,
-      ...(tail.length === 0 ? {} : { tail }),
-    };
-  } catch (error) {
-    return {
-      label,
-      status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
-      sizeBytes: null,
-      truncated: false,
-    };
-  } finally {
-    await file?.close().catch(() => undefined);
+    return { label, status: 'io-error', sizeBytes: null };
   }
 }
 
-/** @internal Test-only bounded collector; production callers use the fixture-bound closure. */
-export async function collectInitialInstallFailureDiagnostics(
+const initialLogNames: readonly InitialDiagnosticLogName[] = [
+  'install-session.log',
+  'server-start.log',
+  'activation-result.log',
+];
+
+function createInitialInstallDiagnostics(
+  status: 'complete' | 'incomplete',
+  reason: InitialInstallDiagnosticsReason,
+  overrides: Partial<Record<InitialDiagnosticLogName, InitialDiagnosticLogRecord>> = {},
+): InitialInstallDiagnostics {
+  const defaultRecord: InitialDiagnosticLogRecord = {
+    status: status === 'complete' ? 'missing' : 'incomplete',
+    sizeBytes: null,
+    diagnostic: INITIAL_DIAGNOSTIC_OMITTED,
+  };
+  const logs: Record<InitialDiagnosticLogName, InitialDiagnosticLogRecord> = {
+    'install-session.log': overrides['install-session.log'] ?? defaultRecord,
+    'server-start.log': overrides['server-start.log'] ?? defaultRecord,
+    'activation-result.log': overrides['activation-result.log'] ?? defaultRecord,
+  };
+  return { status, reason, logs };
+}
+
+function recordForDiagnosticFile(
+  file: InitialInstallDiagnosticFile,
+  roots: readonly string[],
+): InitialDiagnosticLogRecord {
+  return {
+    status: file.status,
+    sizeBytes: file.sizeBytes,
+    diagnostic:
+      file.status === 'captured' && file.text !== undefined
+        ? sanitizeInitialDiagnostic(
+            { status: 'complete', text: file.text.replace(/(?:\r\n|\n)$/u, '') },
+            roots,
+          )
+        : INITIAL_DIAGNOSTIC_OMITTED,
+  };
+}
+
+function statusIsIncomplete(status: InitialDiagnosticLogStatus): boolean {
+  return ['ambiguous', 'unsafe', 'incomplete', 'invalid-utf8', 'io-error', 'too-large'].includes(
+    status,
+  );
+}
+
+export async function collectInitialInstallFailureRecords(
   fixtureRoot: string,
   fixtureChannelRoot: string,
-): Promise<string> {
-  const lines: string[] = [];
-  const prefix = 'POSIX_INSTALL_DIAGNOSTIC ';
-  const truncationMarker = `${prefix}status=output-truncated`;
-  const outputBudget =
-    INITIAL_INSTALL_DIAGNOSTIC_OUTPUT_BYTES - Buffer.byteLength(`${truncationMarker}\n`);
-  let emittedBytes = 0;
-  let outputTruncated = false;
-  const emit = (line: string) => {
-    if (outputTruncated) {
-      return;
-    }
-    const rendered = `${prefix}${line}`;
-    const lineBytes = Buffer.byteLength(rendered) + 1;
-    if (emittedBytes + lineBytes > outputBudget) {
-      outputTruncated = true;
-      return;
-    }
-    lines.push(rendered);
-    emittedBytes += lineBytes;
-  };
-  const finish = () => `${[...lines, ...(outputTruncated ? [truncationMarker] : [])].join('\n')}\n`;
+  signal?: AbortSignal,
+  hook?: DiagnosticReadHook,
+  markCloseUncertain: () => void = () => undefined,
+  closeOperations?: InitialDiagnosticCloseOperations,
+): Promise<InitialInstallDiagnostics> {
+  let context: PinnedDiagnosticContext | undefined;
   try {
+    signal?.throwIfAborted();
     const canonicalRoot = await realpath(fixtureRoot);
-    const canonicalRootStat = await lstat(canonicalRoot);
-    if (canonicalRootStat.isSymbolicLink() || !canonicalRootStat.isDirectory()) {
-      return 'POSIX_INSTALL_DIAGNOSTIC status=diagnostics-incomplete reason=unsafe-fixture-root\n';
+    signal?.throwIfAborted();
+    context = await createPinnedDiagnosticContext(
+      canonicalRoot,
+      markCloseUncertain,
+      closeOperations,
+    );
+    if (context === undefined) {
+      return createInitialInstallDiagnostics('incomplete', 'unsafe-fixture-root');
+    }
+    if (!isPathWithin(resolvePath(fixtureRoot), resolvePath(fixtureChannelRoot))) {
+      return createInitialInstallDiagnostics('incomplete', 'channel-outside-fixture');
     }
     const relativeChannelRoot = relativePath(
       resolvePath(fixtureRoot),
       resolvePath(fixtureChannelRoot),
     );
-    if (!isPathWithin(resolvePath(fixtureRoot), resolvePath(fixtureChannelRoot))) {
-      return 'POSIX_INSTALL_DIAGNOSTIC status=diagnostics-incomplete reason=channel-outside-fixture\n';
-    }
     const channelSegments = relativeChannelRoot ? relativeChannelRoot.split(sep) : [];
-    const channel = await inspectFixtureDirectory(canonicalRoot, channelSegments);
+    const channel = await inspectFixtureDirectory(canonicalRoot, channelSegments, context);
     if (channel.status !== 'ok') {
-      emit(
-        `status=${channel.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempts=${channel.status}`,
-      );
-      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
-        emit(
-          `${label} status=${channel.status === 'missing' ? 'missing' : channel.status} sizeBytes=unknown truncated=false`,
-        );
+      if (channel.status === 'missing') {
+        return createInitialInstallDiagnostics('complete', 'channel-unavailable');
       }
-      return finish();
+      return createInitialInstallDiagnostics('incomplete', 'channel-unavailable', {
+        'install-session.log': {
+          status: channel.status,
+          sizeBytes: null,
+          diagnostic: INITIAL_DIAGNOSTIC_OMITTED,
+        },
+        'server-start.log': {
+          status: channel.status,
+          sizeBytes: null,
+          diagnostic: INITIAL_DIAGNOSTIC_OMITTED,
+        },
+        'activation-result.log': {
+          status: channel.status,
+          sizeBytes: null,
+          diagnostic: INITIAL_DIAGNOSTIC_OMITTED,
+        },
+      });
     }
 
-    const attemptsListing = await listFixtureEntries(channel.path);
+    const attemptsListing = await listFixtureEntries(channel.path, {
+      onCloseUncertain: context.markCloseUncertain,
+      ...(hook ? { hook } : {}),
+      ...(signal ? { signal } : {}),
+      ...(context.closeOperations?.closeDirectory
+        ? { closeDirectory: context.closeOperations.closeDirectory }
+        : {}),
+    });
     const attemptNames = attemptsListing.names.filter((name) =>
       /^\.attempt\.[A-Za-z0-9_-]+$/u.test(name),
     );
     const attemptName = attemptNames[0];
     if (attemptsListing.status !== 'ok' || attemptNames.length !== 1 || attemptName === undefined) {
-      const attemptStatus =
+      const logStatus: InitialDiagnosticLogStatus =
         attemptsListing.status === 'limit-reached' || attemptNames.length > 1
           ? 'ambiguous'
-          : attemptsListing.status === 'missing'
+          : attemptsListing.status === 'missing' || attemptsListing.status === 'ok'
             ? 'missing'
-            : attemptsListing.status === 'ok'
-              ? 'missing'
-              : 'io-error';
-      emit(
-        `status=${attemptStatus === 'io-error' ? 'diagnostics-incomplete' : 'complete'} attempts=${attemptStatus}`,
-      );
-      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
-        emit(`${label} status=${attemptStatus} sizeBytes=unknown truncated=false`);
-      }
-      return finish();
+            : 'io-error';
+      const incomplete = statusIsIncomplete(logStatus);
+      const reason =
+        logStatus === 'ambiguous'
+          ? 'attempts-ambiguous'
+          : logStatus === 'io-error'
+            ? 'attempts-unavailable'
+            : 'attempts-unavailable';
+      const record = { status: logStatus, sizeBytes: null, diagnostic: INITIAL_DIAGNOSTIC_OMITTED };
+      return createInitialInstallDiagnostics(incomplete ? 'incomplete' : 'complete', reason, {
+        'install-session.log': record,
+        'server-start.log': record,
+        'activation-result.log': record,
+      });
     }
 
-    const attempt = await inspectFixtureDirectory(canonicalRoot, [...channelSegments, attemptName]);
+    const attempt = await inspectFixtureDirectory(
+      canonicalRoot,
+      [...channelSegments, attemptName],
+      context,
+    );
     if (attempt.status !== 'ok') {
-      emit(`status=diagnostics-incomplete attempts=${attempt.status}`);
-      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
-        emit(`${label} status=${attempt.status} sizeBytes=unknown truncated=false`);
-      }
-      return finish();
-    }
-    const scratch = await inspectFixtureDirectory(canonicalRoot, [
-      ...channelSegments,
-      attemptName,
-      'runtime',
-      'scratch',
-    ]);
-    if (scratch.status !== 'ok') {
-      emit(
-        `status=${scratch.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempts=1 scratch=${scratch.status}`,
+      const record: InitialDiagnosticLogRecord = {
+        status: attempt.status === 'missing' ? 'missing' : attempt.status,
+        sizeBytes: null,
+        diagnostic: INITIAL_DIAGNOSTIC_OMITTED,
+      };
+      return createInitialInstallDiagnostics(
+        attempt.status === 'missing' ? 'complete' : 'incomplete',
+        'attempt-unavailable',
+        {
+          'install-session.log': record,
+          'server-start.log': record,
+          'activation-result.log': record,
+        },
       );
-      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
-        emit(`${label} status=${scratch.status} sizeBytes=unknown truncated=false`);
-      }
-      return finish();
+    }
+    const scratch = await inspectFixtureDirectory(
+      canonicalRoot,
+      [...channelSegments, attemptName, 'runtime', 'scratch'],
+      context,
+    );
+    if (scratch.status !== 'ok') {
+      const record: InitialDiagnosticLogRecord = {
+        status: scratch.status === 'missing' ? 'missing' : scratch.status,
+        sizeBytes: null,
+        diagnostic: INITIAL_DIAGNOSTIC_OMITTED,
+      };
+      return createInitialInstallDiagnostics(
+        scratch.status === 'missing' ? 'complete' : 'incomplete',
+        'scratch-unavailable',
+        {
+          'install-session.log': record,
+          'server-start.log': record,
+          'activation-result.log': record,
+        },
+      );
     }
 
-    const activationListing = await listFixtureEntries(scratch.path);
+    const activationListing = await listFixtureEntries(scratch.path, {
+      onCloseUncertain: context.markCloseUncertain,
+      ...(hook ? { hook } : {}),
+      ...(signal ? { signal } : {}),
+      ...(context.closeOperations?.closeDirectory
+        ? { closeDirectory: context.closeOperations.closeDirectory }
+        : {}),
+    });
     const activationNames = activationListing.names.filter((name) =>
       /^\.activation-request-[A-Za-z0-9_-]+$/u.test(name),
     );
     const activationName = activationNames[0];
-    const activationStatus =
-      activationListing.status === 'limit-reached' || activationNames.length > 1
-        ? 'ambiguous'
-        : activationListing.status === 'missing'
-          ? 'missing'
-          : activationListing.status === 'ok'
-            ? activationNames.length === 0
+    let activationLog: InitialInstallDiagnosticFile;
+    if (activationListing.status !== 'ok') {
+      activationLog = {
+        label: 'activation-result.log',
+        status:
+          activationListing.status === 'limit-reached'
+            ? 'ambiguous'
+            : activationListing.status === 'missing'
               ? 'missing'
-              : 'captured'
-            : 'io-error';
-    if (activationNames.length === 1 && activationName !== undefined) {
-      const activationDirectory = await inspectFixtureDirectory(canonicalRoot, [
-        ...channelSegments,
-        attemptName,
-        'runtime',
-        'scratch',
-        activationName,
-      ]);
-      if (activationDirectory.status !== 'ok') {
-        emit(
-          `status=diagnostics-incomplete attempts=1 activationRequest=${activationDirectory.status}`,
-        );
-      }
+              : activationListing.status,
+        sizeBytes: null,
+      };
+    } else if (activationNames.length === 1 && activationName !== undefined) {
+      const activationDirectory = await inspectFixtureDirectory(
+        canonicalRoot,
+        [...channelSegments, attemptName, 'runtime', 'scratch', activationName],
+        context,
+      );
+      activationLog =
+        activationDirectory.status === 'ok'
+          ? await readInitialDiagnosticFile(
+              canonicalRoot,
+              [...channelSegments, attemptName, 'runtime', 'scratch', activationName, 'result.log'],
+              'activation-result.log',
+              context,
+              signal,
+              hook,
+            )
+          : {
+              label: 'activation-result.log',
+              status: activationDirectory.status,
+              sizeBytes: null,
+            };
+    } else {
+      const logStatus: InitialDiagnosticLogStatus =
+        activationNames.length > 1 ? 'ambiguous' : 'missing';
+      activationLog = {
+        label: 'activation-result.log',
+        status: logStatus,
+        sizeBytes: null,
+      };
     }
 
-    const rootsToRedact = [fixtureRoot, fixtureChannelRoot, canonicalRoot, channel.path];
-    const files: InitialInstallDiagnosticFile[] = [
+    const rootsToRedact = [
+      resolvePath(fixtureRoot),
+      resolvePath(fixtureChannelRoot),
+      canonicalRoot,
+      channel.path,
+    ];
+    const files = [
       await readInitialDiagnosticFile(
         canonicalRoot,
         [...channelSegments, attemptName, 'runtime', 'scratch', 'install-session.log'],
         'install-session.log',
-        rootsToRedact,
+        context,
+        signal,
+        hook,
       ),
       await readInitialDiagnosticFile(
         canonicalRoot,
         [...channelSegments, attemptName, 'runtime', 'scratch', 'server-start.log'],
         'server-start.log',
-        rootsToRedact,
+        context,
+        signal,
+        hook,
       ),
-      activationNames.length === 1 &&
-      activationName !== undefined &&
-      activationStatus === 'captured'
-        ? await readInitialDiagnosticFile(
-            canonicalRoot,
-            [...channelSegments, attemptName, 'runtime', 'scratch', activationName, 'result.log'],
-            'activation-result.log',
-            rootsToRedact,
-          )
-        : {
-            label: 'activation-result.log',
-            status: activationStatus,
-            sizeBytes: null,
-            truncated: false,
-          },
+      activationLog,
     ];
-    const incomplete =
-      attemptsListing.status !== 'ok' ||
-      activationStatus === 'io-error' ||
-      files.some((file) => ['unsafe', 'io-error', 'too-large'].includes(file.status));
-    emit(
-      `status=${incomplete ? 'diagnostics-incomplete' : 'complete'} attempts=1 activationRequest=${activationStatus}`,
-    );
-    for (const file of files) {
-      emit(
-        `${file.label} status=${file.status} sizeBytes=${file.sizeBytes ?? 'unknown'} truncated=${file.truncated}`,
-      );
-      if (file.tail) {
-        for (const line of file.tail.split('\n')) {
-          emit(`${file.label} | ${line}`);
-        }
-      } else if (file.status === 'captured') {
-        emit(`${file.label} | tail-unavailable`);
-      }
+    const finalDirectoryStatus = await validatePinnedDirectories(context);
+    if (finalDirectoryStatus !== 'ok') {
+      return createInitialInstallDiagnostics('incomplete', 'directory-identity-changed');
     }
+    const toRecord = (name: InitialDiagnosticLogName): InitialDiagnosticLogRecord => {
+      const file = files.find((candidate) => candidate.label === name);
+      return file
+        ? recordForDiagnosticFile(file, rootsToRedact)
+        : {
+            status: 'incomplete',
+            sizeBytes: null,
+            diagnostic: INITIAL_DIAGNOSTIC_OMITTED,
+          };
+    };
+    const logs: Record<InitialDiagnosticLogName, InitialDiagnosticLogRecord> = {
+      'install-session.log': toRecord('install-session.log'),
+      'server-start.log': toRecord('server-start.log'),
+      'activation-result.log': toRecord('activation-result.log'),
+    };
+    const incomplete = files.some((file) => statusIsIncomplete(file.status));
+    const reason: InitialInstallDiagnosticsReason =
+      activationLog.status === 'ambiguous'
+        ? 'activation-request-ambiguous'
+        : activationLog.status === 'io-error'
+          ? 'activation-request-unavailable'
+          : 'none';
+    return createInitialInstallDiagnostics(incomplete ? 'incomplete' : 'complete', reason, logs);
   } catch {
-    return 'POSIX_INSTALL_DIAGNOSTIC status=diagnostics-incomplete reason=collector-error\n';
+    if (context !== undefined && (await validatePinnedDirectories(context)) !== 'ok') {
+      return createInitialInstallDiagnostics('incomplete', 'directory-identity-changed');
+    }
+    return createInitialInstallDiagnostics('incomplete', 'collector-error');
   }
+}
 
-  return finish();
+/** @internal Legacy bounded text view; core callers consume the structured records directly. */
+export async function collectInitialInstallFailureDiagnostics(
+  fixtureRoot: string,
+  fixtureChannelRoot: string,
+  signal?: AbortSignal,
+  hook?: DiagnosticReadHook,
+): Promise<string> {
+  const diagnostics = await collectInitialInstallFailureRecords(
+    fixtureRoot,
+    fixtureChannelRoot,
+    signal,
+    hook,
+  );
+  const lines = [
+    `POSIX_INSTALL_DIAGNOSTIC status=${diagnostics.status} reason=${diagnostics.reason}`,
+    ...initialLogNames.flatMap((name) => {
+      const record = diagnostics.logs[name];
+      return [
+        `POSIX_INSTALL_DIAGNOSTIC ${name} status=${record.status} sizeBytes=${record.sizeBytes ?? 'unknown'}`,
+        `POSIX_INSTALL_DIAGNOSTIC ${name} | ${JSON.stringify(record.diagnostic)}`,
+      ];
+    }),
+  ];
+  const output = `${lines.join('\n')}\n`;
+  if (Buffer.byteLength(output, 'utf8') <= INITIAL_INSTALL_DIAGNOSTIC_OUTPUT_BYTES) {
+    return output;
+  }
+  return 'POSIX_INSTALL_DIAGNOSTIC status=incomplete reason=output-limit\n';
 }
 
 /** @internal Test-only collector for a caller-identified retained attempt. */
@@ -511,14 +1150,15 @@ export async function collectInstallAttemptDiagnostics(
     emittedBytes += lineBytes;
   };
   const finish = () => `${[...lines, ...(outputTruncated ? [truncationMarker] : [])].join('\n')}\n`;
+  let context: PinnedDiagnosticContext | undefined;
   try {
     if (attemptName === undefined || !/^\.attempt\.[A-Za-z0-9_-]+$/u.test(attemptName)) {
       emit('status=attempt-unresolved reason=invalid-attempt-name');
       return finish();
     }
     const canonicalRoot = await realpath(fixtureRoot);
-    const rootStat = await lstat(canonicalRoot);
-    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    context = await createPinnedDiagnosticContext(canonicalRoot);
+    if (context === undefined) {
       emit('status=diagnostics-incomplete reason=unsafe-fixture-root');
       return finish();
     }
@@ -528,38 +1168,46 @@ export async function collectInstallAttemptDiagnostics(
     }
     const channelRelative = relativePath(resolvePath(fixtureRoot), resolvePath(fixtureChannelRoot));
     const channelSegments = channelRelative ? channelRelative.split(sep) : [];
-    const attempt = await inspectFixtureDirectory(canonicalRoot, [...channelSegments, attemptName]);
+    const attempt = await inspectFixtureDirectory(
+      canonicalRoot,
+      [...channelSegments, attemptName],
+      context,
+    );
     if (attempt.status !== 'ok') {
       emit(
         `status=${attempt.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempt=${attemptName} attemptStatus=${attempt.status}`,
       );
       return finish();
     }
-    const scratch = await inspectFixtureDirectory(canonicalRoot, [
-      ...channelSegments,
-      attemptName,
-      'runtime',
-      'scratch',
-    ]);
+    const scratch = await inspectFixtureDirectory(
+      canonicalRoot,
+      [...channelSegments, attemptName, 'runtime', 'scratch'],
+      context,
+    );
     if (scratch.status !== 'ok') {
       emit(
         `status=${scratch.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempt=${attemptName} scratch=${scratch.status}`,
       );
       return finish();
     }
-    const rootsToRedact = [fixtureRoot, fixtureChannelRoot, canonicalRoot, attempt.path];
+    const rootsToRedact = [
+      resolvePath(fixtureRoot),
+      resolvePath(fixtureChannelRoot),
+      canonicalRoot,
+      attempt.path,
+    ];
     const files: InitialInstallDiagnosticFile[] = [
       await readInitialDiagnosticFile(
         canonicalRoot,
         [...channelSegments, attemptName, 'runtime', 'scratch', 'install-session.log'],
         'install-session.log',
-        rootsToRedact,
+        context,
       ),
       await readInitialDiagnosticFile(
         canonicalRoot,
         [...channelSegments, attemptName, 'runtime', 'scratch', 'server-start.log'],
         'server-start.log',
-        rootsToRedact,
+        context,
       ),
     ];
     const activationListing = await listFixtureEntries(scratch.path);
@@ -573,7 +1221,7 @@ export async function collectInstallAttemptDiagnostics(
           canonicalRoot,
           [...channelSegments, attemptName, 'runtime', 'scratch', activationName, 'result.log'],
           'activation-result.log',
-          rootsToRedact,
+          context,
         ),
       );
     } else {
@@ -586,29 +1234,32 @@ export async function collectInstallAttemptDiagnostics(
               ? 'ambiguous'
               : 'io-error',
         sizeBytes: null,
-        truncated: false,
       });
     }
-    const incomplete = files.some((file) =>
-      ['unsafe', 'io-error', 'too-large'].includes(file.status),
-    );
+    const incomplete = files.some((file) => statusIsIncomplete(file.status));
     emit(
       `status=${incomplete ? 'diagnostics-incomplete' : 'complete'} attempt=${attemptName} activationRequest=${activationNames.length === 1 ? 'captured' : 'unresolved'}`,
     );
     for (const file of files) {
-      emit(
-        `${file.label} status=${file.status} sizeBytes=${file.sizeBytes ?? 'unknown'} truncated=${file.truncated}`,
-      );
-      if (file.tail) {
-        for (const line of file.tail.split('\n')) {
+      emit(`${file.label} status=${file.status} sizeBytes=${file.sizeBytes ?? 'unknown'}`);
+      if (file.text !== undefined) {
+        const safeText = sanitizeInitialDiagnostic(
+          { status: 'complete', text: file.text },
+          rootsToRedact,
+        );
+        for (const line of safeText.split('\n')) {
           emit(`${file.label} | ${line}`);
         }
-      } else if (file.status === 'captured') {
-        emit(`${file.label} | tail-unavailable`);
       }
     }
   } catch {
     emit('status=diagnostics-incomplete reason=collector-error');
+  }
+  if (context !== undefined) {
+    const status = await validatePinnedDirectories(context);
+    if (status !== 'ok') {
+      return `${prefix}status=diagnostics-incomplete reason=${status}\n`;
+    }
   }
   return finish();
 }
@@ -2184,6 +2835,7 @@ export async function portableToolchain(
   const root = await mkdtemp(
     process.platform === 'darwin' ? '/tmp/r' : join(tmpdir(), 'revo-c3b-'),
   );
+  registerInitialDiagnosticRoot(root);
   const requestedHome = process.platform === 'darwin' ? '/tmp/r' : root;
   const effectiveInstallRoot = installRoot ?? join(root, 'state');
   await mkdir(requestedHome, { recursive: true, mode: 0o700 });
@@ -2247,10 +2899,7 @@ export async function portableToolchain(
     join(pnpmSource, 'pnpm'),
     `${await readFile(join(pnpmSource, 'pnpm'), 'utf8')}printf '%s/bin/node\\n' "$REVO_PRIVATE_NODE_ROOT" >"$REVO_PNPM_NODE_RECORD"\n`,
   );
-  await writeFile(
-    join(pnpmSource, 'pnpm'),
-    '#!/bin/sh\nexec "$REVO_PRIVATE_NODE_ROOT/bin/node" "${0%/*}/launcher.mjs" "$@"\n',
-  );
+  await writeFile(join(pnpmSource, 'pnpm'), '#!/bin/sh\nexec node "${0%/*}/launcher.mjs" "$@"\n');
   await chmod(join(pnpmSource, 'pnpm'), 0o755);
   await writeFile(
     join(pnpmSource, 'launcher.mjs'),
@@ -2310,15 +2959,16 @@ export async function portableToolchain(
     if (descriptor === undefined) {
       throw new Error('fixture omitted pnpm archive');
     }
-    const response = await fetch(descriptor.url, { signal: AbortSignal.timeout(120_000) });
-    if (!response.ok) {
-      throw new Error(`pnpm archive download failed: ${response.status}`);
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    const bytes = await fetchPinnedPnpmFixtureArchive({
+      url: descriptor.url,
+      sha256: descriptor.sha256,
+      onAttempt: ({ attempt, status, durationMs }) => {
+        console.error(
+          `REVO_PNPM_ARCHIVE_FETCH attempt=${attempt} status=${status} durationMs=${durationMs}`,
+        );
+      },
+    });
     const digest = createHash('sha256').update(bytes).digest('hex');
-    if (digest !== descriptor.sha256) {
-      throw new Error('pnpm archive digest mismatch');
-    }
     await writeFile(pnpmArchive, bytes);
     pnpmSha = digest;
   }
@@ -2750,8 +3400,8 @@ syncBuiltinESMExports();\n`,
     nodeArchiveSha256: nodeSha,
     pnpmArchiveSha256: pnpmSha,
     diagnosticContext: diagnosticContextFor(),
-    initialInstallFailureDiagnostics: () =>
-      collectInitialInstallFailureDiagnostics(root, channelRoot),
+    initialInstallFailureDiagnostics: (signal?: AbortSignal, markCloseUncertain?: () => void) =>
+      collectInitialInstallFailureRecords(root, channelRoot, signal, undefined, markCloseUncertain),
   };
 }
 
@@ -2760,9 +3410,18 @@ export async function resolveToolchainFixtureHome(requestedHome: string): Promis
 }
 
 export async function cleanupPortableToolchain(root: string) {
-  await Promise.all([...(installedData.get(root) ?? [])].map(stopInstalledServer));
-  installedData.delete(root);
-  await rm(root, { recursive: true, force: true });
+  const state = diagnosticRootState(root);
+  if (state.lifecycle === 'closed') {
+    return;
+  }
+  state.lifecycle = 'closing';
+  if (state.readers.size > 0 || state.closeUncertain) {
+    throw new Error('INITIAL_DIAGNOSTICS_NOT_QUIESCENT');
+  }
+  await Promise.all([...(installedData.get(state.cleanupRoot) ?? [])].map(stopInstalledServer));
+  installedData.delete(state.cleanupRoot);
+  await rm(state.cleanupRoot, { recursive: true, force: true });
+  state.lifecycle = 'closed';
 }
 
 export async function runWithPortableToolchainCleanup<T>(

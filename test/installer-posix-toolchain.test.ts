@@ -1,13 +1,18 @@
 import { spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import type { Dir } from 'node:fs';
 import {
+  type FileHandle,
   chmod,
   cp,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -24,10 +29,19 @@ import { parseLifecycleDocument } from '../src/server-logs/document.js';
 import { ServerLifecycleStore, serverLifecyclePath } from '../src/server-logs/store.service.js';
 import { activationScenario } from './support/installation/activation-scenario.js';
 import {
+  serializeInitialInstallFailureReceipt,
+  type InitialInstallFailureTestCase,
+  type InitialInstallDiagnostics,
+} from './support/installation/initial-install-diagnostic-sanitizer.js';
+import {
   captureIntelSnapshot as captureIntelSnapshotUnsafe,
   cleanupPortableToolchain,
   collectInstallAttemptDiagnostics,
+  collectInitialInstallFailureRecords,
   collectInitialInstallFailureDiagnostics,
+  fetchPinnedPnpmFixtureArchive,
+  type InitialDiagnosticCollectionLease,
+  type InitialDiagnosticCloseOperations,
   intelCollectorsQuiescent,
   installerData,
   nodeData,
@@ -37,10 +51,188 @@ import {
   recordIntelCollectorIssue,
   resolveToolchainFixtureHome,
   runWithPortableToolchainCleanup,
+  startInitialDiagnosticCollection,
   toolchainInstaller,
   writeIntelDiagnosticSummary,
 } from './support/installation/installer-toolchain-scenario.js';
 import { ServerOwnerScenario } from './support/server/server-owner-scenario.js';
+
+type PnpmArchiveDescriptor = {
+  readonly platform: string;
+  readonly arch: string;
+  readonly sha256: string;
+  readonly url: string;
+};
+type PnpmBootstrap = {
+  readonly nodeVersion: string;
+  readonly pnpmVersion: string;
+  readonly channel: 'stable' | 'alpha';
+  readonly pnpmArchives: readonly PnpmArchiveDescriptor[];
+  readonly [key: string]: unknown;
+};
+type PnpmProbeProvision = {
+  readonly bootstrap: PnpmBootstrap;
+  readonly nodeExecutable: string;
+  readonly privateNodeRoot: string;
+  readonly channelRoot: string;
+  readonly scratch: string;
+  readonly platform: 'darwin' | 'linux';
+  readonly arch: 'arm64' | 'x64';
+  readonly request: (url: string) => Promise<{
+    readonly status: number;
+    readonly headers: Headers;
+    readonly body: AsyncIterable<Uint8Array>;
+  }>;
+};
+type PnpmProbeApi = {
+  provisionPnpm: (input: PnpmProbeProvision) => Promise<{
+    readonly executablePath: string;
+    readonly reused: boolean;
+    readonly version: string;
+  }>;
+};
+
+const pnpmProbeApi = await vi.importActual<PnpmProbeApi>(
+  new URL('../installer/node-bootstrap.mjs', import.meta.url).href,
+);
+
+const isPnpmBootstrap = (value: unknown): value is PnpmBootstrap =>
+  typeof value === 'object' &&
+  value !== null &&
+  'nodeVersion' in value &&
+  typeof value.nodeVersion === 'string' &&
+  'pnpmVersion' in value &&
+  typeof value.pnpmVersion === 'string' &&
+  'channel' in value &&
+  (value.channel === 'stable' || value.channel === 'alpha') &&
+  'pnpmArchives' in value &&
+  Array.isArray(value.pnpmArchives) &&
+  value.pnpmArchives.every(
+    (archive: unknown) =>
+      typeof archive === 'object' &&
+      archive !== null &&
+      'platform' in archive &&
+      typeof archive.platform === 'string' &&
+      'arch' in archive &&
+      typeof archive.arch === 'string' &&
+      'sha256' in archive &&
+      typeof archive.sha256 === 'string' &&
+      'url' in archive &&
+      typeof archive.url === 'string',
+  );
+
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+const privateNodeProbeWrapper = (evidencePath: string, exitCode?: number) => `#!/bin/sh
+set -eu
+umask 077
+printf '%s\\0' "$0" "$PWD" "$HOME" "$TMPDIR" "$PATH" "\${REVO_PRIVATE_NODE_ROOT+x}" "$#" "$1" "$2" "$3" >> ${shellQuote(evidencePath)}
+${exitCode === undefined ? '' : `exit ${exitCode}`}
+exec ${shellQuote(process.execPath)} "$@"
+`;
+
+const privateNodeProbeFixture = async (exitCode?: number) => {
+  const subject = await portableToolchain('stable');
+  const requestedRoot = await mkdtemp(join(tmpdir(), 'revo-pnpm-private-node-probe-'));
+  const root = await realpath(requestedRoot);
+  const privateNodeRoot = join(root, 'private-node');
+  const privateNodeBin = join(privateNodeRoot, 'bin');
+  const nodeExecutable = join(privateNodeBin, 'node');
+  const evidenceDirectory = join(root, 'evidence');
+  const evidencePath = join(evidenceDirectory, 'invocations.bin');
+  const scratch = join(root, 'scratch');
+  const channelRoot = join(root, 'channel');
+  await Promise.all([
+    mkdir(privateNodeBin, { recursive: true, mode: 0o700 }),
+    mkdir(evidenceDirectory, { mode: 0o700 }),
+    mkdir(scratch, { mode: 0o700 }),
+    mkdir(channelRoot, { mode: 0o700 }),
+  ]);
+  await writeFile(nodeExecutable, privateNodeProbeWrapper(evidencePath, exitCode), { mode: 0o700 });
+  await chmod(nodeExecutable, 0o700);
+
+  const rawBootstrap = await installerData('stable');
+  if (!isPnpmBootstrap(rawBootstrap)) {
+    throw new Error('invalid pnpm bootstrap fixture');
+  }
+  const platform = process.platform === 'darwin' ? 'darwin' : 'linux';
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  const descriptor = rawBootstrap.pnpmArchives.find(
+    (item) => item.platform === platform && item.arch === arch,
+  );
+  if (descriptor === undefined) {
+    throw new Error('pnpm bootstrap omitted current target');
+  }
+  const bootstrap: PnpmBootstrap = {
+    ...rawBootstrap,
+    pnpmArchives: rawBootstrap.pnpmArchives.map((item) =>
+      item === descriptor ? { ...item, sha256: subject.pnpmArchiveSha256 } : item,
+    ),
+  };
+  const bytes = await readFile(subject.pnpmArchive);
+  const request = vi.fn<PnpmProbeProvision['request']>(async (url) => {
+    if (url !== descriptor.url) {
+      throw new Error('unexpected pnpm archive request');
+    }
+    return {
+      status: 200,
+      headers: new Headers({ 'content-length': String(bytes.length) }),
+      body: (async function* () {
+        yield bytes;
+      })(),
+    };
+  });
+  const provision = () =>
+    pnpmProbeApi.provisionPnpm({
+      bootstrap,
+      nodeExecutable,
+      privateNodeRoot,
+      channelRoot,
+      scratch,
+      platform,
+      arch,
+      request,
+    });
+  const target = join(
+    channelRoot,
+    'pnpm',
+    bootstrap.nodeVersion,
+    `${platform}-${arch}`,
+    bootstrap.pnpmVersion,
+  );
+  const invocations = async () => {
+    const encoded = await readFile(evidencePath, 'utf8');
+    const fields = encoded.split('\0');
+    if (fields.at(-1) !== '') {
+      throw new Error('private Node evidence is truncated');
+    }
+    fields.pop();
+    if (fields.length % 10 !== 0) {
+      throw new Error('private Node evidence is malformed');
+    }
+    return Array.from({ length: fields.length / 10 }, (_, index) =>
+      fields.slice(index * 10, index * 10 + 10),
+    );
+  };
+  const cleanup = async () => {
+    await cleanupPortableToolchain(subject.root);
+    await rm(root, { recursive: true, force: true });
+  };
+  return {
+    bootstrap,
+    channelRoot,
+    cleanup,
+    evidencePath,
+    invocations,
+    nodeExecutable,
+    privateNodeBin,
+    provision,
+    request,
+    scratch,
+    subject,
+    target,
+  };
+};
 
 const extractWorkflowBlock = (source: string, startMarker: string, endMarker: string): string => {
   expect(source.split(startMarker)).toHaveLength(2);
@@ -605,7 +797,13 @@ it
       async () => {
         expect(subject.plan.release.version).toMatch(/^0\.0\./u);
         const installation = subject.startInstaller();
-        const installationCode = await installation.finish;
+        const installationCode = await finishInitialInstallWithDiagnostics(
+          channel === 'stable' ? 'real-stable-activation-mode' : 'real-alpha-activation-mode',
+          subject.root,
+          installation,
+          (signal, markCloseUncertain) =>
+            subject.initialInstallFailureDiagnostics(signal, markCloseUncertain),
+        );
         installerOutcome = formatInstallerOutcome(installation.outcome());
         installerStderrTail = installation.stderrTail();
         expect(installationCode).toBe(0);
@@ -833,7 +1031,485 @@ async function reportRecoveryAttempt(input: {
   );
 }
 
+type InitialInstallExecution = {
+  readonly finish: Promise<number>;
+  readonly outcome: () =>
+    | { readonly code: number | null; readonly signal: NodeJS.Signals | null }
+    | undefined;
+};
+
+async function finishInitialInstallWithDiagnostics(
+  testCase: InitialInstallFailureTestCase,
+  fixtureRoot: string,
+  installation: InitialInstallExecution,
+  collect: (
+    signal: AbortSignal,
+    markCloseUncertain: () => void,
+  ) => Promise<InitialInstallDiagnostics>,
+  report: (message: string) => void = (message) => console.error(message),
+  timeoutMs = 5_000,
+  resolveDiagnosticRoot: (path: string) => Promise<string> = realpath,
+): Promise<number> {
+  const finishCode = await installation.finish;
+  if (finishCode !== 0) {
+    try {
+      let diagnostics: InitialInstallDiagnostics = {
+        status: 'incomplete',
+        reason: 'collector-error',
+        logs: {
+          'install-session.log': {
+            status: 'incomplete',
+            sizeBytes: null,
+            diagnostic: '[diagnostic omitted]',
+          },
+          'server-start.log': {
+            status: 'incomplete',
+            sizeBytes: null,
+            diagnostic: '[diagnostic omitted]',
+          },
+          'activation-result.log': {
+            status: 'incomplete',
+            sizeBytes: null,
+            diagnostic: '[diagnostic omitted]',
+          },
+        },
+      };
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let currentLease: InitialDiagnosticCollectionLease<InitialInstallDiagnostics> | undefined;
+      try {
+        let timedOut = false;
+        const deadline = new Promise<{ readonly kind: 'timeout' }>((resolve) => {
+          timeout = setTimeout(() => {
+            timedOut = true;
+            currentLease?.abort();
+            resolve({ kind: 'timeout' });
+          }, timeoutMs);
+        });
+        currentLease = startInitialDiagnosticCollection(
+          fixtureRoot,
+          collect,
+          resolveDiagnosticRoot,
+        );
+        const collection = currentLease.promise.then(
+          (value) => ({ kind: 'complete' as const, value }),
+          () => ({ kind: 'failed' as const }),
+        );
+        const result = await Promise.race([collection, deadline]);
+        if (result.kind === 'complete') {
+          diagnostics = result.value;
+        } else if (result.kind === 'timeout') {
+          currentLease.abort();
+        } else if (timedOut) {
+          currentLease.abort();
+        }
+      } catch {
+        // Diagnostics are best-effort and cannot replace the installer failure.
+      } finally {
+        if (timeout !== undefined) {
+          clearTimeout(timeout);
+        }
+      }
+      let signal: string | null = null;
+      try {
+        signal = installation.outcome()?.signal ?? null;
+      } catch {
+        // Keep the receipt valid even if a diagnostic accessor fails.
+      }
+      const platform =
+        process.platform === 'linux' || process.platform === 'darwin'
+          ? process.platform
+          : 'unknown';
+      const arch = process.arch === 'x64' || process.arch === 'arm64' ? process.arch : 'unknown';
+      const receipt = serializeInitialInstallFailureReceipt({
+        testCase,
+        platform,
+        arch,
+        finishCode,
+        signal,
+        stdoutDiagnostic: { status: 'incomplete' },
+        stderrDiagnostic: { status: 'incomplete' },
+        diagnostics,
+      });
+      report(receipt);
+    } catch {
+      // Serialization or reporting failure is swallowed; never invoke a broken reporter twice.
+    }
+  }
+  return finishCode;
+}
+
+async function runWithCleanupPreservingFailure<T>(
+  run: () => Promise<T>,
+  cleanups: readonly (() => Promise<void>)[],
+): Promise<T> {
+  let value!: T;
+  let primaryFailure: unknown;
+  let hasPrimaryFailure = false;
+  try {
+    value = await run();
+  } catch (error) {
+    primaryFailure = error;
+    hasPrimaryFailure = true;
+  }
+
+  const cleanupFailures: unknown[] = [];
+  for (const cleanup of cleanups) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- continue after each failure and preserve cleanup order.
+      await cleanup();
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+  }
+
+  if (hasPrimaryFailure && cleanupFailures.length > 0) {
+    throw new AggregateError(
+      [primaryFailure, ...cleanupFailures],
+      'Scenario and one or more independent cleanup steps failed',
+    );
+  }
+  if (hasPrimaryFailure) {
+    throw primaryFailure;
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'One or more independent cleanup steps failed');
+  }
+  return value;
+}
+
+describe('pinned pnpm fixture archive fetch', () => {
+  const url = 'https://github.com/pnpm/pnpm/releases/download/v12.5.1/pnpm-fixture.tar.gz';
+  const bytes = new Uint8Array([1, 2, 3, 4]);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+
+  it('retries one transient 5xx and verifies the pinned bytes', async () => {
+    let firstBodyCancelled = false;
+    const transientBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('transient'));
+      },
+      cancel() {
+        firstBodyCancelled = true;
+      },
+    });
+    const request = vi
+      .fn<typeof fetch>(async () => new Response(transientBody, { status: 500 }))
+      .mockResolvedValueOnce(new Response(transientBody, { status: 500 }))
+      .mockResolvedValueOnce(new Response(bytes, { status: 200 }));
+    const attempts: Array<{
+      attempt: number;
+      status: number | 'network-error';
+      durationMs: number;
+    }> = [];
+
+    const result = await fetchPinnedPnpmFixtureArchive({
+      url,
+      sha256,
+      request,
+      retryDelayMs: 1,
+      onAttempt: (attempt) => attempts.push(attempt),
+    });
+
+    expect(result).toEqual(bytes);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(firstBodyCancelled).toBe(true);
+    expect(attempts.map(({ attempt, status }) => [attempt, status])).toEqual([
+      [1, 500],
+      [2, 200],
+    ]);
+    expect(attempts.every(({ durationMs }) => durationMs >= 0)).toBe(true);
+  });
+
+  it('does not retry a second transient 5xx', async () => {
+    const request = vi
+      .fn<typeof fetch>(async () => new Response('unavailable', { status: 503 }))
+      .mockResolvedValueOnce(new Response('unavailable', { status: 503 }))
+      .mockResolvedValueOnce(new Response('still unavailable', { status: 503 }));
+    const attempts: number[] = [];
+
+    await expect(
+      fetchPinnedPnpmFixtureArchive({
+        url,
+        sha256,
+        request,
+        retryDelayMs: 1,
+        onAttempt: ({ status }) => {
+          if (typeof status === 'number') {
+            attempts.push(status);
+          }
+        },
+      }),
+    ).rejects.toThrow('pnpm archive download failed: 503');
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(attempts).toEqual([503, 503]);
+  });
+
+  it('does not retry checksum mismatch or non-retryable status', async () => {
+    const wrongDigestRequest = vi.fn<typeof fetch>(
+      async () => new Response('wrong', { status: 200 }),
+    );
+    await expect(
+      fetchPinnedPnpmFixtureArchive({ url, sha256, request: wrongDigestRequest }),
+    ).rejects.toThrow('pnpm archive digest mismatch');
+    expect(wrongDigestRequest).toHaveBeenCalledTimes(1);
+
+    const notFoundRequest = vi.fn<typeof fetch>(async () => new Response(null, { status: 404 }));
+    await expect(
+      fetchPinnedPnpmFixtureArchive({ url, sha256, request: notFoundRequest, retryDelayMs: 1 }),
+    ).rejects.toThrow('pnpm archive download failed: 404');
+    expect(notFoundRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies one overall deadline to retry delay and requests', async () => {
+    const request = vi.fn<typeof fetch>(async () => new Response('unavailable', { status: 500 }));
+    await expect(
+      fetchPinnedPnpmFixtureArchive({
+        url,
+        sha256,
+        request,
+        timeoutMs: 20,
+        retryDelayMs: 100,
+      }),
+    ).rejects.toBeDefined();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds a request that never resolves response headers', async () => {
+    const request = vi.fn<typeof fetch>(() => new Promise(() => undefined));
+    const attempts: string[] = [];
+
+    await expect(
+      fetchPinnedPnpmFixtureArchive({
+        url,
+        sha256,
+        request,
+        timeoutMs: 10,
+        onAttempt: ({ status }) => attempts.push(String(status)),
+      }),
+    ).rejects.toBeDefined();
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(attempts).toEqual(['network-error']);
+  });
+
+  it('cancels a response whose headers arrive after the overall timeout', async () => {
+    let resolveRequest: ((response: Response) => void) | undefined;
+    let bodyCancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('late response'));
+      },
+      cancel() {
+        bodyCancelled = true;
+      },
+    });
+    const request = vi.fn<typeof fetch>(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveRequest = resolve;
+        }),
+    );
+
+    await expect(
+      fetchPinnedPnpmFixtureArchive({ url, sha256, request, timeoutMs: 10 }),
+    ).rejects.toBeDefined();
+    resolveRequest?.(new Response(body, { status: 500 }));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(bodyCancelled).toBe(true);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds a successful response whose body never completes', async () => {
+    let rejectBody: ((error: Error) => void) | undefined;
+    const stalledBody = new ReadableStream<Uint8Array>({
+      pull: () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectBody = reject;
+        }),
+    });
+    const request = vi.fn<typeof fetch>(async () => new Response(stalledBody, { status: 200 }));
+
+    await expect(
+      fetchPinnedPnpmFixtureArchive({ url, sha256, request, timeoutMs: 10 }),
+    ).rejects.toBeDefined();
+    rejectBody?.(new Error('late body rejection'));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['stalled', 'rejected'] as const)(
+    'does not retry a transient response when body cancellation is %s',
+    async (cancelMode) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('transient'));
+        },
+        cancel() {
+          return cancelMode === 'stalled'
+            ? new Promise<void>(() => undefined)
+            : Promise.reject(new Error('cancel failed'));
+        },
+      });
+      const request = vi.fn<typeof fetch>(async () => new Response(body, { status: 500 }));
+      await expect(
+        fetchPinnedPnpmFixtureArchive({ url, sha256, request, timeoutMs: 20, retryDelayMs: 1 }),
+      ).rejects.toThrow('pnpm archive response cancellation failed');
+      expect(request).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('does not retry a network rejection or a wrong digest after one 5xx', async () => {
+    const networkError = new Error('network unavailable');
+    const rejectedRequest = vi.fn<typeof fetch>(async () => {
+      throw networkError;
+    });
+    await expect(
+      fetchPinnedPnpmFixtureArchive({ url, sha256, request: rejectedRequest, retryDelayMs: 1 }),
+    ).rejects.toBe(networkError);
+    expect(rejectedRequest).toHaveBeenCalledTimes(1);
+
+    const wrongBytes = new Uint8Array([9, 8, 7]);
+    const wrongDigestRequest = vi
+      .fn<typeof fetch>(async () => new Response('unavailable', { status: 500 }))
+      .mockResolvedValueOnce(new Response('unavailable', { status: 500 }))
+      .mockResolvedValueOnce(new Response(wrongBytes, { status: 200 }));
+    await expect(
+      fetchPinnedPnpmFixtureArchive({
+        url,
+        sha256,
+        request: wrongDigestRequest,
+        retryDelayMs: 1,
+      }),
+    ).rejects.toThrow('pnpm archive digest mismatch');
+    expect(wrongDigestRequest).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('initial installation failure diagnostics', () => {
+  it('keeps the scenario error first and runs every independent cleanup after failures', async () => {
+    const primary = new Error('original installation assertion');
+    const cleanupFailure = new Error('server cleanup failed');
+    const events: string[] = [];
+
+    const outcome = runWithCleanupPreservingFailure(async () => {
+      events.push('scenario');
+      throw primary;
+    }, [
+      async () => {
+        events.push('cleanup-one');
+        throw cleanupFailure;
+      },
+      async () => {
+        events.push('cleanup-two');
+      },
+    ]);
+
+    await expect(outcome).rejects.toMatchObject({ errors: [primary, cleanupFailure] });
+    expect(events).toEqual(['scenario', 'cleanup-one', 'cleanup-two']);
+  });
+
+  it('collects only after an unexpected failure and preserves the installer result', async () => {
+    const events: string[] = [];
+    const report = vi.fn<(message: string) => void>();
+    const success = {
+      finish: Promise.resolve(0),
+      outcome: () => ({ code: 0, signal: null }),
+      stdoutTail: () => '',
+      stderrTail: () => '',
+    };
+    const collect = vi.fn<() => Promise<InitialInstallDiagnostics>>(async () => {
+      events.push('collect');
+      throw new Error('collector failure');
+    });
+
+    expect(
+      await finishInitialInstallWithDiagnostics(
+        'real-stable-activation-mode',
+        process.cwd(),
+        success,
+        collect,
+        report,
+      ),
+    ).toBe(0);
+    expect(collect).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+
+    const failure = { ...success, finish: Promise.resolve(1) };
+    expect(
+      await finishInitialInstallWithDiagnostics(
+        'real-stable-activation-mode',
+        process.cwd(),
+        failure,
+        collect,
+        report,
+      ),
+    ).toBe(1);
+    events.push('cleanup');
+    expect(events).toEqual(['collect', 'cleanup']);
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(report.mock.calls[0]?.[0]).toContain('"finishCode":1');
+    expect(report.mock.calls[0]?.[0]).toContain('"reason":"collector-error"');
+    expect(report.mock.calls[0]?.[0]).not.toContain('collector failure');
+  });
+
+  it('preserves a rejected finish and never lets diagnostic getters or reporting replace its code', async () => {
+    const finishFailure = new Error('installer finish rejection');
+    await expect(
+      finishInitialInstallWithDiagnostics(
+        'real-stable-activation-mode',
+        process.cwd(),
+        {
+          finish: Promise.reject(finishFailure),
+          outcome: () => undefined,
+        },
+        async () => ({
+          status: 'incomplete',
+          reason: 'collector-error',
+          logs: {
+            'install-session.log': {
+              status: 'incomplete',
+              sizeBytes: null,
+              diagnostic: '[diagnostic omitted]',
+            },
+            'server-start.log': {
+              status: 'incomplete',
+              sizeBytes: null,
+              diagnostic: '[diagnostic omitted]',
+            },
+            'activation-result.log': {
+              status: 'incomplete',
+              sizeBytes: null,
+              diagnostic: '[diagnostic omitted]',
+            },
+          },
+        }),
+      ),
+    ).rejects.toBe(finishFailure);
+
+    const report = vi.fn<(message: string) => void>(() => {
+      throw new Error('reporter failure');
+    });
+    const installation = {
+      finish: Promise.resolve(23),
+      get outcome(): InitialInstallExecution['outcome'] {
+        throw new Error('outcome accessor failure');
+      },
+    };
+    await expect(
+      finishInitialInstallWithDiagnostics(
+        'real-stable-activation-mode',
+        process.cwd(),
+        installation,
+        async () => {
+          throw new Error('collector rejection');
+        },
+        report,
+      ),
+    ).resolves.toBe(23);
+    expect(report).toHaveBeenCalledTimes(1);
+  });
+
   async function fixture() {
     const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostics-'));
     const channelRoot = join(root, 'state', 'stable');
@@ -843,7 +1519,7 @@ describe('initial installation failure diagnostics', () => {
     return { root, channelRoot, scratch, activation };
   }
 
-  it('reads only the three fixed logs and redacts secrets, paths, ANSI, and workflow commands', async () => {
+  it('reads only fixed logs and omits an entire credential-bearing or unsafe log', async () => {
     const subject = await fixture();
     try {
       await writeFile(
@@ -865,7 +1541,9 @@ describe('initial installation failure diagnostics', () => {
       expect(output).toContain('install-session.log status=captured');
       expect(output).toContain('server-start.log status=captured');
       expect(output).toContain('activation-result.log status=captured');
-      expect(output).toContain('activation helper failed');
+      expect(output).toContain('server did not start');
+      expect(output).toContain('install-session.log | "[diagnostic omitted]"');
+      expect(output).toContain('activation-result.log | "[diagnostic omitted]"');
       expect(output).not.toContain('super-secret');
       expect(output).not.toContain('other-secret');
       expect(output).not.toContain(subject.root);
@@ -883,7 +1561,7 @@ describe('initial installation failure diagnostics', () => {
     }
   });
 
-  it('bounds each file tail and the total diagnostic output', async () => {
+  it('omits oversized diagnostic fields instead of publishing a partial tail', async () => {
     const subject = await fixture();
     try {
       const large = `${'x'.repeat(10_000)}\nfinal-evidence-line\n`;
@@ -897,8 +1575,9 @@ describe('initial installation failure diagnostics', () => {
       );
 
       expect(Buffer.byteLength(output)).toBeLessThanOrEqual(16 * 1024);
-      expect(output).toContain(`sizeBytes=${Buffer.byteLength(large, 'utf8')} truncated=true`);
-      expect(output).toContain('final-evidence-line');
+      expect(output).toContain(`sizeBytes=${Buffer.byteLength(large, 'utf8')}`);
+      expect(output).toContain('install-session.log | "[diagnostic omitted]"');
+      expect(output).not.toContain('final-evidence-line');
     } finally {
       await rm(subject.root, { recursive: true, force: true });
     }
@@ -910,7 +1589,7 @@ describe('initial installation failure diagnostics', () => {
     await mkdir(missingChannel, { recursive: true, mode: 0o700 });
     try {
       const missingOutput = await collectInitialInstallFailureDiagnostics(missing, missingChannel);
-      expect(missingOutput).toContain('attempts=missing');
+      expect(missingOutput).toContain('reason=attempts-unavailable');
 
       const logsMissing = await fixture();
       try {
@@ -918,7 +1597,7 @@ describe('initial installation failure diagnostics', () => {
           logsMissing.root,
           logsMissing.channelRoot,
         );
-        expect(output).toContain('attempts=1 activationRequest=captured');
+        expect(output).toContain('status=complete reason=none');
         expect(output).toContain('install-session.log status=missing');
         expect(output).toContain('server-start.log status=missing');
         expect(output).toContain('activation-result.log status=missing');
@@ -935,7 +1614,7 @@ describe('initial installation failure diagnostics', () => {
         });
         expect(
           await collectInitialInstallFailureDiagnostics(subject.root, subject.channelRoot),
-        ).toContain('attempts=ambiguous');
+        ).toContain('reason=attempts-ambiguous');
       } finally {
         await rm(subject.root, { recursive: true, force: true });
       }
@@ -947,7 +1626,6 @@ describe('initial installation failure diagnostics', () => {
           activationAmbiguous.root,
           activationAmbiguous.channelRoot,
         );
-        expect(output).toContain('activationRequest=ambiguous');
         expect(output).toContain('activation-result.log status=ambiguous');
       } finally {
         await rm(activationAmbiguous.root, { recursive: true, force: true });
@@ -987,7 +1665,7 @@ describe('initial installation failure diagnostics', () => {
         subject.root,
         subject.channelRoot,
       );
-      expect(parentOutput).toContain('attempts=1');
+      expect(parentOutput).toContain('status=incomplete reason=scratch-unavailable');
       expect(parentOutput).toContain('install-session.log status=unsafe');
       expect(parentOutput).not.toContain('outside-secret');
     } finally {
@@ -995,7 +1673,102 @@ describe('initial installation failure diagnostics', () => {
     }
   });
 
-  it('keeps prefixed multibyte lines whole within the aggregate output cap', async () => {
+  it('marks named-attempt diagnostics incomplete for invalid UTF-8 and accepts missing logs', async () => {
+    const subject = await fixture();
+    const attemptName = '.attempt.Abc123';
+    const logPath = join(
+      subject.channelRoot,
+      attemptName,
+      'runtime',
+      'scratch',
+      'install-session.log',
+    );
+    try {
+      const missingOutput = await collectInstallAttemptDiagnostics(
+        subject.root,
+        subject.channelRoot,
+        attemptName,
+      );
+      expect(missingOutput).toContain('status=complete attempt=.attempt.Abc123');
+
+      await writeFile(logPath, Buffer.from([0xff, 0xfe, 0xfd]));
+      const invalidUtf8Output = await collectInstallAttemptDiagnostics(
+        subject.root,
+        subject.channelRoot,
+        attemptName,
+      );
+
+      expect(invalidUtf8Output).toContain('status=diagnostics-incomplete attempt=.attempt.Abc123');
+      expect(invalidUtf8Output).toContain('install-session.log status=invalid-utf8');
+      expect(invalidUtf8Output).not.toContain('�');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not select directory entries returned after collection is aborted at its bound', async () => {
+    const subject = await fixture();
+    const controller = new AbortController();
+    let entryReads = 0;
+    try {
+      await Promise.all(
+        Array.from({ length: 63 }, (_, index) =>
+          writeFile(join(subject.channelRoot, `unrelated-${index}`), ''),
+        ),
+      );
+      const diagnostics = await collectInitialInstallFailureRecords(
+        subject.root,
+        subject.channelRoot,
+        controller.signal,
+        async (event) => {
+          if (event.phase === 'directory-entry-read') {
+            entryReads += 1;
+            if (entryReads === 64) {
+              controller.abort();
+            }
+          }
+        },
+      );
+
+      expect(entryReads).toBe(64);
+      expect(diagnostics.status).toBe('incomplete');
+      expect(diagnostics.reason).toBe('attempts-unavailable');
+      expect(Object.values(diagnostics.logs).every((record) => record.status === 'io-error')).toBe(
+        true,
+      );
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not choose a single activation request from a truncated directory listing', async () => {
+    const subject = await fixture();
+    try {
+      await writeFile(join(subject.activation, 'result.log'), 'must-not-be-selected');
+      await Promise.all(
+        Array.from({ length: 63 }, (_, index) =>
+          writeFile(join(subject.scratch, `unrelated-${index}`), ''),
+        ),
+      );
+      const diagnostics = await collectInitialInstallFailureRecords(
+        subject.root,
+        subject.channelRoot,
+      );
+
+      expect(diagnostics.status).toBe('incomplete');
+      expect(diagnostics.reason).toBe('activation-request-ambiguous');
+      expect(diagnostics.logs['activation-result.log']).toMatchObject({
+        status: 'ambiguous',
+        sizeBytes: null,
+        diagnostic: '[diagnostic omitted]',
+      });
+      expect(JSON.stringify(diagnostics)).not.toContain('must-not-be-selected');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('omits multibyte fields that exceed the per-field UTF-8 output bound', async () => {
     const subject = await fixture();
     try {
       const dense = 'é\n'.repeat(4096);
@@ -1010,8 +1783,8 @@ describe('initial installation failure diagnostics', () => {
       const lines = output.split('\n').filter(Boolean);
 
       expect(Buffer.byteLength(output)).toBeLessThanOrEqual(16 * 1024);
-      expect(output).toContain('status=output-truncated');
-      expect(output).toContain(' | é');
+      expect(output).toContain('install-session.log | "[diagnostic omitted]"');
+      expect(output).not.toContain(' | é');
       expect(lines.every((line) => line.startsWith('POSIX_INSTALL_DIAGNOSTIC '))).toBe(true);
       expect(output).not.toContain('\uFFFD');
     } finally {
@@ -1019,7 +1792,7 @@ describe('initial installation failure diagnostics', () => {
     }
   });
 
-  it('strips controls before secret redaction so escape sequences cannot split credentials', async () => {
+  it('omits a whole log when controls split a credential indicator', async () => {
     const subject = await fixture();
     try {
       await writeFile(
@@ -1032,11 +1805,734 @@ describe('initial installation failure diagnostics', () => {
         subject.channelRoot,
       );
 
-      expect(output).toContain('password=[redacted]');
+      expect(output).toContain('install-session.log | "[diagnostic omitted]"');
       expect(output).not.toContain('escape-secret');
       expect(output).not.toContain('\u001b');
     } finally {
       await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects oversized and invalid UTF-8 captures without exposing any remainder', async () => {
+    const subject = await fixture();
+    try {
+      await writeFile(join(subject.scratch, 'install-session.log'), 'x'.repeat(16 * 1024));
+      let output = await collectInitialInstallFailureDiagnostics(subject.root, subject.channelRoot);
+      expect(output).toContain('install-session.log status=captured sizeBytes=16384');
+      expect(output).toContain('install-session.log | "[diagnostic omitted]"');
+
+      await writeFile(join(subject.scratch, 'install-session.log'), 'x'.repeat(16 * 1024 + 1));
+      output = await collectInitialInstallFailureDiagnostics(subject.root, subject.channelRoot);
+      expect(output).toContain('install-session.log status=too-large sizeBytes=16385');
+      expect(output).not.toContain('x'.repeat(100));
+
+      await writeFile(join(subject.scratch, 'install-session.log'), Buffer.from([0xc3, 0x28]));
+      output = await collectInitialInstallFailureDiagnostics(subject.root, subject.channelRoot);
+      expect(output).toContain('install-session.log status=invalid-utf8 sizeBytes=2');
+      expect(output).not.toContain('\uFFFD');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['symlink', 'directory'] as const)(
+    'fails closed when a validated parent is replaced by a %s before leaf access',
+    async (replacementKind) => {
+      const subject = await fixture();
+      const replacement = await mkdtemp(join(tmpdir(), 'revo-diagnostic-outside-'));
+      const runtime = dirname(subject.scratch);
+      const preservedRuntime = join(subject.root, 'runtime-preserved');
+      try {
+        await writeFile(join(subject.scratch, 'install-session.log'), 'INSIDE_SENTINEL\n');
+        await writeFile(join(replacement, 'install-session.log'), 'OUTSIDE_SENTINEL\n');
+        let replaced = false;
+        const output = await collectInitialInstallFailureDiagnostics(
+          subject.root,
+          subject.channelRoot,
+          undefined,
+          async (event) => {
+            if (
+              event.phase !== 'parents-validated' ||
+              event.label !== 'install-session.log' ||
+              replaced
+            ) {
+              return;
+            }
+            replaced = true;
+            await rename(runtime, preservedRuntime);
+            if (replacementKind === 'symlink') {
+              await symlink(replacement, runtime);
+              return;
+            }
+            await mkdir(join(runtime, 'scratch'), { recursive: true });
+            await writeFile(join(runtime, 'scratch', 'install-session.log'), 'OUTSIDE_SENTINEL\n');
+          },
+        );
+
+        expect(replaced).toBe(true);
+        expect(output).toContain('status=incomplete');
+        expect(output).toContain('reason=directory-identity-changed');
+        expect(output).not.toContain('INSIDE_SENTINEL');
+        expect(output).not.toContain('OUTSIDE_SENTINEL');
+      } finally {
+        await rm(subject.root, { recursive: true, force: true });
+        await rm(replacement, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('rejects a same-size rewrite performed after the bounded file read', async () => {
+    const subject = await fixture();
+    try {
+      const logPath = join(subject.scratch, 'install-session.log');
+      await writeFile(logPath, 'BEFORE\n');
+      let rewritten = false;
+      const output = await collectInitialInstallFailureDiagnostics(
+        subject.root,
+        subject.channelRoot,
+        undefined,
+        async (event) => {
+          if (event.phase === 'file-read' && event.label === 'install-session.log' && !rewritten) {
+            rewritten = true;
+            await writeFile(logPath, 'AFTER!\n');
+          }
+        },
+      );
+
+      expect(rewritten).toBe(true);
+      expect(output).toContain('install-session.log status=incomplete');
+      expect(output).not.toContain('BEFORE');
+      expect(output).not.toContain('AFTER!');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the final failure receipt one-line, bounded, and secret-free end to end', async () => {
+    const subject = await fixture();
+    try {
+      await writeFile(
+        join(subject.scratch, 'install-session.log'),
+        'application-bootstrap failed: ECONNREFUSED\n',
+      );
+      await writeFile(join(subject.scratch, 'server-start.log'), 'password=receipt-secret\n');
+      await writeFile(
+        join(subject.activation, 'result.log'),
+        'https://alice:receipt-url-secret@example.invalid/path?signature=receipt-query-secret\n',
+      );
+      const diagnostics = await collectInitialInstallFailureRecords(
+        subject.root,
+        subject.channelRoot,
+      );
+      const receipt = serializeInitialInstallFailureReceipt({
+        testCase: 'real-stable-activation-mode',
+        platform: 'linux',
+        arch: 'x64',
+        finishCode: 17,
+        signal: null,
+        stdoutDiagnostic: { status: 'incomplete' },
+        stderrDiagnostic: { status: 'incomplete' },
+        diagnostics,
+      });
+      expect(receipt).not.toContain('\n');
+      expect(Buffer.byteLength(`${receipt}\n`, 'utf8')).toBeLessThanOrEqual(24 * 1024);
+      expect(JSON.parse(receipt.slice('REVO_INITIAL_INSTALL_FAILURE '.length))).toMatchObject({
+        finishCode: 17,
+        diagnostics: expect.objectContaining({
+          status: 'complete',
+          logs: expect.objectContaining({
+            'install-session.log': expect.objectContaining({
+              status: 'captured',
+              diagnostic: 'application-bootstrap failed: ECONNREFUSED',
+            }),
+            'server-start.log': expect.objectContaining({
+              status: 'captured',
+              diagnostic: '[diagnostic omitted]',
+            }),
+            'activation-result.log': expect.objectContaining({
+              status: 'captured',
+              diagnostic: 'URL origin scheme=https host=example.invalid port=443',
+            }),
+          }),
+        }),
+      });
+      expect(receipt).not.toContain('receipt-secret');
+      expect(receipt).not.toContain('receipt-url-secret');
+      expect(receipt).not.toContain('receipt-query-secret');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { line: '_authToken=abc123', redacted: true },
+    { line: 'config:NPM_TOKEN=abc123', redacted: true },
+    { line: 'config:clientSecret=abc123', redacted: true },
+    { line: '{"DATABASE_PASSWORD":"abc123"}', redacted: true },
+    { line: 'config:tokenCount=7', redacted: false },
+    { line: 'config:passwordPolicy=strict', redacted: false },
+    { line: 'config:_authTokenCount=7', redacted: false },
+  ])(
+    'sanitizes credential assignment from a collected receipt: $line',
+    async ({ line, redacted }) => {
+      const subject = await fixture();
+      try {
+        await writeFile(join(subject.scratch, 'install-session.log'), `${line}\ncontinued\n`);
+        await writeFile(join(subject.scratch, 'server-start.log'), 'safe neighboring log\n');
+        await writeFile(join(subject.activation, 'result.log'), 'activation completed\n');
+        const diagnostics = await collectInitialInstallFailureRecords(
+          subject.root,
+          subject.channelRoot,
+        );
+        const receipt = serializeInitialInstallFailureReceipt({
+          testCase: 'real-stable-activation-mode',
+          platform: 'linux',
+          arch: 'x64',
+          finishCode: 17,
+          signal: null,
+          stdoutDiagnostic: { status: 'incomplete' },
+          stderrDiagnostic: { status: 'incomplete' },
+          diagnostics,
+        });
+        const payload: unknown = JSON.parse(receipt.slice('REVO_INITIAL_INSTALL_FAILURE '.length));
+        const expectedDiagnostic = redacted ? '[diagnostic omitted]' : `${line}\ncontinued`;
+
+        expect(receipt.includes('abc123')).toBe(false);
+        expect(receipt.includes(line)).toBe(!redacted);
+        expect(receipt).not.toContain('receipt-credential-sentinel');
+        expect(receipt).not.toContain('\n');
+        expect(Buffer.byteLength(`${receipt}\n`, 'utf8')).toBeLessThanOrEqual(24 * 1024);
+        expect(payload).toMatchObject({
+          finishCode: 17,
+          diagnostics: {
+            status: 'complete',
+            logs: {
+              'install-session.log': {
+                status: 'captured',
+                diagnostic: expectedDiagnostic,
+              },
+              'server-start.log': {
+                status: 'captured',
+                diagnostic: 'safe neighboring log',
+              },
+              'activation-result.log': {
+                status: 'captured',
+                diagnostic: 'activation completed',
+              },
+            },
+          },
+        });
+        expect(
+          serializeInitialInstallFailureReceipt({
+            testCase: 'real-stable-activation-mode',
+            platform: 'linux',
+            arch: 'x64',
+            finishCode: 17,
+            signal: null,
+            stdoutDiagnostic: { status: 'incomplete' },
+            stderrDiagnostic: { status: 'incomplete' },
+            diagnostics,
+          }),
+        ).toBe(receipt);
+      } finally {
+        await rm(subject.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('omits one oversized file independently and retains safe diagnostics from the other logs', async () => {
+    const subject = await fixture();
+    try {
+      await writeFile(join(subject.scratch, 'install-session.log'), 'x'.repeat(16 * 1024));
+      await writeFile(join(subject.scratch, 'server-start.log'), 'application-bootstrap: ready\n');
+      await writeFile(join(subject.activation, 'result.log'), 'activation status: unchanged\n');
+      const diagnostics = await collectInitialInstallFailureRecords(
+        subject.root,
+        subject.channelRoot,
+      );
+
+      expect(diagnostics.logs['install-session.log']).toMatchObject({
+        status: 'captured',
+        diagnostic: '[diagnostic omitted]',
+      });
+      expect(diagnostics.logs['server-start.log']).toMatchObject({
+        status: 'captured',
+        diagnostic: 'application-bootstrap: ready',
+      });
+      expect(diagnostics.logs['activation-result.log']).toMatchObject({
+        status: 'captured',
+        diagnostic: 'activation status: unchanged',
+      });
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { kind: 'file' as const, outcome: 'deferred' as const },
+    { kind: 'directory' as const, outcome: 'deferred' as const },
+    { kind: 'file' as const, outcome: 'rejected' as const },
+    { kind: 'directory' as const, outcome: 'rejected' as const },
+  ])(
+    'tracks real $kind close lifecycle when the close operation is $outcome',
+    async ({ kind, outcome }) => {
+      const subject = await fixture();
+      let fileHandle: FileHandle | undefined;
+      let directoryHandle: Dir | undefined;
+      let signalCloseEntered!: () => void;
+      let releaseClose!: () => void;
+      const closeEntered = new Promise<void>((resolve) => {
+        signalCloseEntered = resolve;
+      });
+      const closeBarrier = new Promise<void>((resolve) => {
+        releaseClose = resolve;
+      });
+      let injected = false;
+      let settledWhileClosePending = outcome !== 'deferred';
+      let rootRetainedAfterRejectedClose = false;
+      let diagnosticsContainIoError = false;
+      let diagnosticsAreOmitted = false;
+      let cleanupBeforeReleaseError: unknown;
+      let cleanupAfterReleaseError: unknown;
+      let diagnostics: InitialInstallDiagnostics | undefined;
+      const finishClose = async (handle: { close: () => Promise<void> }) => {
+        if (injected) {
+          await handle.close();
+          return;
+        }
+        injected = true;
+        signalCloseEntered();
+        if (outcome === 'rejected') {
+          throw new Error('injected fs close rejection');
+        }
+        await closeBarrier;
+        await handle.close();
+      };
+      const closeOperations: InitialDiagnosticCloseOperations =
+        kind === 'file'
+          ? {
+              closeFile: (handle) => {
+                fileHandle = handle;
+                return finishClose(handle);
+              },
+            }
+          : {
+              closeDirectory: (handle) => {
+                directoryHandle = handle;
+                return finishClose(handle);
+              },
+            };
+      let lease: InitialDiagnosticCollectionLease<InitialInstallDiagnostics> | undefined;
+      try {
+        await writeFile(join(subject.scratch, 'install-session.log'), 'bounded evidence\n');
+        lease = startInitialDiagnosticCollection(subject.root, (signal, markCloseUncertain) =>
+          collectInitialInstallFailureRecords(
+            subject.root,
+            subject.channelRoot,
+            signal,
+            undefined,
+            markCloseUncertain,
+            closeOperations,
+          ),
+        );
+        await closeEntered;
+        if (outcome === 'deferred') {
+          try {
+            await cleanupPortableToolchain(subject.root);
+          } catch (error) {
+            cleanupBeforeReleaseError = error;
+          }
+          let settled = false;
+          void lease.promise.then(
+            () => {
+              settled = true;
+            },
+            () => {
+              settled = true;
+            },
+          );
+          await Promise.resolve();
+          settledWhileClosePending = settled;
+          releaseClose();
+          diagnostics = await lease.promise;
+          try {
+            await cleanupPortableToolchain(subject.root);
+          } catch (error) {
+            cleanupAfterReleaseError = error;
+          }
+        } else {
+          diagnostics = await lease.promise;
+          try {
+            await cleanupPortableToolchain(subject.root);
+          } catch (error) {
+            cleanupBeforeReleaseError = error;
+          }
+          rootRetainedAfterRejectedClose = (await readdir(subject.root)).length > 0;
+          diagnosticsContainIoError = Object.values(diagnostics.logs).some(
+            (record) => record.status === 'io-error',
+          );
+          diagnosticsAreOmitted = Object.values(diagnostics.logs).every(
+            (record) => record.diagnostic === '[diagnostic omitted]',
+          );
+        }
+        expect(injected).toBe(true);
+        expect(diagnostics?.status).toBe(outcome === 'deferred' ? 'complete' : 'incomplete');
+        expect(settledWhileClosePending).toBe(outcome !== 'deferred');
+        expect(cleanupBeforeReleaseError).toMatchObject({
+          message: 'INITIAL_DIAGNOSTICS_NOT_QUIESCENT',
+        });
+        expect(cleanupAfterReleaseError).toBeUndefined();
+        expect(rootRetainedAfterRejectedClose).toBe(outcome === 'rejected');
+        expect(diagnosticsContainIoError).toBe(outcome === 'rejected');
+        expect(diagnosticsAreOmitted).toBe(outcome === 'rejected');
+      } finally {
+        releaseClose();
+        if (fileHandle) {
+          await fileHandle.close().catch(() => undefined);
+        }
+        if (directoryHandle) {
+          await directoryHandle.close().catch(() => undefined);
+        }
+        await rm(subject.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('settles collection and closes its reader before the real cleanup wrapper runs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostic-order-'));
+    const logPath = join(root, 'diagnostic.log');
+    await writeFile(logPath, 'bounded diagnostic evidence\n');
+    const events: string[] = [];
+    const originalFailure = new Error('original assertion failure');
+    const finish = Promise.resolve(29);
+
+    await expect(
+      runWithPortableToolchainCleanup(
+        root,
+        async () => {
+          const finishCode = await finishInitialInstallWithDiagnostics(
+            'real-stable-activation-mode',
+            root,
+            { finish, outcome: () => ({ code: 29, signal: null }) },
+            async (signal) => {
+              events.push('collect-start');
+              signal.throwIfAborted();
+              const handle = await open(logPath, 'r');
+              try {
+                await handle.readFile('utf8');
+              } finally {
+                await handle.close();
+                events.push('handle-close');
+              }
+              events.push('collect-settled');
+              return {
+                status: 'complete',
+                reason: 'none',
+                logs: {
+                  'install-session.log': {
+                    status: 'captured',
+                    sizeBytes: 27,
+                    diagnostic: 'diagnostics captured',
+                  },
+                  'server-start.log': {
+                    status: 'missing',
+                    sizeBytes: null,
+                    diagnostic: '[diagnostic omitted]',
+                  },
+                  'activation-result.log': {
+                    status: 'missing',
+                    sizeBytes: null,
+                    diagnostic: '[diagnostic omitted]',
+                  },
+                },
+              };
+            },
+            (message) => {
+              expect(message).toContain('"finishCode":29');
+              events.push('receipt-reported');
+            },
+          );
+          expect(finishCode).toBe(29);
+          events.push('assertion');
+          throw originalFailure;
+        },
+        async () => {
+          events.push('cleanup');
+          await cleanupPortableToolchain(root);
+        },
+      ),
+    ).rejects.toBe(originalFailure);
+
+    expect(events).toEqual([
+      'collect-start',
+      'handle-close',
+      'collect-settled',
+      'receipt-reported',
+      'assertion',
+      'cleanup',
+    ]);
+  });
+
+  it('closes collector admission synchronously before cleanup can remove the root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostic-admission-'));
+    let collectorStarted = false;
+
+    const cleanup = cleanupPortableToolchain(root);
+    expect(() =>
+      startInitialDiagnosticCollection(root, async () => {
+        collectorStarted = true;
+        return undefined;
+      }),
+    ).toThrow('INITIAL_DIAGNOSTICS_ROOT_NOT_OPEN');
+    await cleanup;
+
+    expect(collectorStarted).toBe(false);
+  });
+
+  it.each(['canonical-first', 'alias-first'] as const)(
+    'unifies multiple pending leases when %s canonicalizes first',
+    async (resolutionOrder) => {
+      const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostic-alias-'));
+      const alias = join(tmpdir(), `revo-initial-diagnostic-alias-link-${randomUUID()}`);
+      await symlink(root, alias);
+      let startedCount = 0;
+      let notifyFirstStarted: (() => void) | undefined;
+      const firstStarted = new Promise<void>((resolve) => {
+        notifyFirstStarted = resolve;
+      });
+      let notifyBothStarted: (() => void) | undefined;
+      const bothStarted = new Promise<void>((resolve) => {
+        notifyBothStarted = resolve;
+      });
+      let releaseCollectors: (() => void) | undefined;
+      const release = new Promise<void>((resolve) => {
+        releaseCollectors = resolve;
+      });
+      let resolveRoot: ((canonicalRoot: string) => void) | undefined;
+      const rootCanonicalization = new Promise<string>((resolve) => {
+        resolveRoot = resolve;
+      });
+      let resolveAlias: ((canonicalRoot: string) => void) | undefined;
+      const aliasCanonicalization = new Promise<string>((resolve) => {
+        resolveAlias = resolve;
+      });
+      const collect = async () => {
+        startedCount += 1;
+        if (startedCount === 1) {
+          notifyFirstStarted?.();
+        }
+        if (startedCount === 2) {
+          notifyBothStarted?.();
+        }
+        await release;
+      };
+      try {
+        const leases = [
+          startInitialDiagnosticCollection(root, collect, () => rootCanonicalization),
+          startInitialDiagnosticCollection(alias, collect, () => aliasCanonicalization),
+        ];
+        const canonicalRoot = await realpath(root);
+        if (resolutionOrder === 'canonical-first') {
+          resolveRoot?.(canonicalRoot);
+          await firstStarted;
+          resolveAlias?.(canonicalRoot);
+        } else {
+          resolveAlias?.(canonicalRoot);
+          await firstStarted;
+          resolveRoot?.(canonicalRoot);
+        }
+        await bothStarted;
+        await expect(cleanupPortableToolchain(alias)).rejects.toThrow(
+          'INITIAL_DIAGNOSTICS_NOT_QUIESCENT',
+        );
+        expect(() => startInitialDiagnosticCollection(root, collect)).toThrow(
+          'INITIAL_DIAGNOSTICS_ROOT_NOT_OPEN',
+        );
+        releaseCollectors?.();
+        await Promise.all(leases.map((lease) => lease.promise));
+        await cleanupPortableToolchain(alias);
+        await expect(readdir(root)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(cleanupPortableToolchain(root)).resolves.toBeUndefined();
+      } finally {
+        releaseCollectors?.();
+        await rm(alias, { force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('refuses cleanup through an unregistered symlink alias', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostic-unknown-alias-'));
+    const alias = join(tmpdir(), `revo-initial-diagnostic-unknown-link-${randomUUID()}`);
+    await writeFile(join(root, 'sentinel'), 'still here');
+    await symlink(root, alias);
+    try {
+      await expect(cleanupPortableToolchain(alias)).rejects.toThrow(
+        'INITIAL_DIAGNOSTICS_UNKNOWN_ROOT_ALIAS',
+      );
+      expect(await readdir(root)).not.toHaveLength(0);
+      await expect(cleanupPortableToolchain(root)).resolves.toBeUndefined();
+    } finally {
+      await rm(alias, { force: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('removes the canonical fixture root when its parent is reached through a symlink', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostic-parent-alias-'));
+    const canonicalParent = join(base, 'canonical-parent');
+    const lexicalParent = join(base, 'lexical-parent');
+    const canonicalRoot = join(canonicalParent, 'fixture');
+    const lexicalRoot = join(lexicalParent, 'fixture');
+    await mkdir(canonicalRoot, { recursive: true });
+    await symlink(canonicalParent, lexicalParent, 'dir');
+    await writeFile(join(canonicalRoot, 'sentinel'), 'still here');
+    let notifyCollectorStarted: (() => void) | undefined;
+    const collectorStarted = new Promise<void>((resolve) => {
+      notifyCollectorStarted = resolve;
+    });
+    let releaseCollector: (() => void) | undefined;
+    const waitForRelease = new Promise<void>((resolve) => {
+      releaseCollector = resolve;
+    });
+    try {
+      const lease = startInitialDiagnosticCollection(lexicalRoot, async () => {
+        notifyCollectorStarted?.();
+        await waitForRelease;
+      });
+      await collectorStarted;
+      await expect(cleanupPortableToolchain(lexicalRoot)).rejects.toThrow(
+        'INITIAL_DIAGNOSTICS_NOT_QUIESCENT',
+      );
+      releaseCollector?.();
+      await lease.promise;
+
+      await cleanupPortableToolchain(lexicalRoot);
+      await expect(readdir(canonicalRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(cleanupPortableToolchain(lexicalRoot)).resolves.toBeUndefined();
+    } finally {
+      releaseCollector?.();
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a timed-out collector lease active until late settlement, blocking cleanup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostic-timeout-'));
+    const sentinelPath = join(root, 'keep-until-collector-settles');
+    await writeFile(sentinelPath, 'still here');
+    const originalFailure = new Error('original timeout scenario failure');
+    let resolveCollector: ((value: InitialInstallDiagnostics) => void) | undefined;
+    let notifyCollectorSettled: (() => void) | undefined;
+    const collectorSettled = new Promise<void>((resolve) => {
+      notifyCollectorSettled = resolve;
+    });
+    const report = vi.fn<(message: string) => void>();
+
+    await expect(
+      runWithPortableToolchainCleanup(root, async () => {
+        const result = await finishInitialInstallWithDiagnostics(
+          'real-stable-activation-mode',
+          root,
+          { finish: Promise.resolve(31), outcome: () => ({ code: 31, signal: null }) },
+          (signal) => {
+            signal.addEventListener('abort', () => undefined, { once: true });
+            return new Promise<InitialInstallDiagnostics>((resolve) => {
+              resolveCollector = resolve;
+            }).finally(() => notifyCollectorSettled?.());
+          },
+          report,
+          10,
+        );
+        expect(result).toBe(31);
+        expect(report).toHaveBeenCalledTimes(1);
+        throw originalFailure;
+      }),
+    ).rejects.toThrow('INITIAL_DIAGNOSTICS_NOT_QUIESCENT');
+
+    await expect(readFile(sentinelPath, 'utf8')).resolves.toBe('still here');
+    resolveCollector?.({
+      status: 'incomplete',
+      reason: 'collector-error',
+      logs: {
+        'install-session.log': {
+          status: 'incomplete',
+          sizeBytes: null,
+          diagnostic: '[diagnostic omitted]',
+        },
+        'server-start.log': {
+          status: 'incomplete',
+          sizeBytes: null,
+          diagnostic: '[diagnostic omitted]',
+        },
+        'activation-result.log': {
+          status: 'incomplete',
+          sizeBytes: null,
+          diagnostic: '[diagnostic omitted]',
+        },
+      },
+    });
+    await collectorSettled;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(cleanupPortableToolchain(root)).resolves.toBeUndefined();
+    await expect(readFile(sentinelPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('starts the diagnostic deadline before asynchronous root canonicalization', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostic-realpath-'));
+    const sentinelPath = join(root, 'keep-until-realpath-settles');
+    await writeFile(sentinelPath, 'still here');
+    let resolveRoot: ((path: string) => void) | undefined;
+    const canonicalization = new Promise<string>((resolve) => {
+      resolveRoot = resolve;
+    });
+    const collector = vi.fn<() => Promise<InitialInstallDiagnostics>>(async () => ({
+      status: 'complete' as const,
+      reason: 'none' as const,
+      logs: {
+        'install-session.log': {
+          status: 'missing' as const,
+          sizeBytes: null,
+          diagnostic: '[diagnostic omitted]',
+        },
+        'server-start.log': {
+          status: 'missing' as const,
+          sizeBytes: null,
+          diagnostic: '[diagnostic omitted]',
+        },
+        'activation-result.log': {
+          status: 'missing' as const,
+          sizeBytes: null,
+          diagnostic: '[diagnostic omitted]',
+        },
+      },
+    }));
+    const report = vi.fn<(message: string) => void>();
+    try {
+      const finish = finishInitialInstallWithDiagnostics(
+        'real-stable-activation-mode',
+        root,
+        { finish: Promise.resolve(37), outcome: () => ({ code: 37, signal: null }) },
+        collector,
+        report,
+        10,
+        () => canonicalization,
+      );
+
+      await expect(finish).resolves.toBe(37);
+      expect(collector).not.toHaveBeenCalled();
+      expect(report).toHaveBeenCalledTimes(1);
+      await expect(cleanupPortableToolchain(root)).rejects.toThrow(
+        'INITIAL_DIAGNOSTICS_NOT_QUIESCENT',
+      );
+      await expect(readFile(sentinelPath, 'utf8')).resolves.toBe('still here');
+
+      resolveRoot?.(root);
+      await new Promise((resolve) => setImmediate(resolve));
+      await cleanupPortableToolchain(root);
+      await expect(readFile(sentinelPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      resolveRoot?.(root);
+      await rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1054,7 +2550,7 @@ describe('initial installation failure diagnostics', () => {
             subject.root,
             subject.channelRoot,
           );
-          expect(diagnostics).toContain('status=diagnostics-incomplete');
+          expect(diagnostics).toContain('status=incomplete');
           throw scenarioFailure;
         },
         async () => {
@@ -1272,21 +2768,33 @@ it.each(['extra-key', 'oversized', 'symlink'] as const)(
 it.skipIf(process.env.REVO_RUN_REAL_INSTALLER_INTEGRATION !== '1')(
   'real activation refuses during startup and succeeds after the owner closes',
   async () => {
-    const first = await portableToolchain('stable', undefined, false, true);
-    const second = await portableToolchain(
-      'stable',
-      '0.0.1',
-      false,
-      true,
-      join(first.root, 'state'),
-    );
-    const data = join(first.root, 'user-data');
-    const scenario = await new ServerOwnerScenario().setup({ dataDir: data });
+    let firstFixture: Awaited<ReturnType<typeof portableToolchain>> | undefined;
+    let secondFixture: Awaited<ReturnType<typeof portableToolchain>> | undefined;
+    let ownerScenario: ServerOwnerScenario | undefined;
     let started: Awaited<ReturnType<ServerOwnerScenario['openInstalledCandidate']>> | undefined;
-    try {
+    await runWithCleanupPreservingFailure(async () => {
+      const first = (firstFixture = await portableToolchain('stable', undefined, false, true));
+      const second = (secondFixture = await portableToolchain(
+        'stable',
+        '0.0.1',
+        false,
+        true,
+        join(first.root, 'state'),
+      ));
+      const data = join(first.root, 'user-data');
+      const scenario = (ownerScenario = await new ServerOwnerScenario().setup({ dataDir: data }));
       await mkdir(data, { recursive: true, mode: 0o700 });
       await writeFile(join(data, 'sentinel'), 'sentinel\n');
-      expect(await first.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
+      const initialInstall = first.startInstaller({ REVO_DATA_DIR: data });
+      expect(
+        await finishInitialInstallWithDiagnostics(
+          'real-activation-refuses-during-startup',
+          first.root,
+          initialInstall,
+          (signal, markCloseUncertain) =>
+            first.initialInstallFailureDiagnostics(signal, markCloseUncertain),
+        ),
+      ).toBe(0);
       await first.stopServer(data);
       const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
       const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
@@ -1330,12 +2838,22 @@ it.skipIf(process.env.REVO_RUN_REAL_INSTALLER_INTEGRATION !== '1')(
       expect(after.record.generationId).not.toBe(before.record.generationId);
       expect(after.record.release.version).toBe('0.0.1');
       expect(await readFile(join(data, 'sentinel'), 'utf8')).toBe('sentinel\n');
-    } finally {
-      started?.releaseReady();
-      await scenario.cleanup();
-      await cleanupPortableToolchain(second.root);
-      await cleanupPortableToolchain(first.root);
-    }
+    }, [
+      async () => {
+        started?.releaseReady();
+        await ownerScenario?.cleanup();
+      },
+      async () => {
+        if (secondFixture !== undefined) {
+          await cleanupPortableToolchain(secondFixture.root);
+        }
+      },
+      async () => {
+        if (firstFixture !== undefined) {
+          await cleanupPortableToolchain(firstFixture.root);
+        }
+      },
+    ]);
   },
   360_000,
 );
@@ -1755,6 +3273,9 @@ describe('generated POSIX toolchain installer', () => {
           identity,
           '12.5.1',
         );
+        const pnpmLauncher = await readFile(join(pnpm, 'pnpm'), 'utf8');
+        expect(pnpmLauncher).toContain('exec node ');
+        expect(pnpmLauncher).not.toContain('REVO_PRIVATE_NODE_ROOT/bin/node');
         expect(await readFile(join(target, 'install-receipt.json'), 'utf8')).toContain(identity);
         expect(await readFile(join(pnpm, 'install-receipt.json'), 'utf8')).toContain('12.5.1');
         expect(await readFile(subject.calls, 'utf8')).toHaveLength(1);
@@ -1784,4 +3305,75 @@ describe('generated POSIX toolchain installer', () => {
       await cleanupPortableToolchain(subject.root);
     }
   }, 15000);
+});
+
+describe('private Node selection for pnpm probes', () => {
+  const supportedTarget =
+    (process.platform === 'linux' || process.platform === 'darwin') &&
+    (process.arch === 'arm64' || process.arch === 'x64');
+
+  it.skipIf(!supportedTarget)(
+    'uses the private Node from PATH for fresh probes and reuse',
+    async () => {
+      const subject = await privateNodeProbeFixture();
+      try {
+        const first = await subject.provision();
+        expect(first.reused).toBe(false);
+        expect(first.executablePath).toBe(join(subject.target, 'pnpm'));
+        expect(subject.request).toHaveBeenCalledTimes(1);
+        const [freshProbe] = await subject.invocations();
+        if (freshProbe === undefined) {
+          throw new Error('private Node probe did not leave evidence');
+        }
+        expect(freshProbe?.[0]).toBe(subject.nodeExecutable);
+        expect(freshProbe[1]).toMatch(new RegExp(`^${subject.scratch}/\\.pnpm-probe-`));
+        expect(freshProbe[2]).toBe(join(freshProbe[1] ?? '', 'home'));
+        expect(freshProbe?.[3]).toBe(freshProbe?.[1]);
+        expect(freshProbe?.[4]?.split(':')[0]).toBe(subject.privateNodeBin);
+        expect(freshProbe?.[5]).toBe('');
+        expect(freshProbe?.[6]).toBe('3');
+        expect(freshProbe?.[7]).toMatch(/\/launcher\.mjs$/u);
+        expect(freshProbe?.[8]).toBe('--pm-on-fail=ignore');
+        expect(freshProbe?.[9]).toBe('--version');
+        expect(await readdir(subject.scratch)).toEqual([]);
+
+        const executableBeforeReuse = await readFile(first.executablePath);
+        const receiptBeforeReuse = await readFile(join(subject.target, 'install-receipt.json'));
+        const reused = await subject.provision();
+        expect(reused.reused).toBe(true);
+        expect(subject.request).toHaveBeenCalledTimes(1);
+        const probes = await subject.invocations();
+        expect(probes).toHaveLength(2);
+        expect(probes[1]?.[0]).toBe(subject.nodeExecutable);
+        expect(probes[1]?.[1]).not.toBe(probes[0]?.[1]);
+        expect(probes[1]?.[4]?.split(':')[0]).toBe(subject.privateNodeBin);
+        expect(probes[1]?.[5]).toBe('');
+        expect(await readdir(subject.scratch)).toEqual([]);
+        expect(await readFile(first.executablePath)).toEqual(executableBeforeReuse);
+        expect(await readFile(join(subject.target, 'install-receipt.json'))).toEqual(
+          receiptBeforeReuse,
+        );
+      } finally {
+        await subject.cleanup();
+      }
+    },
+  );
+
+  it.skipIf(!supportedTarget)(
+    'fails closed when the selected private Node exits nonzero',
+    async () => {
+      const subject = await privateNodeProbeFixture(47);
+      try {
+        await expect(subject.provision()).rejects.toThrow(/pnpm probe: version command failed/u);
+        const [failedProbe] = await subject.invocations();
+        expect(failedProbe?.[0]).toBe(subject.nodeExecutable);
+        expect(failedProbe?.[4]?.split(':')[0]).toBe(subject.privateNodeBin);
+        expect(failedProbe?.[5]).toBe('');
+        await expect(lstat(subject.target)).rejects.toMatchObject({ code: 'ENOENT' });
+        expect(await readdir(subject.scratch)).toEqual([]);
+      } finally {
+        await subject.cleanup();
+      }
+    },
+  );
 });
