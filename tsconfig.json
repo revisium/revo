@@ -9,6 +9,9 @@
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "resolveJsonModule": true,
+    "paths": {
+      "@revisium/revo/processes": ["./src/processes/index.ts"]
+    },
     "skipLibCheck": true,
     "types": ["node"]
   },
