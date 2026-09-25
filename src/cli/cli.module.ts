@@ -6,6 +6,8 @@ import { ServerModule } from '../server/server.module.js';
 import { DefaultCommand } from './commands/default.command.js';
 import { DoctorCommand } from './commands/doctor.command.js';
 import { ServerCommand } from './commands/server.command.js';
+import { TuiStorageMigrateCommand } from './commands/tui-storage-migrate.command.js';
+import { TuiStorageCommand } from './commands/tui-storage.command.js';
 import { TuiCommand } from './commands/tui.command.js';
 import { VersionCommand } from './commands/version.command.js';
 import { BrowserOpenerService } from './diagnostics/browser-opener.service.js';
@@ -23,6 +25,11 @@ import {
   TUI_TERMINAL,
   TuiCommandService,
 } from './tui-command.service.js';
+import {
+  launchRevoTuiStorageMigration,
+  TUI_STORAGE_MIGRATOR,
+  TuiStorageMigrationService,
+} from './tui-storage-migration.service.js';
 import { WebCommandService } from './web-command.service.js';
 
 @Module({
@@ -37,8 +44,10 @@ import { WebCommandService } from './web-command.service.js';
     { provide: SERVER_LOGS_WAIT, useValue: waitForFollowPoll },
     WebCommandService,
     TuiCommandService,
+    TuiStorageMigrationService,
     { provide: TUI_LAUNCHER, useValue: launchRevoTui },
     { provide: TUI_TERMINAL, useValue: readTuiTerminal },
+    { provide: TUI_STORAGE_MIGRATOR, useValue: launchRevoTuiStorageMigration },
     DoctorComponentProbe,
     DoctorPathProbe,
     DoctorService,
@@ -46,6 +55,8 @@ import { WebCommandService } from './web-command.service.js';
     DoctorCommand,
     VersionCommand,
     TuiCommand,
+    TuiStorageCommand,
+    TuiStorageMigrateCommand,
     ...ServerCommand.registerWithSubCommands(),
   ],
 })

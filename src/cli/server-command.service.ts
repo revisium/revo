@@ -8,7 +8,6 @@ import type {
   ConfigurationFlags,
   ConfigurationInput,
 } from '../configuration/configuration.types.js';
-import { DEFAULT_CONTROL_LIMITS } from '../processes/control-endpoint.types.js';
 import {
   ServerLauncherService,
   type ServerLaunchContext,
@@ -16,7 +15,10 @@ import {
 } from '../server/server-launcher.service.js';
 import type { ServerProgressSink } from '../server/server-startup-observer.js';
 import { ServerStatusService, type ServerStatus } from '../server/server-status.service.js';
-import { ServerStopService } from '../server/server-stop.service.js';
+import {
+  DEFAULT_SERVER_STOP_COMPLETION_TIMEOUT_MS,
+  ServerStopService,
+} from '../server/server-stop.service.js';
 import { CliUsageError } from './cli-error.js';
 import { OutputService } from './output.service.js';
 import { PackageMetadataService } from './package-metadata.service.js';
@@ -130,7 +132,7 @@ export class ServerCommandService {
     if (!STOPPABLE.has(current.kind)) {
       throw new Error(`${UNAVAILABLE}; stop was not performed.`);
     }
-    const stopped = await this.serverStop.stop(dataDir, DEFAULT_CONTROL_LIMITS.timeoutMs);
+    const stopped = await this.serverStop.stop(dataDir, DEFAULT_SERVER_STOP_COMPLETION_TIMEOUT_MS);
     if (stopped.kind !== 'completed') {
       throw new Error('Server stop could not be confirmed.');
     }

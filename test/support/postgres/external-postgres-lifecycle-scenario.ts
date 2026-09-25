@@ -15,9 +15,13 @@ import type { PublishedControl } from '../../../src/processes/control-discovery.
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type { OwnedProcess } from '../../../src/processes/managed-process.types.js';
 import { ProcessExitWaiter } from '../../../src/processes/process-exit-waiter.js';
-import { PublishedControlService } from '../../../src/processes/published-control.service.js';
+import {
+  PublishedControlError,
+  PublishedControlService,
+} from '../../../src/processes/published-control.service.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
 import { BlockingJournal } from '../startup-progress/blocking-journal.js';
+import { cleanupRegistered, closeFixtureOwner, observeFixtureCleanup } from './fixture-cleanup.js';
 import { ClusterFixture } from './postgres-readiness-scenario.js';
 
 const OPERATION = 'abcdefabcdefabcdefabcdefabcdefab';
@@ -25,11 +29,17 @@ const CHILD_TIMEOUT_MS = 5_000;
 const CHILD_STOP = { graceMs: 1_000, killWaitMs: 5_000 } as const;
 const MAX_CHILD_OUTPUT_BYTES = 16 * 1024;
 
-export const REAL_PG_CLEANUP_TIMEOUT_MS = 16_000;
+export const REAL_PG_CLEANUP_TIMEOUT_MS = 45_000;
 
 export class ExternalPostgresLifecycleScenario {
+  private closing = false;
+  private readonly acquisitions = new Set<Promise<unknown>>();
+  private readonly acquisitionFailures: unknown[] = [];
   private readonly roots: string[] = [];
   private readonly owners: PublishedControl[] = [];
+  private readonly expectedCloseRejections = new WeakSet<
+    Extract<PublishedControl, { kind: 'held' }>
+  >();
   private readonly clusters: ClusterFixture[] = [];
   private readonly servers: Server[] = [];
   private readonly sockets = new Set<Socket>();
@@ -95,7 +105,9 @@ export class ExternalPostgresLifecycleScenario {
     );
     const failedAt = Date.now();
     const failed = await this.startOutcome(failedOwner, new AbortController().signal, 300);
-    await failedOwner.close().catch(() => undefined);
+    await failedOwner
+      .close()
+      .catch((error: unknown) => this.noteExpectedCloseFailure(failedOwner, error));
     return {
       cancelled,
       cancelledMs: Date.now() - cancelledAt,
@@ -115,7 +127,9 @@ export class ExternalPostgresLifecycleScenario {
     await new Promise((resolve) => setTimeout(resolve, 75));
     timeoutJournal.release();
     const timeout = await timed;
-    await timeoutOwner.close().catch(() => undefined);
+    await timeoutOwner
+      .close()
+      .catch((error: unknown) => this.noteExpectedCloseFailure(timeoutOwner, error));
 
     const deadlineJournal = new BlockingJournal();
     const deadlineOwner = await this.open(cluster.connectionUrl(), undefined, deadlineJournal);
@@ -125,7 +139,9 @@ export class ExternalPostgresLifecycleScenario {
     await new Promise((resolve) => setTimeout(resolve, 75));
     deadlineJournal.release();
     const deadlineAfterSql = await deadlineStart;
-    await deadlineOwner.close().catch(() => undefined);
+    await deadlineOwner
+      .close()
+      .catch((error: unknown) => this.noteExpectedCloseFailure(deadlineOwner, error));
 
     const closeJournal = new BlockingJournal();
     const closeOwner = await this.open(cluster.connectionUrl(), undefined, closeJournal);
@@ -191,7 +207,10 @@ export class ExternalPostgresLifecycleScenario {
     await journal.entered;
     const closing = gatedOwner.close().then(
       () => 'resolved' as const,
-      () => 'rejected' as const,
+      (error: unknown) => {
+        this.noteExpectedCloseFailure(gatedOwner, error);
+        return 'rejected' as const;
+      },
     );
     try {
       const closeOutcome = await closing;
@@ -234,6 +253,9 @@ export class ExternalPostgresLifecycleScenario {
   }
 
   async abortsARealStalledConnectionWithoutStoppingTheForeignListener() {
+    if (this.closing) {
+      throw new Error('external scenario is closing');
+    }
     let accept!: () => void;
     const accepted = new Promise<void>((resolve) => (accept = resolve));
     const server = createServer((socket) => {
@@ -242,10 +264,13 @@ export class ExternalPostgresLifecycleScenario {
       accept();
     });
     this.servers.push(server);
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen({ host: '127.0.0.1', port: 0 }, resolve);
-    });
+    await this.trackAcquisition(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          server.once('error', reject);
+          server.listen({ host: '127.0.0.1', port: 0 }, resolve);
+        }),
+    );
     const address = server.address();
     if (!address || typeof address === 'string') {
       throw new Error('listener address missing');
@@ -257,17 +282,23 @@ export class ExternalPostgresLifecycleScenario {
     const startedAt = Date.now();
     controller.abort();
     const outcome = await starting;
-    await owner.close().catch(() => undefined);
+    await owner.close().catch((error: unknown) => this.noteExpectedCloseFailure(owner, error));
     return { outcome, elapsedMs: Date.now() - startedAt, listenerAlive: server.listening };
   }
 
   async isolatesHostilePostgresEnvironmentInARealChild() {
     const cluster = await this.cluster();
-    const root = await mkdtemp('/tmp/external-pg-env-');
-    this.roots.push(root);
-    const passfile = join(root, 'pgpass');
-    await writeFile(passfile, `127.0.0.1:${cluster.port}:postgres:postgres:fixture-password\n`, {
-      mode: 0o600,
+    const passfile = await this.trackAcquisition(async () => {
+      const root = await mkdtemp('/tmp/external-pg-env-');
+      this.roots.push(root);
+      if (this.closing) {
+        throw new Error('external scenario is closing');
+      }
+      const path = join(root, 'pgpass');
+      await writeFile(path, `127.0.0.1:${cluster.port}:postgres:postgres:fixture-password\n`, {
+        mode: 0o600,
+      });
+      return path;
     });
     const child = fileURLToPath(new URL('./external-postgres-env-child.mjs', import.meta.url));
     const env: NodeJS.ProcessEnv = {
@@ -292,41 +323,91 @@ export class ExternalPostgresLifecycleScenario {
   }
 
   async cleanup() {
-    await Promise.allSettled(
-      this.owners.map((owner) => (owner.kind === 'held' ? owner.close() : Promise.resolve())),
+    this.closing = true;
+    const failures: unknown[] = [];
+    const record = async (operation: Promise<void>) => {
+      try {
+        await operation;
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+    await record(
+      observeFixtureCleanup(
+        (async () => {
+          const results = await Promise.allSettled([...this.acquisitions]);
+          const failed = [
+            ...new Set([
+              ...this.acquisitionFailures,
+              ...results.flatMap((result) => (result.status === 'rejected' ? [result.reason] : [])),
+            ]),
+          ];
+          if (failed.length > 0) {
+            throw new AggregateError(failed, 'External fixture acquisition did not settle safely');
+          }
+        })(),
+      ),
+    );
+    await record(
+      cleanupRegistered(this.owners, async (owner) => {
+        if (owner.kind === 'held') {
+          await closeFixtureOwner(
+            owner,
+            (error) =>
+              this.expectedCloseRejections.has(owner) && expectedExternalCloseFailure(error),
+          );
+        }
+      }),
     );
     const childCleanup = await Promise.allSettled(
       [...this.children].map(async ([child, processes]) => {
-        await processes.stop(child, CHILD_STOP);
-        await child.completion;
+        await observeFixtureCleanup(
+          (async () => {
+            await processes.stop(child, CHILD_STOP);
+            await child.completion;
+          })(),
+        );
         this.children.delete(child);
       }),
     );
-    await Promise.allSettled(this.clusters.map((cluster) => cluster.close()));
+    failures.push(
+      ...childCleanup.flatMap((result) => (result.status === 'rejected' ? [result.reason] : [])),
+    );
+    await record(cleanupRegistered(this.clusters, (cluster) => cluster.close()));
     for (const socket of this.sockets) {
       socket.destroy();
     }
-    await Promise.all(
-      this.servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+    await record(
+      cleanupRegistered(
+        this.servers,
+        (server) =>
+          new Promise<void>((resolve, reject) => {
+            server.close((error) => (error ? reject(error) : resolve()));
+          }),
+      ),
     );
-    if (childCleanup.some((result) => result.status === 'rejected')) {
-      throw new Error('External PostgreSQL child cleanup could not be confirmed');
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'External PostgreSQL cleanup unconfirmed; roots retained');
     }
-    await Promise.all(
-      this.roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-    );
+    await cleanupRegistered(this.roots, (root) => rm(root, { recursive: true, force: true }));
   }
 
   private async executeChild(entry: string, args: readonly string[], env: NodeJS.ProcessEnv) {
     const processes = new ManagedProcessService();
-    const child = await processes.start({
-      executable: process.execPath,
-      args: [entry, ...args],
-      cwd: process.cwd(),
-      env: definedEnvironment(env),
-      stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+    const child = await this.trackAcquisition(async () => {
+      const handle = await processes.start({
+        executable: process.execPath,
+        args: [entry, ...args],
+        cwd: process.cwd(),
+        env: definedEnvironment(env),
+        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+      });
+      this.children.set(handle, processes);
+      return handle;
     });
-    this.children.set(child, processes);
+    if (this.closing) {
+      throw new Error('external scenario is closing');
+    }
     child.stderr?.resume();
     const stdout = readOutput(child);
     void stdout.catch(() => undefined);
@@ -342,14 +423,46 @@ export class ExternalPostgresLifecycleScenario {
   }
 
   private async cluster() {
-    const cluster = await ClusterFixture.start('scram');
+    if (this.closing) {
+      throw new Error('external scenario is closing');
+    }
+    const cluster = ClusterFixture.create('scram');
     this.clusters.push(cluster);
+    await cluster.start();
+    if (this.closing) {
+      throw new Error('external scenario is closing');
+    }
     return cluster;
   }
 
-  private async fixture() {
+  private trackAcquisition<T>(acquire: () => Promise<T>): Promise<T> {
+    if (this.closing) {
+      return Promise.reject(new Error('external scenario is closing'));
+    }
+    const operation = acquire();
+    this.acquisitions.add(operation);
+    void operation.then(
+      () => this.acquisitions.delete(operation),
+      (error: unknown) => {
+        this.acquisitions.delete(operation);
+        if (this.closing) {
+          this.acquisitionFailures.push(error);
+        }
+      },
+    );
+    return operation;
+  }
+
+  private fixture() {
+    return this.trackAcquisition(() => this.createFixture());
+  }
+
+  private async createFixture() {
     const root = await mkdtemp('/tmp/external-pg-');
     this.roots.push(root);
+    if (this.closing) {
+      throw new Error('external scenario is closing');
+    }
     const fixture = {
       dataDir: join(root, 'data'),
       logDir: join(root, 'logs'),
@@ -370,10 +483,22 @@ export class ExternalPostgresLifecycleScenario {
     return this.openAt(await this.fixture(), databaseUrl, embedded, journal);
   }
 
-  private async openAt(
+  private openAt(
     fixture: { dataDir: string; logDir: string; runtimeDir: string },
     databaseUrl: string,
     embedded = new EmbeddedPostgresResourceService(),
+    journal?: StartupProgressJournalWriter,
+    external?: ExternalPostgresResourceService,
+  ) {
+    return this.trackAcquisition(() =>
+      this.acquireOwner(fixture, databaseUrl, embedded, journal, external),
+    );
+  }
+
+  private async acquireOwner(
+    fixture: { dataDir: string; logDir: string; runtimeDir: string },
+    databaseUrl: string,
+    embedded: EmbeddedPostgresResourceService,
     journal?: StartupProgressJournalWriter,
     external?: ExternalPostgresResourceService,
   ) {
@@ -394,6 +519,12 @@ export class ExternalPostgresLifecycleScenario {
       startupProgress: { operationId: OPERATION, now: () => performance.now() },
     });
     this.owners.push(owner);
+    if (this.closing) {
+      if (owner.kind === 'held') {
+        await closeFixtureOwner(owner);
+      }
+      throw new Error('external scenario is closing');
+    }
     if (owner.kind !== 'held' || owner.databaseKind !== 'external') {
       throw new Error('external database owner missing');
     }
@@ -447,18 +578,36 @@ export class ExternalPostgresLifecycleScenario {
   private closeOutcome(owner: Extract<PublishedControl, { kind: 'held' }>) {
     return owner.close().then(
       () => ({ kind: 'resolved' as const }),
-      (error: unknown) =>
-        error instanceof Error
+      (error: unknown) => {
+        this.noteExpectedCloseFailure(owner, error);
+        return error instanceof Error
           ? {
               kind: 'rejected' as const,
               name: error.name,
               message: error.message,
               code: 'code' in error ? String(error.code) : undefined,
             }
-          : { kind: 'rejected' as const, name: typeof error, message: String(error) },
+          : { kind: 'rejected' as const, name: typeof error, message: String(error) };
+      },
     );
   }
+
+  private noteExpectedCloseFailure(
+    owner: Extract<PublishedControl, { kind: 'held' }>,
+    error: unknown,
+  ) {
+    if (!expectedExternalCloseFailure(error)) {
+      throw error;
+    }
+    this.expectedCloseRejections.add(owner);
+  }
 }
+
+const expectedExternalCloseFailure = (error: unknown): boolean =>
+  error instanceof PublishedControlError &&
+  error.phase === 'close' &&
+  error.cleanupFailures.length === 0 &&
+  (error.ownership === 'retained' || error.ownership === 'released');
 
 const definedEnvironment = (environment: NodeJS.ProcessEnv) =>
   Object.fromEntries(

@@ -13,8 +13,10 @@ import {
   rename,
   rm,
 } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { sanitizeProbeDiagnostic } from './probe-diagnostic.mjs';
 
 const HASH = /^[a-f0-9]{64}$/u;
 const VERSION =
@@ -224,10 +226,12 @@ const policyFor = (value = {}) => {
     throw acquisitionFailure('validate', 'policy.redirectLimit is unbounded');
   return policy;
 };
-const boundedText = (value, limit) =>
-  String(value ?? '')
-    .replace(/\p{Cc}/gu, ' ')
-    .slice(0, limit);
+const pnpmProbeFailure = (reason, detail) => {
+  const error = acquisitionFailure('probe', reason);
+  error.diagnosticCode = 'PNPM_PROBE_FAILED';
+  if (detail !== undefined) error.diagnosticDetail = sanitizeProbeDiagnostic(detail);
+  return error;
+};
 const header = (response, name) => response.headers?.get?.(name) ?? response.headers?.[name];
 const dispose = async (response) => {
   try {
@@ -393,7 +397,7 @@ async function downloadPnpm(url, destination, policy, signal, request) {
   }
 }
 
-function runProcess(command, args, stage, timeoutMs, policy, signal) {
+function runProcess(command, args, stage, timeoutMs, policy, signal, options = {}) {
   return new Promise((done, reject) => {
     if (signal?.aborted) {
       reject(acquisitionFailure(stage, 'cancelled'));
@@ -402,6 +406,8 @@ function runProcess(command, args, stage, timeoutMs, policy, signal) {
     let child;
     try {
       child = spawn(command, args, {
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(options.env === undefined ? {} : { env: options.env }),
         shell: false,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -411,14 +417,31 @@ function runProcess(command, args, stage, timeoutMs, policy, signal) {
       reject(acquisitionFailure(stage, 'process could not start'));
       return;
     }
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (chunk) => {
-      stdout += boundedText(chunk, policy.maxOutputBytes - stdout.length);
-    });
-    child.stderr?.on('data', (chunk) => {
-      stderr += boundedText(chunk, policy.maxOutputBytes - stderr.length);
-    });
+    const capture = () => ({ chunks: [], bytes: 0, overflow: false });
+    const stdout = capture();
+    const stderr = capture();
+    const collect = (target, chunk) => {
+      if (target.overflow) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      if (bytes.length > policy.maxOutputBytes - target.bytes) {
+        target.chunks = [];
+        target.bytes = 0;
+        target.overflow = true;
+        return;
+      }
+      target.chunks.push(bytes);
+      target.bytes += bytes.length;
+    };
+    const decode = (target) => {
+      if (target.overflow) return undefined;
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(target.chunks));
+      } catch {
+        return undefined;
+      }
+    };
+    child.stdout?.on('data', (chunk) => collect(stdout, chunk));
+    child.stderr?.on('data', (chunk) => collect(stderr, chunk));
     let stopping = false;
     let timedOut = false;
     let grace;
@@ -444,16 +467,50 @@ function runProcess(command, args, stage, timeoutMs, policy, signal) {
     const timer = setTimeout(() => stop(true), timeoutMs);
     const abort = () => stop(false);
     signal?.addEventListener('abort', abort, { once: true });
-    child.once('error', () => {});
+    let spawnError;
+    child.once('error', (error) => {
+      spawnError = error;
+    });
     child.once('close', (code, term) => {
       clearTimeout(timer);
       clearTimeout(grace);
       signal?.removeEventListener('abort', abort);
       if (signal?.aborted) reject(acquisitionFailure(stage, 'cancelled'));
       else if (timedOut) reject(acquisitionFailure(stage, 'timed out'));
-      else if (code !== 0)
-        reject(acquisitionFailure(stage, `process failed${term ? ` (${term})` : ''}: ${stderr}`));
-      else done(stdout);
+      else if (code !== 0) {
+        const stderrText = decode(stderr);
+        const outcome =
+          spawnError !== undefined
+            ? `spawn ${errorCode(spawnError) ?? 'failed'}`
+            : code !== null
+              ? `exit ${String(code)}`
+              : term !== null
+                ? `signal ${term}`
+                : 'no exit status';
+        reject(
+          acquisitionFailure(
+            stage,
+            `process failed (${outcome})${
+              stderr.overflow
+                ? ': [stderr omitted: capture limit exceeded]'
+                : stderrText === undefined
+                  ? stderr.bytes === 0
+                    ? ''
+                    : ': [stderr omitted: invalid UTF-8]'
+                  : stderrText === ''
+                    ? ''
+                    : `: ${stderrText}`
+            }`,
+          ),
+        );
+      } else if (stdout.overflow) {
+        reject(acquisitionFailure(stage, '[stdout omitted: capture limit exceeded]'));
+      } else {
+        const stdoutText = decode(stdout);
+        if (stdoutText === undefined)
+          reject(acquisitionFailure(stage, '[stdout omitted: invalid UTF-8]'));
+        else done(stdoutText);
+      }
     });
   });
 }
@@ -487,6 +544,64 @@ async function safeLayout(root) {
   )
     throw acquisitionFailure('extract', 'archive has no safe pnpm+dist layout');
   return executable;
+}
+
+async function runPnpmVersionProbe(
+  executablePath,
+  expectedVersion,
+  scratch,
+  nodeExecutable,
+  policy,
+  signal,
+) {
+  const root = await mkdtemp(join(scratch, '.pnpm-probe-'));
+  const paths = {
+    home: join(root, 'home'),
+    config: join(root, 'config'),
+    cache: join(root, 'cache'),
+    data: join(root, 'data'),
+    state: join(root, 'state'),
+  };
+  try {
+    await Promise.all(Object.values(paths).map((path) => mkdir(path, { mode: 0o700 })));
+    let output;
+    try {
+      output = await runProcess(
+        executablePath,
+        ['--pm-on-fail=ignore', '--version'],
+        'probe',
+        policy.probeTimeoutMs,
+        policy,
+        signal,
+        {
+          cwd: root,
+          env: {
+            HOME: paths.home,
+            XDG_CONFIG_HOME: paths.config,
+            XDG_CACHE_HOME: paths.cache,
+            XDG_DATA_HOME: paths.data,
+            XDG_STATE_HOME: paths.state,
+            PATH: [dirname(nodeExecutable), '/usr/bin', '/bin'].join(delimiter),
+            TMPDIR: root,
+            CI: '1',
+            NO_COLOR: '1',
+          },
+        },
+      );
+    } catch (cause) {
+      throw pnpmProbeFailure('version command failed', cause?.message);
+    }
+    const actualVersion = output.trim();
+    if (actualVersion !== expectedVersion)
+      throw pnpmProbeFailure(
+        'version mismatch',
+        `expected ${expectedVersion}, actual ${
+          VERSION.test(actualVersion) ? actualVersion : '<invalid version output>'
+        }`,
+      );
+  } finally {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /** Acquire the verified v3 pnpm archive into an owned temporary directory. */
@@ -619,7 +734,7 @@ const pnpmReceipt = (bootstrap, archive, platform, arch) => ({
   arch,
   archiveSha256: archive.sha256,
 });
-async function existingTarget(target, expected, policy, signal) {
+async function existingTarget(target, expected, policy, signal, probe) {
   const info = await lstat(target).catch((error) => {
     if (errorCode(error) === 'ENOENT') return undefined;
     throw acquisitionFailure('reuse', 'target is unavailable');
@@ -652,16 +767,15 @@ async function existingTarget(target, expected, policy, signal) {
     JSON.stringify(found) !== JSON.stringify(expected)
   )
     throw acquisitionFailure('reuse', 'receipt is incompatible');
-  const output = await runProcess(
+  probe.onProgress?.('probe');
+  await runPnpmVersionProbe(
     executablePath,
-    ['--version'],
-    'probe',
-    policy.probeTimeoutMs,
+    expected.version,
+    probe.scratch,
+    probe.nodeExecutable,
     policy,
     signal,
   );
-  if (output.trim() !== expected.version)
-    throw acquisitionFailure('probe', 'pnpm version does not match');
   return executablePath;
 }
 
@@ -685,7 +799,7 @@ export async function provisionPnpm({
     throw acquisitionFailure('validate', 'unsupported target');
   if (signal?.aborted) throw acquisitionFailure('validate', 'cancelled');
   const policy = policyFor(inputPolicy);
-  const { scratchPath } = await privateNode(nodeExecutable, scratch, privateNodeRoot);
+  const { nodePath, scratchPath } = await privateNode(nodeExecutable, scratch, privateNodeRoot);
   const decoded =
     record(bootstrap) &&
     record(bootstrap.bootstrap) &&
@@ -705,9 +819,9 @@ export async function provisionPnpm({
   await targetParents(target, root);
   onProgress?.('validate');
   const expected = pnpmReceipt(decoded.bootstrap, decoded.pnpmArchive, platform, arch);
-  const reused = await existingTarget(target, expected, policy, signal);
+  const probe = { scratch: scratchPath, nodeExecutable: nodePath, onProgress };
+  const reused = await existingTarget(target, expected, policy, signal, probe);
   if (reused !== undefined) {
-    onProgress?.('probe');
     onProgress?.('reuse');
     return { executablePath: reused, version: decoded.bootstrap.pnpmVersion, reused: true };
   }
@@ -723,17 +837,15 @@ export async function provisionPnpm({
   });
   let published = false;
   try {
-    const output = await runProcess(
+    onProgress?.('probe');
+    await runPnpmVersionProbe(
       join(acquired.directory, 'pnpm'),
-      ['--version'],
-      'probe',
-      policy.probeTimeoutMs,
+      decoded.bootstrap.pnpmVersion,
+      scratchPath,
+      nodePath,
       policy,
       signal,
     );
-    if (output.trim() !== decoded.bootstrap.pnpmVersion)
-      throw acquisitionFailure('probe', 'pnpm version does not match');
-    onProgress?.('probe');
     const receiptPath = join(acquired.directory, 'install-receipt.json');
     const file = await open(receiptPath, 'wx', 0o600);
     try {
@@ -741,7 +853,7 @@ export async function provisionPnpm({
     } finally {
       await file.close();
     }
-    const appeared = await existingTarget(target, expected, policy, signal);
+    const appeared = await existingTarget(target, expected, policy, signal, probe);
     if (appeared !== undefined) {
       onProgress?.('reuse');
       return { executablePath: appeared, version: decoded.bootstrap.pnpmVersion, reused: true };
@@ -750,7 +862,7 @@ export async function provisionPnpm({
       await rename(acquired.directory, target);
     } catch (error) {
       if (errorCode(error) === 'EEXIST' || errorCode(error) === 'ENOTEMPTY') {
-        const winner = await existingTarget(target, expected, policy, signal);
+        const winner = await existingTarget(target, expected, policy, signal, probe);
         if (winner !== undefined) {
           onProgress?.('reuse');
           return {

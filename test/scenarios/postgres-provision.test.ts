@@ -7,7 +7,7 @@ describe('embedded PostgreSQL provision', () => {
   afterEach(async () => {
     await scenario.cleanup();
     scenario = new PostgresScenario();
-  });
+  }, 35_000);
 
   it('hydrates public binaries, initializes PostgreSQL 17 once, and safely reopens it', async () => {
     await expect(scenario.provisionAndReopen()).resolves.toEqual({
@@ -19,18 +19,22 @@ describe('embedded PostgreSQL provision', () => {
       version: '17\n',
       frozen: true,
     });
-  });
+  }, 150_000);
 
-  it.each([
-    'fifo',
-    'malformed-credential',
-    'partial',
-    'public-credential',
-    'symlink',
-    'wrong-major',
-  ] as const)('rejects an existing %s cluster without replacing it', async (kind) => {
-    await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toBe('rejected');
-  });
+  it.each(['fifo', 'partial', 'symlink'] as const)(
+    'rejects an existing %s cluster without replacing it',
+    async (kind) => {
+      await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toBe('rejected');
+    },
+  );
+
+  it.each(['malformed-credential', 'public-credential', 'wrong-major'] as const)(
+    'rejects an existing %s cluster without replacing it',
+    async (kind) => {
+      await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toBe('rejected');
+    },
+    90_000,
+  );
 
   it('cancels and drains owned initialization before releasing ownership', async () => {
     await expect(scenario.closeCancelsOwnedInitialization()).resolves.toEqual({

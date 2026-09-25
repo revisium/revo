@@ -34,6 +34,7 @@ describe('generated POSIX package installer', () => {
     try {
       const result = await data.publish();
       expect(result.directory).toBe(data.target);
+      expect(await data.mode(data.target)).toBe(0o700);
       expect(await data.mode(`${data.target}/install-receipt.json`)).toBe(0o600);
       expect(JSON.parse(await data.readReceipt())).toEqual(data.receipt);
       expect(await data.reuse()).toBe(data.target);
@@ -47,11 +48,12 @@ describe('generated POSIX package installer', () => {
     const data = await installerPackageScenario();
     try {
       await data.publish();
+      const targetMode = await data.mode(data.target);
       await (
         await import('node:fs/promises')
       ).writeFile(`${data.target}/install-receipt.json`, '{}\n');
       await expect(data.reuse()).rejects.toThrow(/receipt/iu);
-      expect(await data.mode(data.target)).toBe(0o755);
+      expect(await data.mode(data.target)).toBe(targetMode);
     } finally {
       await data.cleanup();
     }
@@ -63,7 +65,7 @@ describe('generated POSIX package installer', () => {
       release: {},
       components: {},
       target: { platform: 'linux', arch: 'x64' },
-      toolchain: { node: '26.8.2', pnpm: '12.4.1' },
+      toolchain: { node: '26.8.2', pnpm: '12.5.1' },
       artifacts: {
         package: { sha256: '0'.repeat(64), integrity: 'sha512-x' },
         packageJson: { sha256: '0'.repeat(64) },

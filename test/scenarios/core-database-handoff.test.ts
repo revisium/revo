@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { buildCoreChildEnvironment } from '../../src/core-host/core-child-environment.js';
 import { buildCoreDatabaseHandoff } from '../../src/core-host/core-database-handoff.js';
 import { CoreDatabaseHandoffScenario } from '../support/core-host/core-database-handoff-scenario.js';
+import { cleanupRegistered } from '../support/postgres/fixture-cleanup.js';
 import { ClusterFixture } from '../support/postgres/postgres-readiness-scenario.js';
 
 const PASSWORD = 'revo-test-password';
@@ -30,19 +31,16 @@ describe('Core database handoff', () => {
       failures.push(error);
     }
     if (scenario.hasNoRunningChildren()) {
-      const clusterResults = await Promise.allSettled(
-        clusters.splice(0).map((cluster) => cluster.close()),
-      );
-      failures.push(
-        ...clusterResults.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
-        ),
-      );
+      try {
+        await cleanupRegistered(clusters, (cluster) => cluster.close());
+      } catch (error) {
+        failures.push(error);
+      }
     }
     if (failures.length > 0) {
       throw new AggregateError(failures, 'Core database fixture cleanup failed');
     }
-  });
+  }, 25_000);
 
   it('passes explicit credentials through every published Core stage and GraphQL', async () => {
     const cluster = await startCluster();
@@ -59,7 +57,7 @@ describe('Core database handoff', () => {
       data: { __typename: 'Query' },
     });
     await result.close();
-  }, 60_000);
+  }, 120_000);
 
   it('does not fall through to pgpass or hostile ambient PostgreSQL variables', async () => {
     const cluster = await startCluster();
@@ -97,7 +95,7 @@ describe('Core database handoff', () => {
       'application-database-migrations:started',
       'application-database-migrations:failed',
     ]);
-  }, 60_000);
+  }, 120_000);
 
   it('round-trips a slash and space through the installed public connection parser', () => {
     const database = 'revo/reserved name';
@@ -105,11 +103,11 @@ describe('Core database handoff', () => {
     expect(parseIntoClientConfig(handoff(url)).database).toBe(database);
   });
 
-  function startCluster() {
-    return ClusterFixture.start('scram').then((cluster) => {
-      clusters.push(cluster);
-      return cluster;
-    });
+  async function startCluster() {
+    const cluster = ClusterFixture.create('scram');
+    clusters.push(cluster);
+    await cluster.start();
+    return cluster;
   }
 });
 

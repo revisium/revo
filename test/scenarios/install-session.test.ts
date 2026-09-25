@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Writable } from 'node:stream';
 
 import { describe, expect, it } from 'vitest';
@@ -89,6 +92,111 @@ describe('installer activation and startup session', () => {
     await scenario.session.fail(undefined, new Error('private-token'));
     expect(scenario.errors.join('')).toContain('INSTALL_SESSION_FAILED');
     expect(scenario.errors.join('')).not.toContain('private-token');
+  });
+
+  it('keeps bounded pnpm probe details in the private diagnostic file only', async () => {
+    const scenario = new InstallSessionScenario();
+    const scratch = await mkdtemp(join(tmpdir(), 'revo-install-session-probe-'));
+    const failure = Object.assign(new Error('pnpm probe: version command failed'), {
+      diagnosticCode: 'PNPM_PROBE_FAILED',
+      diagnosticDetail: `expected 12.5.1, actual 12.4.1; https://user:pass@registry.example/pkg?token=secret#fragment Bearer abc123 ${'é'.repeat(350)}`,
+    });
+    scenario.session.stage('probe');
+    try {
+      await scenario.session.fail(scratch, failure);
+      const path = join(scratch, 'install-session.log');
+      const log = await readFile(path, 'utf8');
+      expect(log).toContain('runtime-probe [PNPM_PROBE_FAILED]');
+      expect(log).toContain('expected 12.5.1, actual 12.4.1');
+      expect(log).toContain('https://[redacted]@registry.example/pkg');
+      expect(log).toContain('Bearer [redacted]');
+      expect(log).not.toContain('token=secret');
+      expect(log).not.toContain('abc123');
+      expect(log).not.toContain('user:pass');
+      expect(log).not.toContain('fragment');
+      const detail = log
+        .split('\n')
+        .find((line) => line.startsWith('Probe detail:'))
+        ?.slice(14);
+      expect(detail).toBeDefined();
+      expect(Buffer.byteLength(detail ?? '', 'utf8')).toBeLessThanOrEqual(1_024);
+      expect(detail).not.toContain('\uFFFD');
+      expect(log.length).toBeLessThan(1_300);
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect(scenario.errors.join('')).toContain('PNPM_PROBE_FAILED');
+      expect(scenario.errors.join('')).not.toContain('12.4.1');
+      expect(scenario.errors.join('')).not.toContain('secret');
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('omits an oversized sanitized probe detail instead of cutting a URL mid-token', async () => {
+    const scenario = new InstallSessionScenario();
+    const scratch = await mkdtemp(join(tmpdir(), 'revo-install-session-probe-size-'));
+    scenario.session.stage('probe');
+    try {
+      await scenario.session.fail(
+        scratch,
+        Object.assign(new Error('pnpm probe failed'), {
+          diagnosticCode: 'PNPM_PROBE_FAILED',
+          diagnosticDetail: `${'é'.repeat(600)} https://size-user:size-password@host/path`,
+        }),
+      );
+      const log = await readFile(join(scratch, 'install-session.log'), 'utf8');
+      expect(log).toContain('[probe detail omitted: size limit exceeded]');
+      expect(log).not.toContain('size-user');
+      expect(log).not.toContain('size-password');
+      expect(scenario.errors.join('')).toContain('[PNPM_PROBE_FAILED]');
+      expect(scenario.errors.join('')).not.toContain('size-user');
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      label: 'multiple userinfo separators',
+      detail: 'https://session-user:part@session-password@registry.example/path',
+      safe: 'https://[redacted]@registry.example/path',
+      secrets: ['session-user', 'session-password'],
+    },
+    {
+      label: 'an embedded control in authority',
+      detail: 'https://session-tab-user:session-tab-password\t@registry.example/path',
+      safe: '[probe detail omitted: embedded control]',
+      secrets: ['session-tab-user', 'session-tab-password'],
+    },
+    {
+      label: 'an invalid URL authority',
+      detail: 'https://session-invalid-user:session-invalid-password@/path',
+      safe: '[probe detail omitted: ambiguous URL authority]',
+      secrets: ['session-invalid-user', 'session-invalid-password'],
+    },
+  ])('sanitizes raw $label before writing session diagnostics', async (testCase) => {
+    const scenario = new InstallSessionScenario();
+    const scratch = await mkdtemp(join(tmpdir(), 'revo-install-session-probe-edge-'));
+    scenario.session.stage('probe');
+    try {
+      await scenario.session.fail(
+        scratch,
+        Object.assign(new Error('pnpm probe failed'), {
+          diagnosticCode: 'PNPM_PROBE_FAILED',
+          diagnosticDetail: testCase.detail,
+        }),
+      );
+      const log = await readFile(join(scratch, 'install-session.log'), 'utf8');
+      expect(log).toContain(testCase.safe);
+      expect(log).toContain('[PNPM_PROBE_FAILED]');
+      for (const secret of testCase.secrets) {
+        expect(log).not.toContain(secret);
+        expect(scenario.errors.join('')).not.toContain(secret);
+      }
+      expect(scenario.errors.join('')).toContain('[PNPM_PROBE_FAILED]');
+      expect((await stat(join(scratch, 'install-session.log'))).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   });
 
   it('disables broken progress output without aborting or retrying server startup', async () => {

@@ -1,6 +1,13 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
-  "ignorePatterns": [".codegraph/**", "coverage/**", "dist/**", "node_modules/**"],
+  "ignorePatterns": [
+    ".codegraph/**",
+    "coverage/**",
+    "dist/**",
+    "node_modules/**",
+    "test/fixtures/acceptance-lockfile/pnpm-12.5.1-before.yaml",
+    "test/fixtures/acceptance-lockfile/pnpm-12.5.1-after.yaml"
+  ],
   "printWidth": 100,
   "singleQuote": true,
   "sortImports": true,

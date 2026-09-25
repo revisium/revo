@@ -92,6 +92,7 @@ describe('persisted startup progress', () => {
   it('drains an accepted write before releasing ownership and rejects later writes', async () => {
     await expect(scenario.closeDrainsAcceptedWriteBeforeRelease()).resolves.toEqual({
       late: 'rejected',
+      terminalPersisted: true,
       busy: 'busy',
       replacement: 'held',
     });

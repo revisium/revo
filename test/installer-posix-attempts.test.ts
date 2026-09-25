@@ -161,7 +161,7 @@ describe('generated POSIX private attempts', () => {
       await access(join(root, 'stable/package/1.2.3'));
       await access(join(root, 'stable/package/1.2.4'));
       await access(join(root, `stable/node/${process.versions.node}`, identity));
-      await access(join(root, `stable/pnpm/${process.versions.node}`, identity, '12.4.1'));
+      await access(join(root, `stable/pnpm/${process.versions.node}`, identity, '12.5.1'));
     } finally {
       await Promise.all([
         cleanupPortableToolchain(first.root),

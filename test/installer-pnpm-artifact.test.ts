@@ -1,5 +1,6 @@
 // oxlint-disable no-unsafe-type-assertion, no-explicit-any, no-await-in-loop, vitest/require-mock-type-parameters, vitest/require-to-throw-message -- compact fixture API
 import { mkdir, readdir, stat } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -27,15 +28,15 @@ const bootstrap = embeddedBootstrap(
       core: '4.3.2',
       admin: '5.4.3',
       node: process.versions.node,
-      pnpm: '12.4.1',
+      pnpm: '12.5.1',
     }),
   ),
 ) as Data;
 
 // Build through the real installer builder so URL/target metadata remains production-shaped.
-const fixture = async () => {
+const fixture = async (hardlink = false) => {
   const scenario = await pnpmBootstrapScenario(engine, bootstrap);
-  const archive = await scenario.archive();
+  const archive = await scenario.archive({ hardlink });
   const value = structuredClone(bootstrap);
   const selected = value.pnpmArchives.find(
     (item: Data) => item.platform === 'linux' && item.arch === 'x64',
@@ -67,10 +68,26 @@ describe('pnpm artifact acquisition', () => {
       request: vi.fn(async () => response(data.bytes)),
       onProgress: (stage: string) => stages.push(stage),
     });
-    expect(result).toMatchObject({ version: '12.4.1', archiveSha256: expect.any(String) });
+    expect(result).toMatchObject({ version: '12.5.1', archiveSha256: expect.any(String) });
     expect(stages).toEqual(['download', 'verify', 'extract']);
     expect((await stat(result.executablePath)).mode & 0o111).toBeTruthy();
     expect(await readdir(result.directory)).toEqual(expect.arrayContaining(['pnpm', 'dist']));
+  });
+  it('accepts the pinned pnpm layout with an internal regular-file hardlink', async () => {
+    const data = await fixture(true);
+    const result = await api.acquirePnpmArtifact({
+      bootstrap: data.value,
+      platform: 'linux',
+      arch: 'x64',
+      scratch: data.scratch,
+      request: vi.fn(async () => response(data.bytes)),
+    });
+    const [original, copy] = await Promise.all([
+      stat(join(result.directory, 'dist', 'index.js')),
+      stat(join(result.directory, 'dist', 'copy.js')),
+    ]);
+    expect(copy.ino).toBe(original.ino);
+    expect(copy.nlink).toBe(2);
   });
   it('follows only bounded release-assets redirects and never leaks query secrets', async () => {
     const data = await fixture();

@@ -15,6 +15,21 @@ permissions:
   contents: read
 
 jobs:
+  workflow-validation:
+    name: Validate GitHub workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Validate workflow syntax and contexts
+        run: bash scripts/ci/check-workflows.sh
+
   process-platforms:
     name: Processes (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -293,6 +308,7 @@ jobs:
         id: installer_activation
         env:
           REVO_INTEL_DIAGNOSTICS_DIR: ${{ steps.intel_evidence.outputs.directory }}
+          REVO_RUN_REAL_INSTALLER_INTEGRATION: '1'
         run: pnpm exec vitest run test/installer-posix-toolchain.test.ts test/scenarios/install-activation-helper.test.ts
 
       - name: Validate Intel diagnostic evidence
@@ -1096,6 +1112,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Verify
+        env:
+          REVO_RUN_REAL_INSTALLER_INTEGRATION: '0'
         run: pnpm verify
 
       - name: Require Sonar provider access

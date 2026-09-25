@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { ConfigurationError } from '../../src/configuration/configuration-error.js';
+import { DEFAULT_CONTROL_LIMITS } from '../../src/processes/control-endpoint.types.js';
 import { ManagedProcessError } from '../../src/processes/managed-process-error.js';
 import { ProgressOperation, parseProgressEvent } from '../../src/progress/index.js';
 import type { ServerLaunchResult } from '../../src/server/server-launcher.service.js';
@@ -44,7 +45,7 @@ const NO_START = `${UNAVAILABLE}; start was not performed.\n`;
 const NO_STOP = `${UNAVAILABLE}; stop was not performed.\n`;
 const STOPPED = 'Server stopped.\n';
 const ALREADY_STOPPED = 'Server is already stopped.\n';
-const STOP_CALL = { dataDir: FIXTURE_DATA_DIR, timeoutMs: 5_000 };
+const STOP_CALL = { dataDir: FIXTURE_DATA_DIR, timeoutMs: 45_000 };
 const CANCELLED = 'Server start was cancelled.\n';
 const FAILED = 'Server start failed.\n';
 const OUTCOME = 'Server start outcome is unknown.\n';
@@ -171,6 +172,11 @@ describe('revo server command line', () => {
 });
 
 describe('server command presentation', () => {
+  it('keeps stop completion and control transport budgets independent', () => {
+    expect(DEFAULT_CONTROL_LIMITS.timeoutMs).toBe(5_000);
+    expect(STOP_CALL.timeoutMs).toBe(45_000);
+  });
+
   it.each<{ code: number; err: string; out: string; outcome: ServerLaunchResult }>([
     { code: 0, err: '', out: 'Server started at http://127.0.0.1:3210.\n', outcome: STARTED },
     { code: 0, err: '', out: 'Server is already running.\n', outcome: serverStatus('running') },

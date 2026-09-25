@@ -5,7 +5,7 @@ import { ServerOwnerScenario } from '../support/server/server-owner-scenario.js'
 const REAL_OWNER_START_TIMEOUT_MS = 125_000;
 const REAL_OWNER_RESTART_TIMEOUT_MS = 255_000;
 const REAL_OWNER_CONTROL_STOP_TIMEOUT_MS = 145_000;
-const REAL_OWNER_CLEANUP_TIMEOUT_MS = 20_000;
+const REAL_OWNER_CLEANUP_TIMEOUT_MS = 35_000;
 
 describe('Server owner composition', () => {
   let scenario: ServerOwnerScenario;

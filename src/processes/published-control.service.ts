@@ -128,70 +128,116 @@ export class PublishedControlService {
       };
       temporaryPath = join(canonicalDataDir, `.revo-control.${instanceId}.tmp`);
       await publishRecord(temporaryPath, join(canonicalDataDir, CONTROL_FILE), record);
-      let finalClose: Promise<void> | undefined;
       let progressClose: Promise<void> | undefined;
       const lifecycleStop = new LifecycleStop(lifecycle);
       let finalState: 'pending' | 'released' | 'failed' = 'pending';
+      let finalization:
+        | {
+            promise: Promise<void>;
+            phase: 'postgres' | 'progress' | 'releasing' | 'released' | 'failed';
+            retryable: boolean;
+          }
+        | undefined;
+      let closeOperation: Promise<void> | undefined;
       let resolveOwnershipReleased!: () => void;
       const ownershipReleased = new Promise<void>((resolve) => {
         resolveOwnershipReleased = resolve;
       });
       const isReleased = () => finalState === 'released';
       const finalize = () => {
-        progressClose ??= progress?.close();
-        if (!finalClose) {
-          finalClose = (async () => {
+        if (finalization && !finalization.retryable) {
+          return finalization.promise;
+        }
+        const attempt: {
+          promise: Promise<void>;
+          phase: 'postgres' | 'progress' | 'releasing' | 'released' | 'failed';
+          retryable: boolean;
+        } = {
+          promise: Promise.resolve(),
+          phase: 'postgres',
+          retryable: false,
+        };
+        finalization = attempt;
+        attempt.promise = (async () => {
+          try {
             await postgres?.settled();
-            await progressClose;
-            await this.closeOwned(
-              createdEndpoint,
-              canonicalDataDir,
-              instanceId,
-              token,
-              lease,
-              lifecycleStop,
-              resolveOwnershipReleased,
-            );
-          })();
-          void finalClose.then(
+          } catch {
+            lifecycleStop.resourcesFailed();
+            attempt.retryable = true;
+            throw new PublishedControlError('close', [], 'retained');
+          }
+          attempt.phase = 'progress';
+          progressClose ??= progress?.close();
+          await progressClose;
+          attempt.phase = 'releasing';
+          await this.closeOwned(
+            createdEndpoint,
+            canonicalDataDir,
+            instanceId,
+            token,
+            lease,
+            lifecycleStop,
             () => {
               finalState = 'released';
-            },
-            () => {
-              finalState = 'failed';
+              resolveOwnershipReleased();
             },
           );
-        }
-        return finalClose;
+        })();
+        void attempt.promise.then(
+          () => {
+            if (finalization === attempt) {
+              attempt.phase = 'released';
+              finalState = 'released';
+            }
+          },
+          () => {
+            if (finalization === attempt && !attempt.retryable) {
+              attempt.phase = 'failed';
+              finalState = 'failed';
+            }
+          },
+        );
+        return attempt.promise;
       };
-      const close = async () => {
+      const performClose = async () => {
         if (isReleased()) {
-          await finalClose;
+          await finalization?.promise;
           return;
         }
         lifecycleStop.begin();
-        const postgresClose = postgres?.close();
-        progressClose ??= progress?.close();
         let postgresFailed = false;
         try {
-          await postgresClose;
+          await postgres?.close();
         } catch {
           postgresFailed = true;
           lifecycleStop.resourcesFailed();
         }
         if (postgresFailed) {
-          if (!finalClose) {
-            void finalize().catch(() => undefined);
-          }
+          const pendingFinalization = finalize();
+          void pendingFinalization.catch(() => undefined);
           if (isReleased()) {
             throw new PublishedControlError('close', [], 'released');
-          }
-          if (finalState === 'failed') {
-            await finalClose;
           }
           throw new PublishedControlError('close', [], 'retained');
         }
         await finalize();
+      };
+      const close = () => {
+        if (isReleased()) {
+          return finalization?.promise ?? Promise.resolve();
+        }
+        progress?.seal();
+        if (closeOperation) {
+          return closeOperation;
+        }
+        const operation = performClose();
+        closeOperation = operation;
+        void operation.then(undefined, () => {
+          if (closeOperation === operation) {
+            closeOperation = undefined;
+          }
+        });
+        return operation;
       };
       const common = {
         kind: 'held' as const,
@@ -230,7 +276,7 @@ export class PublishedControlService {
     token: string,
     lease: Extract<Awaited<ReturnType<ServerOwnershipService['acquire']>>, { kind: 'held' }>,
     lifecycleStop: LifecycleStop,
-    resolveOwnershipReleased: () => void,
+    markOwnershipReleased: () => void,
   ): Promise<void> {
     const failures: ('endpoint' | 'metadata' | 'ownership')[] = [];
     try {
@@ -255,7 +301,7 @@ export class PublishedControlService {
     await lifecycleStop.finish(failures);
     try {
       await lease.release();
-      resolveOwnershipReleased();
+      markOwnershipReleased();
     } catch {
       failures.push('ownership');
     }

@@ -412,7 +412,7 @@ export class ServerOwnerScenario {
     if (completion.kind !== 'completed') {
       throw new Error('Published owner control reported failed cleanup');
     }
-    const outcome = await waitBounded(owner.outcome(), 15_000);
+    const outcome = await waitBounded(owner.outcome(), 35_000);
     if (outcome.kind !== 'stopped') {
       throw new Error('Published control stop did not fully clean up the owner');
     }

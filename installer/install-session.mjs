@@ -6,6 +6,7 @@ import { runPackageProcess } from '../src/installation/package-process.js';
 import { PackageProgressRenderer } from '../src/installation/package-progress-renderer.js';
 import { createPnpmProgressSink } from '../src/installation/pnpm-progress.js';
 import { parseProgressEvent, ProgressOperation, ProgressRenderer } from '../src/progress/index.js';
+import { sanitizeProbeDiagnostic } from './probe-diagnostic.mjs';
 
 const quote = (value) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
 const safePath = (value) =>
@@ -20,6 +21,7 @@ const hasUnsafeCharacters = (value) => {
   }
   return false;
 };
+const safeDiagnostic = (value) => sanitizeProbeDiagnostic(value);
 const stages = new Map([
   ['validate', 'runtime-validate'],
   ['download', 'runtime-download'],
@@ -389,20 +391,34 @@ export class InstallSession {
       'INSTALL_PATH_UNSAFE',
       'INSTALL_PROGRESS_OUTPUT_FAILED',
     ]);
-    const code = known.has(error?.message) ? error.message : 'INSTALL_SESSION_FAILED';
+    const probeFailure = error?.diagnosticCode === 'PNPM_PROBE_FAILED';
+    const code = probeFailure
+      ? error.diagnosticCode
+      : known.has(error?.message)
+        ? error.message
+        : 'INSTALL_SESSION_FAILED';
+    const probeDetail = probeFailure ? safeDiagnostic(error?.diagnosticDetail) : '';
     const diagnostic = `Installation did not complete during ${phase} [${code}]. Activation may already be committed; no application or database rollback was performed.\n`;
     let suffix = '';
     if (safePath(scratch)) {
       const path = join(scratch, 'install-session.log');
-      await writeFile(path, diagnostic, { mode: 0o600, flag: 'wx' }).then(
+      await writeFile(
+        path,
+        `${diagnostic}${probeDetail === '' ? '' : `Probe detail: ${probeDetail}\n`}`,
+        {
+          mode: 0o600,
+          flag: 'wx',
+        },
+      ).then(
         () => {
           suffix = `Diagnostics: ${quote(path)}\n`;
         },
         () => undefined,
       );
-      const detail = this.diagnosticPath ?? error?.diagnosticPath ?? error?.result?.diagnosticPath;
-      if (safePath(detail) && resolve(detail).startsWith(`${resolve(scratch)}/`)) {
-        suffix += `Process log: ${quote(detail)}\n`;
+      const processLogPath =
+        this.diagnosticPath ?? error?.diagnosticPath ?? error?.result?.diagnosticPath;
+      if (safePath(processLogPath) && resolve(processLogPath).startsWith(`${resolve(scratch)}/`)) {
+        suffix += `Process log: ${quote(processLogPath)}\n`;
       }
     }
     this.stderr(diagnostic + suffix);

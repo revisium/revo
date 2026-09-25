@@ -129,6 +129,21 @@ describe('managed child process', () => {
     await expect(handle.completion).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' });
   });
 
+  it('uses a scoped escalation signal when requested', async () => {
+    const handle = await scenario.start(scenario.request(['int'], { ipc: true }));
+    await scenario.begin(handle);
+    const termReceived = scenario.waitForMessage(handle);
+
+    await new ManagedProcessService().stop(handle, {
+      graceMs: 100,
+      killWaitMs: 1_000,
+      escalationSignal: 'SIGINT',
+    });
+
+    await expect(termReceived).resolves.toEqual({ state: 'term-received' });
+    await expect(handle.completion).resolves.toEqual({ exitCode: 0, signal: null });
+  });
+
   it('reports a bounded stop timeout without claiming the child exited', async () => {
     const handle = await scenario.startWithoutExitObservation(
       scenario.request(['resist'], { ipc: true }),
@@ -188,6 +203,27 @@ describe('managed child process', () => {
     await expect(handle.cancellationResult).resolves.toEqual({ kind: 'stopped' });
     expect(scenario.isRunning(unrelated)).toBe(true);
     expect(process.listenerCount('SIGTERM')).toBe(parentListeners);
+  });
+
+  it('coalesces explicit stop with cancellation without shortening the original grace', async () => {
+    const cancellation = new AbortController();
+    const handle = await scenario.start(
+      scenario.request(['resist'], {
+        cancellation: { graceMs: 500, killWaitMs: 1_000, signal: cancellation.signal },
+        ipc: true,
+      }),
+    );
+    await scenario.begin(handle);
+    const termReceived = scenario.waitForMessage(handle);
+    const cancellationStartedAt = Date.now();
+
+    cancellation.abort();
+    await termReceived;
+    await new ManagedProcessService().stop(handle, { graceMs: 1, killWaitMs: 1 });
+
+    expect(Date.now() - cancellationStartedAt).toBeGreaterThanOrEqual(400);
+    await expect(handle.cancellationResult).resolves.toEqual({ kind: 'stopped' });
+    await expect(handle.completion).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' });
   });
 
   it.each(['detachCommitted', 'abandonUncertain'] as const)(
