@@ -706,31 +706,10 @@ async function waitForPostgresSettlement(clusterDir: string): Promise<void> {
   const pidPath = `${clusterDir}/postmaster.pid`;
   const deadline = performance.now() + POSTGRES_SETTLEMENT_TIMEOUT_MS;
   for (;;) {
-    try {
-      // oxlint-disable-next-line no-await-in-loop -- settlement must observe each filesystem state in order.
-      const metadata = await lstatBeforeDeadline(pidPath, deadline);
-      if (performance.now() > deadline) {
-        throw new EmbeddedPostgresError('process');
-      }
-      if (metadata.isSymbolicLink() || !metadata.isFile()) {
-        throw new EmbeddedPostgresError('process');
-      }
-    } catch (error) {
-      if (error instanceof EmbeddedPostgresError) {
-        throw error;
-      }
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        error.code === 'ENOENT'
-      ) {
-        if (performance.now() <= deadline) {
-          return;
-        }
-        throw new EmbeddedPostgresError('process');
-      }
-      throw new EmbeddedPostgresError('process');
+    // oxlint-disable-next-line no-await-in-loop -- settlement must observe each filesystem state in order.
+    const observation = await observePostgresMarker(pidPath, deadline);
+    if (observation === 'absent') {
+      return;
     }
     const settlementRemainingMs = deadline - performance.now();
     if (settlementRemainingMs <= 0) {
@@ -741,6 +720,31 @@ async function waitForPostgresSettlement(clusterDir: string): Promise<void> {
       setTimeout(resolve, Math.min(POSTGRES_SETTLEMENT_POLL_MS, settlementRemainingMs)),
     );
   }
+}
+
+async function observePostgresMarker(
+  pidPath: string,
+  deadline: number,
+): Promise<'present' | 'absent'> {
+  try {
+    const metadata = await lstatBeforeDeadline(pidPath, deadline);
+    if (performance.now() > deadline || metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new EmbeddedPostgresError('process');
+    }
+    return 'present';
+  } catch (error) {
+    if (error instanceof EmbeddedPostgresError) {
+      throw error;
+    }
+    if (isMissingPathError(error) && performance.now() <= deadline) {
+      return 'absent';
+    }
+    throw new EmbeddedPostgresError('process');
+  }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }
 
 async function lstatBeforeDeadline(pidPath: string, deadline: number) {
