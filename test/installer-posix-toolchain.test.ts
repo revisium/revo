@@ -29,6 +29,7 @@ import { parseLifecycleDocument } from '../src/server-logs/document.js';
 import { ServerLifecycleStore, serverLifecyclePath } from '../src/server-logs/store.service.js';
 import { activationScenario } from './support/installation/activation-scenario.js';
 import {
+  sanitizeInitialDiagnostic,
   serializeInitialInstallFailureReceipt,
   type InitialInstallFailureTestCase,
   type InitialInstallDiagnostics,
@@ -792,6 +793,87 @@ it
     let phase = 'initial-install';
     let installerOutcome = 'not-started';
     let installerStderrTail = '';
+    let installerSignal: NodeJS.Signals | null = null;
+    let initialFailureDiagnostics: InitialInstallDiagnostics | undefined;
+    const installationStartedAt = performance.now();
+    const emitFailureSnapshot = async (
+      checkpoint: 'installer-failed' | 'cleanup-failed',
+      installerCode: number | undefined,
+      diagnostics: InitialInstallDiagnostics | undefined,
+      cleanupError?: unknown,
+      diagnosticsReused = false,
+    ) => {
+      try {
+        const context = subject.diagnosticContext;
+        const startupTimeoutInput = context.configurationEnvironment.REVO_STARTUP_TIMEOUT;
+        const startupTimeoutMs =
+          startupTimeoutInput !== undefined && /^\d{1,6}$/u.test(startupTimeoutInput)
+            ? Number(startupTimeoutInput)
+            : undefined;
+        const logs = Object.fromEntries(
+          Object.entries(diagnostics?.logs ?? {}).map(([name, record]) => [
+            name,
+            { status: record.status, sizeBytes: record.sizeBytes, diagnostic: record.diagnostic },
+          ]),
+        );
+        const evidence = {
+          schemaVersion: 'revo-real-installer-failure/v1',
+          checkpoint,
+          channel,
+          installerCode: installerCode ?? null,
+          installerSignal,
+          installerOutcome,
+          elapsedMs: Math.round(performance.now() - installationStartedAt),
+          cleanupError:
+            cleanupError instanceof Error
+              ? sanitizeInitialDiagnostic({ status: 'complete', text: cleanupError.message }, [
+                  subject.root,
+                ])
+              : cleanupError === undefined
+                ? null
+                : 'non-error cleanup failure',
+          status: { kind: 'not-observed-by-snapshot' },
+          startupTimeoutMs:
+            startupTimeoutMs ?? (startupTimeoutInput === undefined ? 180_000 : null),
+          lifecycle: { status: 'see bounded sanitized server-start log' },
+          diagnosticsReused,
+          installDiagnostics: diagnostics
+            ? { status: diagnostics.status, reason: diagnostics.reason, logs }
+            : { status: 'incomplete', reason: 'collection-unavailable', logs },
+        };
+        const line = JSON.stringify(evidence);
+        const prefix = 'REVO_REAL_INSTALLER_FAILURE ';
+        const boundedLine =
+          Buffer.byteLength(`${prefix}${line}\n`, 'utf8') <= 16_384
+            ? line
+            : JSON.stringify({
+                schemaVersion: 'revo-real-installer-failure/v1',
+                checkpoint,
+                channel,
+                installerCode: installerCode ?? null,
+                installerSignal,
+                installerOutcome,
+                elapsedMs: Math.round(performance.now() - installationStartedAt),
+                snapshotStatus: 'incomplete-size-limit',
+                diagnosticsReused,
+              });
+        console.error(`${prefix}${boundedLine}`);
+      } catch {
+        console.error(
+          `REVO_REAL_INSTALLER_FAILURE ${JSON.stringify({
+            schemaVersion: 'revo-real-installer-failure/v1',
+            checkpoint,
+            channel,
+            installerCode: installerCode ?? null,
+            installerSignal,
+            installerOutcome,
+            elapsedMs: Math.round(performance.now() - installationStartedAt),
+            snapshotStatus: 'incomplete',
+            diagnosticsReused,
+          })}`,
+        );
+      }
+    };
     await runWithPortableToolchainCleanup(
       subject.root,
       async () => {
@@ -803,9 +885,23 @@ it
           installation,
           (signal, markCloseUncertain) =>
             subject.initialInstallFailureDiagnostics(signal, markCloseUncertain),
+          undefined,
+          5_000,
+          realpath,
+          (diagnostics) => {
+            initialFailureDiagnostics = diagnostics;
+          },
         );
         installerOutcome = formatInstallerOutcome(installation.outcome());
         installerStderrTail = installation.stderrTail();
+        installerSignal = installation.outcome()?.signal ?? null;
+        if (installationCode !== 0) {
+          await emitFailureSnapshot(
+            'installer-failed',
+            installationCode,
+            initialFailureDiagnostics,
+          );
+        }
         expect(installationCode).toBe(0);
         phase = 'initial-server-status';
         const running = await subject.status();
@@ -839,6 +935,13 @@ it
         try {
           await cleanupPortableToolchain(subject.root);
         } catch (error) {
+          await emitFailureSnapshot(
+            'cleanup-failed',
+            undefined,
+            initialFailureDiagnostics,
+            error,
+            true,
+          );
           throw new Error(
             `cleanup phase failed; testPhase=${phase}; installer=${installerOutcome}; ` +
               `stderrTail=${installerStderrTail.slice(-1024)}`,
@@ -1049,6 +1152,7 @@ async function finishInitialInstallWithDiagnostics(
   report: (message: string) => void = (message) => console.error(message),
   timeoutMs = 5_000,
   resolveDiagnosticRoot: (path: string) => Promise<string> = realpath,
+  onDiagnostics?: (diagnostics: InitialInstallDiagnostics) => void,
 ): Promise<number> {
   const finishCode = await installation.finish;
   if (finishCode !== 0) {
@@ -1120,6 +1224,11 @@ async function finishInitialInstallWithDiagnostics(
           ? process.platform
           : 'unknown';
       const arch = process.arch === 'x64' || process.arch === 'arm64' ? process.arch : 'unknown';
+      try {
+        onDiagnostics?.(diagnostics);
+      } catch {
+        // Snapshot capture must not replace the installer failure.
+      }
       const receipt = serializeInitialInstallFailureReceipt({
         testCase,
         platform,
@@ -2427,6 +2536,7 @@ describe('initial installation failure diagnostics', () => {
       notifyCollectorSettled = resolve;
     });
     const report = vi.fn<(message: string) => void>();
+    let capturedDiagnostics: InitialInstallDiagnostics | undefined;
 
     await expect(
       runWithPortableToolchainCleanup(root, async () => {
@@ -2442,9 +2552,17 @@ describe('initial installation failure diagnostics', () => {
           },
           report,
           10,
+          realpath,
+          (diagnostics) => {
+            capturedDiagnostics = diagnostics;
+          },
         );
         expect(result).toBe(31);
         expect(report).toHaveBeenCalledTimes(1);
+        expect(capturedDiagnostics).toMatchObject({
+          status: 'incomplete',
+          reason: 'collector-error',
+        });
         throw originalFailure;
       }),
     ).rejects.toThrow('INITIAL_DIAGNOSTICS_NOT_QUIESCENT');
