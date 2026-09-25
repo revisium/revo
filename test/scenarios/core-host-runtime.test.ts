@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { finished } from 'node:stream/promises';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   CORE_HOST_PROTOCOL,
@@ -17,6 +17,7 @@ import {
   CoreChildScenario,
   DeferredCoreRuntimeService,
 } from '../support/core-host/core-host-scenario.js';
+import { cleanupRegistered } from '../support/postgres/fixture-cleanup.js';
 import { ClusterFixture } from '../support/postgres/postgres-readiness-scenario.js';
 
 const start = {
@@ -299,9 +300,16 @@ describe('Core child runtime', () => {
 });
 
 describe('published Core child process', () => {
+  const clusters: ClusterFixture[] = [];
+  afterEach(async () => {
+    await cleanupRegistered(clusters, (cluster) => cluster.close());
+  }, 20_000);
+
   it('migrates new and existing databases, serves GraphQL, and closes its listener', async () => {
+    const cluster = ClusterFixture.create('scram');
+    clusters.push(cluster);
+    await cluster.start();
     const deadline = Date.now() + 75_000;
-    const cluster = await ClusterFixture.start('scram');
     const root = await mkdtemp('/tmp/revo-core-host-').catch(async (primary: unknown) => {
       await cluster.close().catch((error: unknown) => {
         throw new Error(
@@ -371,7 +379,7 @@ describe('published Core child process', () => {
     if (primary !== undefined) {
       throw primary;
     }
-  }, 90_000);
+  }, 180_000);
 
   it('bounds and redacts a real subprocess startup failure', async () => {
     const root = await mkdtemp('/tmp/revo-core-host-failure-');

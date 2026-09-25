@@ -665,8 +665,11 @@ export class InstallerPosixBootstrapScenario {
           ? bootstrapPolicy
           : { ...bootstrapPolicy, terminationGraceSeconds: 1 };
     const { buildInstaller } = await vi.importActual<InstallerBuilder>(BUILDER);
+    const { buildPayload } = await vi.importActual<{
+      buildPayload: (input: { readonly entry: string }) => Promise<string>;
+    }>(new URL('../../../installer/build-payload.mjs', import.meta.url).href);
     const template = await readFile(join(ROOT, 'installer', 'install.sh.in'), 'utf8');
-    const payloadSource = await readFile(PAYLOAD, 'utf8');
+    const payloadSource = await buildPayload({ entry: PAYLOAD });
     const payload =
       options.payload === 'hostile'
         ? `${payloadSource}\n// '; touch ${this.path(SENTINEL)} #\n`

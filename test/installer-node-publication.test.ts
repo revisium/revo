@@ -34,6 +34,7 @@ const engine = new URL('../installer/node-bootstrap.mjs', import.meta.url).pathn
 const execute = promisify(execFile);
 const nodePlatform = process.platform;
 const nodeArch = process.arch;
+const PUBLISHER_CHILD_TIMEOUT_MS = 15_000;
 const { buildInstaller } = await vi.importActual<{ buildInstaller: (input: unknown) => string }>(
   new URL('../installer/build-installer.mjs', import.meta.url).href,
 );
@@ -45,31 +46,30 @@ const fixture = async () => {
         core: '4.3.2',
         admin: '5.4.3',
         node: process.versions.node,
-        pnpm: '12.4.1',
+        pnpm: '12.5.1',
       }),
     ),
   ) as Data;
   const scenario = await pnpmBootstrapScenario(engine, value);
-  const channelRoot = join(scenario.root, 'channel');
-  await mkdir(channelRoot);
-  const node = await scenario.prepareNodeStage();
-  const archiveSha256 = value.archives.find(
-    (item: Data) => item.platform === nodePlatform && item.arch === nodeArch,
-  ).sha256;
-  await api.runBootstrap({
-    dataPath: scenario.dataPath,
-    receiptPath: join(node.stage, 'install-receipt.json'),
-    target: `${nodePlatform}-${nodeArch}`,
-    archiveSha256,
-  });
-  return {
-    value,
-    scenario,
-    channelRoot,
-    node,
-    archiveSha256,
-    cleanup: () => rm(scenario.root, { recursive: true, force: true }),
-  };
+  const cleanup = () => rm(scenario.root, { recursive: true, force: true });
+  try {
+    const channelRoot = join(scenario.root, 'channel');
+    await mkdir(channelRoot);
+    const node = await scenario.prepareNodeStage();
+    const archiveSha256 = value.archives.find(
+      (item: Data) => item.platform === nodePlatform && item.arch === nodeArch,
+    ).sha256;
+    await api.runBootstrap({
+      dataPath: scenario.dataPath,
+      receiptPath: join(node.stage, 'install-receipt.json'),
+      target: `${nodePlatform}-${nodeArch}`,
+      archiveSha256,
+    });
+    return { value, scenario, channelRoot, node, archiveSha256, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
 };
 const input = (data: Data, stage = data.node.stage) => ({
   bootstrap: data.value,
@@ -324,5 +324,25 @@ describe('managed Node bootstrap publication', () => {
     } finally {
       await data.cleanup();
     }
-  });
+  }, 60_000);
+
+  it('fails fast and cleans publisher children that exit before ready', async () => {
+    const data = await fixture();
+    const attempts = await Promise.all([
+      data.scenario.prepareNodeStage('process-a'),
+      data.scenario.prepareNodeStage('process-b'),
+    ]);
+    const started = Date.now();
+    try {
+      await expect(
+        data.scenario.publishNodeTogether(attempts, {
+          ...input(data),
+          testPublisherMode: 'exit-before-ready',
+        }),
+      ).rejects.toThrow(/exited before ready/iu);
+      expect(Date.now() - started).toBeLessThan(PUBLISHER_CHILD_TIMEOUT_MS);
+    } finally {
+      await data.cleanup();
+    }
+  }, 30_000);
 });

@@ -172,7 +172,7 @@ export function releaseManifestFixture(
     core: '0.0.0',
     admin: '0.0.0',
     node: '26.8.2',
-    pnpm: '12.4.1',
+    pnpm: '12.5.1',
   };
   const policy = options.policy ?? releasePolicyFixture();
   const bytes = {
@@ -257,7 +257,7 @@ const isPnpmAssetFixture = (value: unknown): value is PnpmAssetFixture =>
 const readPnpmAssetFixture = (): PnpmAssetFixture => {
   const value: unknown = JSON.parse(
     readFileSync(
-      new URL('../../fixtures/installation/pnpm-v12.4.1-assets.json', import.meta.url),
+      new URL('../../fixtures/installation/pnpm-v12.5.1-assets.json', import.meta.url),
       'utf8',
     ),
   );

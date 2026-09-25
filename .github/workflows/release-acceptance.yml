@@ -1,0 +1,821 @@
+name: Release acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      revo_revision:
+        description: Full Revo commit SHA; for this workflow it must equal the dispatched revision.
+        required: true
+        type: string
+      tui_repository:
+        description: TUI producer repository.
+        required: true
+        default: revisium/revo-tui
+        type: string
+      tui_revision:
+        description: Full revo-tui producer commit SHA.
+        required: true
+        type: string
+      tui_run_id:
+        description: Exact successful package-artifacts workflow run ID.
+        required: true
+        type: string
+      tui_run_attempt:
+        description: Exact producer run attempt.
+        required: true
+        default: '1'
+        type: string
+      tui_artifact_id:
+        description: Exact revo-tui-verified-package artifact ID.
+        required: true
+        type: string
+      tui_tarball_sha256:
+        description: SHA256 of the TUI tarball inside the producer artifact.
+        required: true
+        type: string
+      channel:
+        description: Installer channel used by the acceptance bundle.
+        required: true
+        default: stable
+        type: choice
+        options:
+          - alpha
+          - stable
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-acceptance-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare exact acceptance bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      artifact_id: ${{ steps.upload_handoff.outputs['artifact-id'] }}
+    steps:
+      - name: Check out exact Revo revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate dispatch identity
+        env:
+          REVO_REVISION: ${{ inputs.revo_revision }}
+          EVENT_SHA: ${{ github.sha }}
+          TUI_REPOSITORY: ${{ inputs.tui_repository }}
+          TUI_REVISION: ${{ inputs.tui_revision }}
+          TUI_RUN_ID: ${{ inputs.tui_run_id }}
+          TUI_RUN_ATTEMPT: ${{ inputs.tui_run_attempt }}
+          TUI_ARTIFACT_ID: ${{ inputs.tui_artifact_id }}
+          TUI_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$REVO_REVISION" == "$EVENT_SHA" ]]
+          [[ "$REVO_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TUI_REPOSITORY" == revisium/revo-tui ]]
+          [[ "$TUI_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TUI_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$TUI_RUN_ATTEMPT" == 1 ]]
+          [[ "$TUI_ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$TUI_TARBALL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Validate channel against Revo version
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          case "$CHANNEL" in
+            stable)
+              if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                echo "stable acceptance requires a non-prerelease SemVer; got $version" >&2
+                exit 1
+              fi
+              ;;
+            alpha)
+              if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.(0|[1-9][0-9]*)$ ]]; then
+                echo "alpha acceptance requires an X.Y.Z-alpha.N release-train version; got $version" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "unsupported acceptance channel: $CHANNEL" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 12.5.1
+
+      - name: Install isolated acceptance tooling
+        run: node scripts/acceptance/bootstrap-tooling.mjs "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+
+      - name: Check out exact TUI verifier revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ inputs.tui_repository }}
+          ref: ${{ inputs.tui_revision }}
+          path: tui-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve exact producer run and artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TUI_REPOSITORY: ${{ inputs.tui_repository }}
+          TUI_REVISION: ${{ inputs.tui_revision }}
+          TUI_RUN_ID: ${{ inputs.tui_run_id }}
+          TUI_RUN_ATTEMPT: ${{ inputs.tui_run_attempt }}
+          TUI_ARTIFACT_ID: ${{ inputs.tui_artifact_id }}
+          OUTPUT: ${{ runner.temp }}/tui-artifact.zip
+        run: node scripts/acceptance/fetch-tui-artifact.mjs
+
+      - name: Extract producer artifact safely
+        env:
+          ZIP: ${{ runner.temp }}/tui-artifact.zip
+          OUTPUT: ${{ runner.temp }}/tui-artifact
+        run: |
+          set -euo pipefail
+          python3 scripts/acceptance/extract-artifact.py --archive "$ZIP" --output "$OUTPUT"
+
+      - name: Verify exact TUI package and requested tarball digest
+        env:
+          EXPECTED_SOURCE_REVISION: ${{ inputs.tui_revision }}
+          EXPECTED_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/tui-artifact"
+          manifest="$release_dir/release-package-manifest.json"
+          test -f "$manifest"
+          tarball_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$manifest")"
+          tarball="$release_dir/$tarball_name"
+          test -f "$tarball"
+          actual="$(sha256sum "$tarball" | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_TARBALL_SHA256"
+          expected_version="$(node -p "require('./tui-source/package.json').version")"
+          node tui-source/scripts/verify-release-package.mjs \
+            --manifest "$manifest" \
+            --tarball "$tarball" \
+            --expected-version "$expected_version" \
+            --expected-source-revision "$EXPECTED_SOURCE_REVISION"
+
+      - name: Create private localhost CA and trust it on the builder
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          pki="$RUNNER_TEMP/revo-acceptance-pki"
+          umask 077
+          mkdir -m 700 "$pki"
+          node -e "require('node:fs').writeFileSync(process.argv[1], ['[ca_ext]', 'basicConstraints=critical,CA:TRUE,pathlen:0', 'keyUsage=critical,keyCertSign,cRLSign', 'subjectKeyIdentifier=hash', '', '[server_ext]', 'basicConstraints=critical,CA:FALSE', 'keyUsage=critical,digitalSignature,keyEncipherment', 'extendedKeyUsage=serverAuth', 'subjectAltName=DNS:localhost,IP:127.0.0.1', 'subjectKeyIdentifier=hash', 'authorityKeyIdentifier=keyid,issuer', ''].join('\\n'), {mode:0o600})" "$pki/openssl.cnf"
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$pki/ca.key" -out "$pki/ca.crt" \
+            -subj /CN=revo-acceptance-ca -config "$pki/openssl.cnf" \
+            -extensions ca_ext -days 1 >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "$pki/server.key" -out "$pki/server.csr" \
+            -subj /CN=localhost >/dev/null 2>&1
+          openssl x509 -req -in "$pki/server.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" \
+            -CAcreateserial -out "$pki/server.crt" -days 1 -sha256 \
+            -extfile "$pki/openssl.cnf" -extensions server_ext >/dev/null 2>&1
+          sudo -n cp "$pki/ca.crt" /usr/local/share/ca-certificates/revo-acceptance-ca.crt
+          sudo -n update-ca-certificates >/dev/null
+          cat /etc/ssl/certs/ca-certificates.crt "$pki/ca.crt" >"$pki/ca-bundle.crt"
+          node -e "require('node:fs').writeFileSync(process.argv[1], 'cafile=' + process.argv[2] + '\\nstrict-ssl=true\\n', {mode:0o600})" \
+            "$RUNNER_TEMP/revo-acceptance.npmrc" "$pki/ca-bundle.crt"
+
+      - name: Start exact loopback artifact server
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          TUI_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          tui_dir="$RUNNER_TEMP/tui-artifact"
+          tui_manifest="$tui_dir/release-package-manifest.json"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$tui_manifest")"
+          node scripts/acceptance/serve-artifacts.mjs \
+            --key "$RUNNER_TEMP/revo-acceptance-pki/server.key" \
+            --certificate "$RUNNER_TEMP/revo-acceptance-pki/server.crt" \
+            --bundle-root "$RUNNER_TEMP/revo-bundle" \
+            --tui-tarball "$tui_dir/$tui_name" \
+            --tui-sha256 "$TUI_TARBALL_SHA256" \
+            >"$RUNNER_TEMP/revo-acceptance-server.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/revo-acceptance-server.pid"
+          for _attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --cacert "$RUNNER_TEMP/revo-acceptance-pki/ca-bundle.crt" \
+              "https://127.0.0.1:8443/tui/$TUI_TARBALL_SHA256/$tui_name?sha256=$TUI_TARBALL_SHA256" -o /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/revo-acceptance-server.log"
+          exit 1
+
+      - name: Prepare isolated Revo staging copy and regenerate lock
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/revo-acceptance.npmrc
+          NODE_EXTRA_CA_CERTS: ${{ runner.temp }}/revo-acceptance-pki/ca.crt
+          TUI_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          tui_dir="$RUNNER_TEMP/tui-artifact"
+          tui_manifest="$tui_dir/release-package-manifest.json"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$tui_manifest")"
+          tui_version="$(node -e "process.stdout.write(require(process.argv[1]).package.version)" "$tui_manifest")"
+          node scripts/acceptance/prepare-bundle.mjs \
+            --tui-tarball "$tui_dir/$tui_name" \
+            --tui-url "https://127.0.0.1:8443/tui/$TUI_TARBALL_SHA256/$tui_name?sha256=$TUI_TARBALL_SHA256" \
+            --expected-tui-version "$tui_version" \
+            --output "$RUNNER_TEMP/revo-staging"
+
+      - name: Install and build the isolated bundle
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/revo-acceptance.npmrc
+          NODE_EXTRA_CA_CERTS: ${{ runner.temp }}/revo-acceptance-pki/ca.crt
+          ACCEPTANCE_CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/revo-staging"
+          tui_dir="$RUNNER_TEMP/tui-artifact"
+          tui_manifest="$tui_dir/release-package-manifest.json"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$tui_manifest")"
+          node scripts/acceptance/preparation-receipt.mjs staging \
+            "$stage" "$tui_dir/$tui_name"
+          pnpm --dir "$stage" install --frozen-lockfile \
+            --store-dir "$RUNNER_TEMP/revo-staging-store" \
+            --pm-on-fail=error \
+            --config.strict-dep-builds=true \
+            --config.verify-store-integrity=true
+          node scripts/acceptance/preparation-receipt.mjs staging \
+            "$stage" "$tui_dir/$tui_name"
+          pnpm --dir "$stage" run build
+          node scripts/acceptance/preparation-receipt.mjs staging \
+            "$stage" "$tui_dir/$tui_name"
+          (
+            cd "$stage"
+            node scripts/build-release-bundle.mjs \
+              --channel "$ACCEPTANCE_CHANNEL" \
+              --origin https://127.0.0.1:8443/revo \
+              --output "$RUNNER_TEMP/revo-bundle"
+          )
+          node scripts/acceptance/preparation-receipt.mjs staging \
+            "$stage" "$tui_dir/$tui_name"
+          (cd "$RUNNER_TEMP/revo-bundle" && sha256sum -c SHA256SUMS)
+
+      - name: Create immutable acceptance handoff
+        id: metadata
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          REVO_REVISION: ${{ inputs.revo_revision }}
+          TUI_REPOSITORY: ${{ inputs.tui_repository }}
+          TUI_REVISION: ${{ inputs.tui_revision }}
+          TUI_RUN_ID: ${{ inputs.tui_run_id }}
+          TUI_RUN_ATTEMPT: ${{ inputs.tui_run_attempt }}
+          TUI_ARTIFACT_ID: ${{ inputs.tui_artifact_id }}
+          TUI_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          handoff="$RUNNER_TEMP/revo-acceptance"
+          mkdir -m 700 "$handoff"
+          cp -a "$RUNNER_TEMP/revo-bundle" "$handoff/revo-bundle"
+          tui_dir="$RUNNER_TEMP/tui-artifact"
+          tui_manifest="$tui_dir/release-package-manifest.json"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$tui_manifest")"
+          mkdir -m 700 "$handoff/tui"
+          cp "$tui_dir/$tui_name" "$handoff/tui/$tui_name"
+          cp "$tui_manifest" "$handoff/tui/release-package-manifest.json"
+          cp "$RUNNER_TEMP/tui-artifact.zip.json" "$handoff/tui-artifact.zip.json"
+          cp "$RUNNER_TEMP/revo-staging/acceptance-input.json" "$handoff/acceptance-input.json"
+          cp "$RUNNER_TEMP/revo-staging/package.json" "$handoff/prepared-package.json"
+          cp "$RUNNER_TEMP/revo-staging/pnpm-lock.yaml" "$handoff/prepared-pnpm-lock.yaml"
+          cp "$RUNNER_TEMP/revo-staging/pnpm-workspace.yaml" "$handoff/prepared-pnpm-workspace.yaml"
+          REVO_VERSION="$(node -p "require('$RUNNER_TEMP/revo-staging/package.json').version")"
+          export REVO_VERSION
+          # shellcheck disable=SC2094
+          node -e "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync(process.argv[1])); p.revo={revision:process.env.REVO_REVISION,version:process.env.REVO_VERSION,channel:process.env.CHANNEL}; p.producer={repository:process.env.TUI_REPOSITORY,revision:process.env.TUI_REVISION,runId:Number(process.env.TUI_RUN_ID),runAttempt:Number(process.env.TUI_RUN_ATTEMPT),artifactId:Number(process.env.TUI_ARTIFACT_ID)}; fs.writeFileSync(process.argv[2], JSON.stringify(p,null,2)+'\\n', {mode:0o600})" "$handoff/acceptance-input.json" "$handoff/acceptance-input.final.json"
+          mv "$handoff/acceptance-input.final.json" "$handoff/acceptance-input.json"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$handoff/tui/release-package-manifest.json")"
+          node scripts/acceptance/preparation-receipt.mjs handoff \
+            "$handoff" "$handoff/revo-bundle" "$handoff/tui/$tui_name"
+          find "$handoff" -type f ! -name SHA256SUMS -printf '%P\0' >"$RUNNER_TEMP/revo-acceptance-files"
+          (cd "$handoff" && sort -z "$RUNNER_TEMP/revo-acceptance-files" | xargs -0 sha256sum > SHA256SUMS)
+          echo "artifact_name=revo-acceptance-candidate" >>"$GITHUB_OUTPUT"
+
+      - name: Upload one immutable acceptance handoff
+        id: upload_handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: revo-acceptance-candidate
+          path: ${{ runner.temp }}/revo-acceptance
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Stop artifact server
+        if: ${{ always() }}
+        run: |
+          set +e
+          status=0
+          if [ -f "$RUNNER_TEMP/revo-acceptance-server.pid" ]; then
+            pid="$(cat "$RUNNER_TEMP/revo-acceptance-server.pid")" || status=1
+            command="$(ps -p "$pid" -o command= 2>/dev/null)"
+            case "$command" in
+              *serve-artifacts.mjs*)
+                kill "$pid" 2>/dev/null || status=1
+                for _attempt in $(seq 1 10); do
+                  if ! kill -0 "$pid" 2>/dev/null; then break; fi
+                  sleep 1
+                done
+                kill -0 "$pid" 2>/dev/null && status=1
+                ;;
+              '')
+                ;;
+              *)
+                echo 'artifact server PID does not identify the acceptance helper' >&2
+                status=1
+                ;;
+            esac
+          fi
+          printf '%s\n' "$status" >"$RUNNER_TEMP/artifact-server-cleanup.status"
+          exit "$status"
+
+      - name: Remove private acceptance CA
+        if: ${{ always() }}
+        run: |
+          set +e
+          status=0
+          sudo -n rm -f -- /usr/local/share/ca-certificates/revo-acceptance-ca.crt || status=1
+          sudo -n update-ca-certificates >/dev/null 2>&1 || status=1
+          exit "$status"
+
+  consumer:
+    name: Consumer acceptance (${{ matrix.runner }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      REVO_CHANNEL: ${{ inputs.channel }}
+      REVO_HOST: 127.0.0.1
+      REVO_PORT: '33211'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux
+            target: linux-x64
+          - runner: ubuntu-22.04-arm
+            platform: linux
+            target: linux-arm64
+          - runner: macos-15-intel
+            platform: darwin
+            target: darwin-x64
+          - runner: macos-15
+            platform: darwin
+            target: darwin-arm64
+    steps:
+      - name: Check out exact Revo revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.revo_revision }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Download exact acceptance handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/revo-acceptance
+
+      - name: Verify handoff checksums
+        run: |
+          set -euo pipefail
+          checksum() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
+          verify_checksums() {
+            root="$1"
+            test -s "$root/SHA256SUMS"
+            while read -r expected file; do
+              test -n "$expected" && test -n "$file"
+              test "$(checksum "$root/$file")" = "$expected"
+            done < "$root/SHA256SUMS"
+          }
+          verify_checksums "$RUNNER_TEMP/revo-acceptance"
+          verify_checksums "$RUNNER_TEMP/revo-acceptance/revo-bundle"
+          test -f "$RUNNER_TEMP/revo-acceptance/acceptance-input.json"
+          test -f "$RUNNER_TEMP/revo-acceptance/tui-artifact.zip.json"
+          test -f "$RUNNER_TEMP/revo-acceptance/tui/release-package-manifest.json"
+          test -f "$RUNNER_TEMP/revo-acceptance/revo-bundle/install.sh"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$RUNNER_TEMP/revo-acceptance/tui/release-package-manifest.json")"
+          node scripts/acceptance/preparation-receipt.mjs handoff \
+            "$RUNNER_TEMP/revo-acceptance" \
+            "$RUNNER_TEMP/revo-acceptance/revo-bundle" \
+            "$RUNNER_TEMP/revo-acceptance/tui/$tui_name"
+
+      - name: Verify exact handoff identity
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          REVO_REVISION: ${{ inputs.revo_revision }}
+          TUI_REPOSITORY: ${{ inputs.tui_repository }}
+          TUI_REVISION: ${{ inputs.tui_revision }}
+          TUI_RUN_ID: ${{ inputs.tui_run_id }}
+          TUI_RUN_ATTEMPT: ${{ inputs.tui_run_attempt }}
+          TUI_ARTIFACT_ID: ${{ inputs.tui_artifact_id }}
+          TUI_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+
+          const root = process.env.RUNNER_TEMP + '/revo-acceptance';
+          const handoff = JSON.parse(readFileSync(`${root}/acceptance-input.json`));
+          const channel = JSON.parse(readFileSync(`${root}/revo-bundle/channel.json`));
+          const manifest = JSON.parse(readFileSync(`${root}/tui/release-package-manifest.json`));
+          const receipt = JSON.parse(readFileSync(`${root}/tui-artifact.zip.json`));
+          const lock = handoff.lockValidation;
+          const expected = {
+            schemaVersion: 1,
+            revo: {
+              revision: process.env.REVO_REVISION,
+              channel: process.env.CHANNEL,
+              version: channel.version,
+            },
+            producer: {
+              repository: process.env.TUI_REPOSITORY,
+              revision: process.env.TUI_REVISION,
+              runId: Number(process.env.TUI_RUN_ID),
+              runAttempt: Number(process.env.TUI_RUN_ATTEMPT),
+              artifactId: Number(process.env.TUI_ARTIFACT_ID),
+            },
+          };
+          if (handoff.schemaVersion !== expected.schemaVersion) throw new Error('handoff schema mismatch');
+          if (lock?.policy !== 'revo-tui-lock-override-v1') throw new Error('lock validation handoff missing');
+          if (lock.dependency !== '@revisium/revo-tui' || lock.url !== handoff.tui?.url || lock.version !== handoff.tui?.version || lock.tarballSha256 !== handoff.tui?.tarballSha256 || lock.integrity !== handoff.tui?.integrity) throw new Error('lock validation handoff binding mismatch');
+          if (!/^[a-f0-9]{64}$/.test(lock.sourceLockSha256) || !/^[a-f0-9]{64}$/.test(lock.stagingLockSha256)) throw new Error('lock validation handoff hashes invalid');
+          for (const [key, value] of Object.entries(expected.revo)) {
+            if (handoff.revo?.[key] !== value) throw new Error(`Revo handoff mismatch: ${key}`);
+          }
+          for (const [key, value] of Object.entries(expected.producer)) {
+            if (handoff.producer?.[key] !== value) throw new Error(`TUI producer handoff mismatch: ${key}`);
+          }
+          if (handoff.tui?.tarballSha256 !== process.env.TUI_TARBALL_SHA256) throw new Error('TUI digest mismatch');
+          if (handoff.tui?.version !== manifest.package?.version) throw new Error('TUI version mismatch');
+          if (manifest.package?.sha256 !== process.env.TUI_TARBALL_SHA256) throw new Error('TUI manifest digest mismatch');
+          if (receipt.repository !== process.env.TUI_REPOSITORY || receipt.revision !== process.env.TUI_REVISION) throw new Error('TUI receipt identity mismatch');
+          if (receipt.runId !== Number(process.env.TUI_RUN_ID) || receipt.runAttempt !== Number(process.env.TUI_RUN_ATTEMPT) || receipt.artifactId !== Number(process.env.TUI_ARTIFACT_ID)) throw new Error('TUI receipt run mismatch');
+          if (typeof receipt.artifactDigest !== 'string' || typeof receipt.zipSha256 !== 'string') throw new Error('TUI receipt digest missing');
+          NODE
+
+      - name: Trust private acceptance CA and start exact artifact server
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TUI_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+        run: |
+          set -euo pipefail
+          pki="$RUNNER_TEMP/revo-acceptance-pki"
+          umask 077
+          mkdir -m 700 "$pki"
+          node -e "require('node:fs').writeFileSync(process.argv[1], ['[ca_ext]', 'basicConstraints=critical,CA:TRUE,pathlen:0', 'keyUsage=critical,keyCertSign,cRLSign', 'subjectKeyIdentifier=hash', '', '[server_ext]', 'basicConstraints=critical,CA:FALSE', 'keyUsage=critical,digitalSignature,keyEncipherment', 'extendedKeyUsage=serverAuth', 'subjectAltName=DNS:localhost,IP:127.0.0.1', 'subjectKeyIdentifier=hash', 'authorityKeyIdentifier=keyid,issuer', ''].join('\\n'), {mode:0o600})" "$pki/openssl.cnf"
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$pki/ca.key" -out "$pki/ca.crt" \
+            -subj /CN=revo-acceptance-ca -config "$pki/openssl.cnf" \
+            -extensions ca_ext -days 1 >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "$pki/server.key" -out "$pki/server.csr" \
+            -subj /CN=localhost >/dev/null 2>&1
+          openssl x509 -req -in "$pki/server.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" \
+            -CAcreateserial -out "$pki/server.crt" -days 1 -sha256 \
+            -extfile "$pki/openssl.cnf" -extensions server_ext >/dev/null 2>&1
+          case "$PLATFORM" in
+            linux)
+              sudo -n cp "$pki/ca.crt" /usr/local/share/ca-certificates/revo-acceptance-ca.crt
+              sudo -n update-ca-certificates >/dev/null
+              cat /etc/ssl/certs/ca-certificates.crt "$pki/ca.crt" >"$pki/ca-bundle.crt"
+              ;;
+            darwin)
+              sudo -n /usr/bin/security add-trusted-cert -d -r trustRoot \
+                -k /Library/Keychains/System.keychain "$pki/ca.crt"
+              /usr/bin/security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain >"$pki/ca-bundle.crt"
+              cat "$pki/ca.crt" >>"$pki/ca-bundle.crt"
+              ;;
+            *)
+              echo "unsupported consumer platform: $PLATFORM" >&2
+              exit 1
+              ;;
+          esac
+          node -e "require('node:fs').writeFileSync(process.argv[1], 'cafile=' + process.argv[2] + '\\nstrict-ssl=true\\n', {mode:0o600})" \
+            "$RUNNER_TEMP/revo-acceptance.npmrc" "$pki/ca-bundle.crt"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$RUNNER_TEMP/revo-acceptance/tui/release-package-manifest.json")"
+          tui="$RUNNER_TEMP/revo-acceptance/tui/$tui_name"
+          actual_tui_sha256="$(node -e "const fs=require('node:fs'); const crypto=require('node:crypto'); process.stdout.write(crypto.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex'))" "$tui")"
+          test "$actual_tui_sha256" = "$TUI_TARBALL_SHA256"
+          node scripts/acceptance/serve-artifacts.mjs \
+            --key "$pki/server.key" \
+            --certificate "$pki/server.crt" \
+            --bundle-root "$RUNNER_TEMP/revo-acceptance/revo-bundle" \
+            --tui-tarball "$tui" \
+            --tui-sha256 "$TUI_TARBALL_SHA256" \
+            >"$RUNNER_TEMP/revo-acceptance-server.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/revo-acceptance-server.pid"
+          for _attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --cacert "$pki/ca-bundle.crt" \
+              "https://127.0.0.1:8443/revo/channels/${{ inputs.channel }}.json" -o /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/revo-acceptance-server.log"
+          exit 1
+
+      - name: Install through the real pipe and run lifecycle/API smoke
+        id: lifecycle
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/revo-acceptance.npmrc
+          NODE_EXTRA_CA_CERTS: ${{ runner.temp }}/revo-acceptance-pki/ca.crt
+          REVO_INSTALL_ROOT: ${{ runner.temp }}/revo-install
+          REVO_DATA_DIR: ${{ runner.temp }}/revo-data
+          TUI_TARBALL_SHA256: ${{ inputs.tui_tarball_sha256 }}
+          HOME: ${{ runner.temp }}/revo-home
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -m 700 "$HOME" "$REVO_INSTALL_ROOT" "$REVO_DATA_DIR"
+          bundle="$RUNNER_TEMP/revo-acceptance/revo-bundle"
+          tui_name="$(node -e "process.stdout.write(require(process.argv[1]).package.filename)" "$RUNNER_TEMP/revo-acceptance/tui/release-package-manifest.json")"
+          tui_url="$(node -e "process.stdout.write(require(process.argv[1]).dependencies['@revisium/revo-tui'])" "$bundle/package.json")"
+          expected_tui_url="https://127.0.0.1:8443/tui/$TUI_TARBALL_SHA256/$tui_name?sha256=$TUI_TARBALL_SHA256"
+          test "$tui_url" = "$expected_tui_url"
+          curl --fail --silent --show-error --cacert "$RUNNER_TEMP/revo-acceptance-pki/ca-bundle.crt" \
+            "$tui_url" -o "$RUNNER_TEMP/tui-preflight.tgz"
+          actual_tui_sha256="$(node -e "const fs=require('node:fs'); const crypto=require('node:crypto'); process.stdout.write(crypto.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex'))" "$RUNNER_TEMP/tui-preflight.tgz")"
+          test "$actual_tui_sha256" = "$TUI_TARBALL_SHA256"
+          : >"$RUNNER_TEMP/installation-started"
+          set +e
+          cat "$bundle/install.sh" | sh 2>&1 | tee "$RUNNER_TEMP/install.log"
+          pipe_status=("${PIPESTATUS[@]}")
+          set -e
+          test "${pipe_status[0]}" -eq 0
+          install_status="${pipe_status[1]}"
+          test "${pipe_status[2]}" -eq 0
+          test "$install_status" -eq 0
+          channel='${{ inputs.channel }}'
+          release_version="$(node -e "process.stdout.write(require(process.argv[1]).version)" "$bundle/channel.json")"
+          node_version="$(node -e "process.stdout.write(require(process.argv[1]).toolchain.node)" "$bundle/manifest.json")"
+          target="$(node -p "process.platform + '-' + process.arch")"
+          test "$target" = '${{ matrix.target }}'
+          node_root="$REVO_INSTALL_ROOT/$channel/node/$node_version/$target"
+          package_root="$REVO_INSTALL_ROOT/$channel/package/$release_version/$target"
+          test -x "$node_root/bin/node"
+          test -f "$package_root/dist/bin/revo.js"
+          revo_launcher="$REVO_INSTALL_ROOT/$channel/current/revo"
+          test -x "$revo_launcher"
+          "$revo_launcher" --version
+          "$revo_launcher" version
+          "$revo_launcher" doctor
+          origin="http://${REVO_HOST}:${REVO_PORT}"
+          start_output="$("$revo_launcher" server start 2>&1)"
+          printf '%s\n' "$start_output" | tee "$RUNNER_TEMP/server-start.log"
+          curl --fail --retry 30 --retry-connrefused "$origin/" -o "$RUNNER_TEMP/admin.html"
+          grep -Eq 'Revisium|Revo' "$RUNNER_TEMP/admin.html"
+          curl --fail --retry 30 --retry-connrefused \
+            -H 'content-type: application/json' \
+            --data '{"query":"{ __typename }"}' \
+            "$origin/graphql" -o "$RUNNER_TEMP/graphql.json"
+          node -e "const value=require(process.argv[1]); if (value.errors || value.data?.__typename !== 'Query') process.exit(1)" "$RUNNER_TEMP/graphql.json"
+          "$revo_launcher" server status
+          "$revo_launcher" server stop
+          "$revo_launcher" server status
+          remaining_postmaster=''
+          if ! remaining_postmaster="$(find "$REVO_DATA_DIR" "$REVO_INSTALL_ROOT" -name postmaster.pid -print -quit 2>/dev/null)"; then
+            echo 'could not inspect PostgreSQL postmaster.pid after stop' >&2
+            exit 1
+          fi
+          test -z "$remaining_postmaster"
+          restart_output="$("$revo_launcher" server start 2>&1)"
+          printf '%s\n' "$restart_output" | tee -a "$RUNNER_TEMP/server-start.log"
+          curl --fail --retry 30 --retry-connrefused "$origin/" -o "$RUNNER_TEMP/admin-restart.html"
+          curl --fail --retry 30 --retry-connrefused \
+            -H 'content-type: application/json' \
+            --data '{"query":"{ __typename }"}' \
+            "$origin/graphql" -o "$RUNNER_TEMP/graphql-restart.json"
+          node -e "const value=require(process.argv[1]); if (value.errors || value.data?.__typename !== 'Query') process.exit(1)" "$RUNNER_TEMP/graphql-restart.json"
+          printf 'REVO_ACCEPTANCE_API_URL=%s/graphql\n' "$origin" >> "$GITHUB_ENV"
+
+      - name: Run standalone and wrapper TUI PTY acceptance
+        id: tui_acceptance
+        env:
+          REVO_INSTALL_ROOT: ${{ runner.temp }}/revo-install
+          REVO_DATA_DIR: ${{ runner.temp }}/revo-data
+          HOME: ${{ runner.temp }}/revo-home
+        run: |
+          set -euo pipefail
+          channel='${{ inputs.channel }}'
+          bundle="$RUNNER_TEMP/revo-acceptance/revo-bundle"
+          release_version="$(node -e "process.stdout.write(require(process.argv[1]).version)" "$bundle/channel.json")"
+          node_version="$(node -e "process.stdout.write(require(process.argv[1]).toolchain.node)" "$bundle/manifest.json")"
+          target="$(node -p "process.platform + '-' + process.arch")"
+          node_root="$REVO_INSTALL_ROOT/$channel/node/$node_version/$target"
+          package_root="$REVO_INSTALL_ROOT/$channel/package/$release_version/$target"
+          tui="$package_root/node_modules/@revisium/revo-tui/bin/revo-tui.js"
+          revo_launcher="$REVO_INSTALL_ROOT/$channel/current/revo"
+          test -x "$revo_launcher"
+          data="$REVO_DATA_DIR/tui"
+          api_url="${REVO_ACCEPTANCE_API_URL:?restart API URL was not exported}"
+          dialogue_title="release-acceptance-${GITHUB_RUN_ID:-local}-${{ matrix.target }}"
+          DIALOGUE_API_URL="$api_url" DIALOGUE_TITLE="$dialogue_title" node --input-type=module <<'NODE'
+          const response = await fetch(process.env.DIALOGUE_API_URL, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              query: 'mutation CreateDialogue($input: CreateDialogueInput!) { createDialogue(input: $input) { title } }',
+              variables: {
+                input: {
+                  title: process.env.DIALOGUE_TITLE,
+                  agentId: 'release.acceptance',
+                  agentVersion: '1.0.0',
+                  agentInstallationId: process.env.DIALOGUE_TITLE,
+                },
+              },
+            }),
+          });
+          const value = await response.json();
+          if (!response.ok || value.errors || value.data?.createDialogue?.title !== process.env.DIALOGUE_TITLE) {
+            throw new Error('dialogue creation failed: ' + JSON.stringify(value));
+          }
+          NODE
+          mkdir -m 700 "$RUNNER_TEMP/pty-evidence"
+          for scenario in connected recovery contention; do
+            python3 scripts/acceptance/pty-harness.py \
+              --executable "$tui" \
+              --node-executable "$node_root/bin/node" \
+              --api-url "$api_url" \
+              --data-dir "$data" \
+              --evidence-dir "$RUNNER_TEMP/pty-evidence/standalone-$scenario" \
+              --scenario "$scenario" \
+              --expect initialized \
+              --expect 'dialogue services' \
+              --expect "$dialogue_title" \
+              --label "${{ matrix.runner }}-standalone-$scenario"
+          done
+          python3 scripts/acceptance/pty-harness.py \
+            --executable "$revo_launcher" \
+            --api-url "$api_url" \
+            --data-dir "$data" \
+            --evidence-dir "$RUNNER_TEMP/pty-evidence/wrapper-connected" \
+            --scenario connected \
+            --expect initialized \
+            --expect 'dialogue services' \
+            --expect "$dialogue_title" \
+            --label "${{ matrix.runner }}-wrapper" \
+            -- tui
+
+      - name: Stop Revo and confirm owned runtime cleanup
+        id: runtime_cleanup
+        if: ${{ always() }}
+        env:
+          REVO_INSTALL_ROOT: ${{ runner.temp }}/revo-install
+          REVO_DATA_DIR: ${{ runner.temp }}/revo-data
+          HOME: ${{ runner.temp }}/revo-home
+        run: |
+          set +e
+          status=0
+          launcher="$REVO_INSTALL_ROOT/${{ inputs.channel }}/current/revo"
+          if [ -x "$launcher" ]; then
+            "$launcher" server stop >"$RUNNER_TEMP/server-stop.log" 2>&1
+            stop_status=$?
+            cat "$RUNNER_TEMP/server-stop.log" | tee -a "$RUNNER_TEMP/server-start.log"
+            tee_status=$?
+            test "$stop_status" -eq 0 || status=1
+            test "$tee_status" -eq 0 || status=1
+            status_output="$("$launcher" server status 2>&1)"
+            status_code=$?
+            printf '%s\n' "$status_output" | tee -a "$RUNNER_TEMP/server-start.log"
+            test "$status_code" -eq 0 || status=1
+            printf '%s\n' "$status_output" | grep -q 'Server is stopped\.' || status=1
+          elif [ -f "$RUNNER_TEMP/installation-started" ] && [ -d "$REVO_INSTALL_ROOT" ]; then
+            echo 'installed root exists but launcher is unavailable; cleanup is unverified' >&2
+            status=1
+          fi
+          if [ -f "$RUNNER_TEMP/installation-started" ]; then
+            remaining_postmaster=''
+            if ! remaining_postmaster="$(find "$REVO_DATA_DIR" "$REVO_INSTALL_ROOT" -name postmaster.pid -print -quit 2>/dev/null)"; then
+              echo 'could not inspect PostgreSQL postmaster.pid during cleanup' >&2
+              status=1
+            elif [ -n "$remaining_postmaster" ]; then
+              echo 'owned PostgreSQL postmaster.pid remains after cleanup' >&2
+              status=1
+            fi
+          fi
+          exit "$status"
+
+      - name: Stop artifact server
+        if: ${{ always() }}
+        run: |
+          set +e
+          status=0
+          if [ -f "$RUNNER_TEMP/revo-acceptance-server.pid" ]; then
+            pid="$(cat "$RUNNER_TEMP/revo-acceptance-server.pid")" || status=1
+            command="$(ps -p "$pid" -o command= 2>/dev/null)"
+            case "$command" in
+              *serve-artifacts.mjs*)
+                kill "$pid" 2>/dev/null || status=1
+                for _attempt in $(seq 1 10); do
+                  if ! kill -0 "$pid" 2>/dev/null; then break; fi
+                  sleep 1
+                done
+                kill -0 "$pid" 2>/dev/null && status=1
+                ;;
+              '')
+                ;;
+              *)
+                echo 'artifact server PID does not identify the acceptance helper' >&2
+                status=1
+                ;;
+            esac
+          fi
+          printf '%s\n' "$status" >"$RUNNER_TEMP/artifact-server-cleanup.status"
+          exit "$status"
+
+      - name: Remove private acceptance CA
+        if: ${{ always() }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set +e
+          pki="$RUNNER_TEMP/revo-acceptance-pki"
+          status=0
+          if [ -f "$pki/ca.crt" ]; then
+            case "$PLATFORM" in
+              linux)
+                sudo -n rm -f -- /usr/local/share/ca-certificates/revo-acceptance-ca.crt || status=1
+                sudo -n update-ca-certificates >/dev/null 2>&1 || status=1
+                ;;
+              darwin)
+                sudo -n /usr/bin/security remove-trusted-cert -d "$pki/ca.crt" || status=1
+                ca_sha256="$(openssl x509 -in "$pki/ca.crt" -noout -fingerprint -sha256 | sed 's/^[^=]*=//; s/://g')"
+                if ! printf '%s' "$ca_sha256" | /usr/bin/grep -Eq '^[0-9A-Fa-f]{64}$'; then
+                  echo 'could not derive the CA certificate fingerprint' >&2
+                  status=1
+                else
+                  sudo -n /usr/bin/security delete-certificate -Z "$ca_sha256" \
+                    /Library/Keychains/System.keychain || status=1
+                  certificate_output="$(/usr/bin/security find-certificate -a -Z /Library/Keychains/System.keychain 2>&1)"
+                  certificate_status=$?
+                  if [ "$certificate_status" -ne 0 ]; then
+                    echo 'could not inspect the macOS system keychain after CA cleanup' >&2
+                    printf '%s\n' "$certificate_output" >&2
+                    status=1
+                  elif /usr/bin/grep -Fq -- "$ca_sha256" <<<"$certificate_output"; then
+                    echo 'acceptance CA remains trusted after cleanup' >&2
+                    status=1
+                  fi
+                fi
+                ;;
+              *)
+                echo "unsupported consumer platform: $PLATFORM" >&2
+                status=1
+                ;;
+            esac
+          fi
+          printf '%s\n' "$status" >"$RUNNER_TEMP/ca-cleanup.status"
+          exit "$status"
+
+      - name: Upload bounded diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: revo-acceptance-diagnostics-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/install.log
+            ${{ runner.temp }}/server-start.log
+            ${{ runner.temp }}/server-stop.log
+            ${{ runner.temp }}/revo-acceptance-server.log
+            ${{ runner.temp }}/pty-evidence
+            ${{ runner.temp }}/artifact-server-cleanup.status
+            ${{ runner.temp }}/ca-cleanup.status
+          if-no-files-found: ignore
+          retention-days: 7

@@ -245,13 +245,34 @@ export class StartupProgressScenario {
     }
     const accepted = held.progress.start('runtime-extract');
     await journal.entered;
+    const terminal = held.progress.fail('server-start', { code: 'FIXTURE_START_FAILED' });
     const closing = held.close();
-    const late = await Promise.allSettled([held.progress.progress('runtime-extract')]);
-    const busy = await new PublishedControlService().open(fixture);
-    journal.release();
-    await Promise.all([accepted, closing]);
+    let late: string;
+    let busy: Awaited<ReturnType<PublishedControlService['open']>>;
+    try {
+      late = await Promise.race([
+        Promise.allSettled([held.progress.progress('runtime-extract')]).then(
+          (results) => results[0]?.status ?? 'missing',
+        ),
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
+      ]);
+      busy = await new PublishedControlService().open(fixture);
+    } finally {
+      journal.release();
+      await Promise.allSettled([accepted, terminal, closing]);
+    }
+    const persisted = await new StartupProgressDiscoveryService().read(fixture.dataDir, {
+      operationId: FIRST,
+      sequence: 0,
+    });
     const replacement = await this.open(fixture, SECOND);
-    return { late: late[0]?.status, busy: busy.kind, replacement: replacement.kind };
+    return {
+      late,
+      terminalPersisted:
+        persisted.kind === 'events' && persisted.events.at(-1)?.status === 'failed',
+      busy: busy.kind,
+      replacement: replacement.kind,
+    };
   }
 
   async cleanup() {

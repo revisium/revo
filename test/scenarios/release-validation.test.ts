@@ -57,7 +57,7 @@ describe('installation release contract', () => {
     expect(fixture.manifest.toolchain.pnpmArchives).toHaveLength(6);
     expect(fixture.manifest.toolchain.pnpmArchives[0]?.url).toContain('/v13.0.2/');
     expect(fixture.manifest.toolchain.pnpmArchives.map(({ sha256 }) => sha256)).not.toContain(
-      '432fd151c10477630cf5c9f41209c2a7b75ac6dce7b2533a459519daf8954c52',
+      '776b26182ea825d5846dc236d29773cf4b7568b7f0abe145c328a342284c8b75',
     );
     expect(validateInstallationReleaseManifest(fixture.manifest, fixture.policy)).toEqual(
       fixture.manifest,
@@ -82,8 +82,8 @@ describe('installation release contract', () => {
   });
 
   it.each([
-    'https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-x64.tar.gz?x=1',
-    'https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-x64.zip',
+    'https://github.com/pnpm/pnpm/releases/download/v12.5.1/pnpm-linux-x64.tar.gz?x=1',
+    'https://github.com/pnpm/pnpm/releases/download/v12.5.1/pnpm-linux-x64.zip',
     'https://foreign.example/pnpm-linux-x64.tar.gz',
   ])('rejects a noncanonical v3 pnpm URL: %s', (url) => {
     const fixture = pnpmReleaseManifestFixture();

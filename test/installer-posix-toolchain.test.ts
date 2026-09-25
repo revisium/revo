@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
 import {
+  chmod,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,7 +13,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve as resolvePath } from 'node:path';
 import { runInNewContext } from 'node:vm';
 
 import { beforeAll, describe, expect, it, vi } from 'vitest';
@@ -20,9 +22,12 @@ import { readActivation, type ActivationReadResult } from '../src/installation/a
 import { ServerOwnershipService } from '../src/processes/server-ownership.service.js';
 import { parseLifecycleDocument } from '../src/server-logs/document.js';
 import { ServerLifecycleStore, serverLifecyclePath } from '../src/server-logs/store.service.js';
+import { activationScenario } from './support/installation/activation-scenario.js';
 import {
   captureIntelSnapshot as captureIntelSnapshotUnsafe,
   cleanupPortableToolchain,
+  collectInstallAttemptDiagnostics,
+  collectInitialInstallFailureDiagnostics,
   intelCollectorsQuiescent,
   installerData,
   nodeData,
@@ -581,7 +586,9 @@ const captureIntelSnapshot = async (...args: Parameters<typeof captureIntelSnaps
   }
 };
 
-it.each(['stable', 'alpha'] as const)(
+it
+  .skipIf(process.env.REVO_RUN_REAL_INSTALLER_INTEGRATION !== '1')
+  .each(['stable', 'alpha'] as const)(
   'real %s activation mode packs the compiled helper',
   async (channel) => {
     const subject = await portableToolchain(
@@ -654,254 +661,865 @@ function formatInstallerOutcome(
     : 'exit-not-observed';
 }
 
+const recoveryActivationSummary = async (channelRoot: string) => {
+  try {
+    const activation = await readActivation(channelRoot);
+    if (activation.status !== 'valid') {
+      return { status: activation.status };
+    }
+    return {
+      status: 'valid' as const,
+      generationId: activation.record.generationId,
+      releaseVersion: activation.record.release.version,
+    };
+  } catch {
+    return {
+      status: 'read-error' as const,
+    };
+  }
+};
+
+const recoveryPostgresObserver = async (path: string | undefined, fixtureRoot: string) => {
+  if (path === undefined) {
+    return 'observer-not-requested';
+  }
+  try {
+    const text = await readFile(path, 'utf8');
+    return text
+      .replaceAll(fixtureRoot, '<fixture>')
+      .replace(/\b(postgres(?:ql)?:\/\/)[^\s/@]+@/giu, '$1[redacted]@')
+      .replace(
+        /\b(password|secret|token|authorization|cookie)(\s*[:=]\s*)(["']?)[^\s,;"']+/giu,
+        '$1$2[redacted]',
+      )
+      .slice(-16 * 1024);
+  } catch {
+    return 'observer-unavailable';
+  }
+};
+
+const boundedProcessSnapshot = (command: string, args: readonly string[]) =>
+  new Promise<{ readonly status: string; readonly output: string }>((resolve) => {
+    let output = '';
+    let settled = false;
+    const child = spawn(command, [...args], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const finish = (status: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status, output });
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      finish('timeout');
+    }, 2000);
+    child.stdout?.on('data', (chunk: Buffer | string) => {
+      if (Buffer.byteLength(output) >= 64 * 1024) {
+        return;
+      }
+      const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
+      const remaining = 64 * 1024 - Buffer.byteLength(output);
+      output += text.slice(-remaining);
+    });
+    child.once('error', () => finish('error'));
+    child.once('close', (code, signal) =>
+      finish(
+        signal === null && code === 0 ? 'captured' : `exit-${code ?? 'null'}-${signal ?? 'none'}`,
+      ),
+    );
+  });
+
+const recoveryRuntimeSnapshot = async (input: {
+  readonly phase: string;
+  readonly dataDir: string;
+  readonly redactionRoots: readonly string[];
+  readonly status?: string;
+}): Promise<void> => {
+  const clusterDir = join(input.dataDir, 'postgres');
+  let postmaster: Record<string, unknown>;
+  try {
+    const path = join(clusterDir, 'postmaster.pid');
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      postmaster = { status: 'unsafe' };
+    } else {
+      const lines = (await readFile(path, 'utf8')).split('\n');
+      postmaster = {
+        status: 'captured',
+        mode: (metadata.mode & 0o777).toString(8),
+        pid: /^\d+$/u.test(lines[0] ?? '') ? lines[0] : 'invalid',
+        startTime: lines[2] ?? 'missing',
+        port: /^\d+$/u.test(lines[3] ?? '') ? lines[3] : 'invalid',
+        sharedMemoryKey: /^\d+$/u.test(lines[6] ?? '') ? lines[6] : 'invalid',
+        sharedMemoryId: /^\d+$/u.test(lines[7] ?? '') ? lines[7] : 'invalid',
+      };
+    }
+  } catch {
+    postmaster = { status: 'missing-or-unavailable' };
+  }
+  const version = await readFile(join(clusterDir, 'PG_VERSION'), 'utf8')
+    .then((value) => value.trim().slice(0, 32))
+    .catch(() => 'missing-or-unavailable');
+  const processes = await boundedProcessSnapshot('ps', [
+    '-eo',
+    'pid=,ppid=,pgid=,sid=,etimes=,stat=,comm=,args=',
+  ]);
+  const roots = [...input.redactionRoots].sort((left, right) => right.length - left.length);
+  const relevantProcesses = processes.output
+    .split('\n')
+    .filter((line) => /postgres|revo-server|revo-core/iu.test(line))
+    .map((line) => roots.reduce((value, root) => value.replaceAll(root, '<fixture>'), line))
+    .slice(0, 64);
+  console.error(
+    `REVO_RECOVERY_SNAPSHOT ${JSON.stringify({
+      phase: input.phase,
+      status: input.status ?? 'not-read',
+      cluster: roots.reduce((value, root) => value.replaceAll(root, '<fixture>'), clusterDir),
+      pgVersion: version,
+      postmaster,
+      processListing: { status: processes.status, entries: relevantProcesses },
+    })}`,
+  );
+};
+
+async function reportRecoveryAttempt(input: {
+  readonly phase: string;
+  readonly fixtureRoot: string;
+  readonly channelRoot: string;
+  readonly attemptName?: string;
+  readonly postgresObserverPath?: string;
+  readonly expectedCandidateVersion: string;
+  readonly expectedGenerationId: string;
+  readonly installer: {
+    readonly finishCode: number;
+    readonly outcome: () =>
+      | { readonly code: number | null; readonly signal: NodeJS.Signals | null }
+      | undefined;
+    readonly stdoutTail: () => string;
+    readonly stderrTail: () => string;
+  };
+}): Promise<void> {
+  let diagnostics = 'collection-not-run';
+  try {
+    diagnostics = input.attemptName
+      ? await collectInstallAttemptDiagnostics(
+          input.fixtureRoot,
+          input.channelRoot,
+          input.attemptName,
+        )
+      : await collectInitialInstallFailureDiagnostics(input.fixtureRoot, input.channelRoot);
+  } catch {
+    diagnostics = 'collection-failed';
+  }
+  console.error(
+    `REVO_RECOVERY_DIAGNOSTIC ${JSON.stringify({
+      phase: input.phase,
+      finishCode: input.installer.finishCode,
+      outcome: formatInstallerOutcome(input.installer.outcome()),
+      expectedCandidateVersion: input.expectedCandidateVersion,
+      expectedGenerationId: input.expectedGenerationId,
+      attemptName: input.attemptName ?? 'attempt-unresolved',
+      activation: await recoveryActivationSummary(input.channelRoot),
+      postgresObserver: await recoveryPostgresObserver(
+        input.postgresObserverPath,
+        input.fixtureRoot,
+      ),
+      stdoutTail: input.installer.stdoutTail(),
+      stderrTail: input.installer.stderrTail(),
+      installDiagnostics: diagnostics,
+    })}`,
+  );
+}
+
+describe('initial installation failure diagnostics', () => {
+  async function fixture() {
+    const root = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostics-'));
+    const channelRoot = join(root, 'state', 'stable');
+    const scratch = join(channelRoot, '.attempt.Abc123', 'runtime', 'scratch');
+    const activation = join(scratch, '.activation-request-Def456');
+    await mkdir(activation, { recursive: true, mode: 0o700 });
+    return { root, channelRoot, scratch, activation };
+  }
+
+  it('reads only the three fixed logs and redacts secrets, paths, ANSI, and workflow commands', async () => {
+    const subject = await fixture();
+    try {
+      await writeFile(
+        join(subject.scratch, 'install-session.log'),
+        `activation failed password=super-secret ${subject.root}\n`,
+      );
+      await writeFile(join(subject.scratch, 'server-start.log'), 'server did not start\n');
+      await writeFile(
+        join(subject.activation, 'result.log'),
+        '\u001b[31m::error::activation helper failed token=other-secret\u001b[0m\n',
+      );
+      await writeFile(join(subject.scratch, 'unlisted-secret.log'), 'must never appear\n');
+
+      const output = await collectInitialInstallFailureDiagnostics(
+        subject.root,
+        subject.channelRoot,
+      );
+
+      expect(output).toContain('install-session.log status=captured');
+      expect(output).toContain('server-start.log status=captured');
+      expect(output).toContain('activation-result.log status=captured');
+      expect(output).toContain('activation helper failed');
+      expect(output).not.toContain('super-secret');
+      expect(output).not.toContain('other-secret');
+      expect(output).not.toContain(subject.root);
+      expect(output).not.toContain('unlisted-secret');
+      expect(output).not.toContain('\u001b');
+      expect(
+        output
+          .split('\n')
+          .filter(Boolean)
+          .every((line) => line.startsWith('POSIX_INSTALL_DIAGNOSTIC ')),
+      ).toBe(true);
+      expect(output.split('\n').some((line) => line.startsWith('::'))).toBe(false);
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds each file tail and the total diagnostic output', async () => {
+    const subject = await fixture();
+    try {
+      const large = `${'x'.repeat(10_000)}\nfinal-evidence-line\n`;
+      await writeFile(join(subject.scratch, 'install-session.log'), large);
+      await writeFile(join(subject.scratch, 'server-start.log'), large);
+      await writeFile(join(subject.activation, 'result.log'), large);
+
+      const output = await collectInitialInstallFailureDiagnostics(
+        subject.root,
+        subject.channelRoot,
+      );
+
+      expect(Buffer.byteLength(output)).toBeLessThanOrEqual(16 * 1024);
+      expect(output).toContain(`sizeBytes=${Buffer.byteLength(large, 'utf8')} truncated=true`);
+      expect(output).toContain('final-evidence-line');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports missing and ambiguous attempts or activation request directories without guessing', async () => {
+    const missing = await mkdtemp(join(tmpdir(), 'revo-initial-diagnostics-missing-'));
+    const missingChannel = join(missing, 'state', 'stable');
+    await mkdir(missingChannel, { recursive: true, mode: 0o700 });
+    try {
+      const missingOutput = await collectInitialInstallFailureDiagnostics(missing, missingChannel);
+      expect(missingOutput).toContain('attempts=missing');
+
+      const logsMissing = await fixture();
+      try {
+        const output = await collectInitialInstallFailureDiagnostics(
+          logsMissing.root,
+          logsMissing.channelRoot,
+        );
+        expect(output).toContain('attempts=1 activationRequest=captured');
+        expect(output).toContain('install-session.log status=missing');
+        expect(output).toContain('server-start.log status=missing');
+        expect(output).toContain('activation-result.log status=missing');
+        expect(output).not.toContain('reason=collector-error');
+      } finally {
+        await rm(logsMissing.root, { recursive: true, force: true });
+      }
+
+      const subject = await fixture();
+      try {
+        await mkdir(join(subject.channelRoot, '.attempt.Other789', 'runtime', 'scratch'), {
+          recursive: true,
+          mode: 0o700,
+        });
+        expect(
+          await collectInitialInstallFailureDiagnostics(subject.root, subject.channelRoot),
+        ).toContain('attempts=ambiguous');
+      } finally {
+        await rm(subject.root, { recursive: true, force: true });
+      }
+
+      const activationAmbiguous = await fixture();
+      try {
+        await mkdir(join(activationAmbiguous.scratch, '.activation-request-Other789'));
+        const output = await collectInitialInstallFailureDiagnostics(
+          activationAmbiguous.root,
+          activationAmbiguous.channelRoot,
+        );
+        expect(output).toContain('activationRequest=ambiguous');
+        expect(output).toContain('activation-result.log status=ambiguous');
+      } finally {
+        await rm(activationAmbiguous.root, { recursive: true, force: true });
+      }
+    } finally {
+      await rm(missing, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects symlink log files and symlink parent directories', async () => {
+    const subject = await fixture();
+    const outside = join(subject.root, 'outside.log');
+    try {
+      await writeFile(outside, 'outside-secret\n');
+      await symlink(outside, join(subject.scratch, 'install-session.log'));
+      await writeFile(join(subject.scratch, 'server-start.log'), 'safe\n');
+      await writeFile(join(subject.activation, 'result.log'), 'safe\n');
+
+      const output = await collectInitialInstallFailureDiagnostics(
+        subject.root,
+        subject.channelRoot,
+      );
+      expect(output).toContain('install-session.log status=unsafe');
+      expect(output).not.toContain('outside-secret');
+
+      await rm(join(subject.scratch, '.activation-request-Def456'), { recursive: true });
+      await rm(join(subject.scratch, 'server-start.log'));
+      await rm(join(subject.scratch, 'install-session.log'));
+      await rm(join(subject.scratch, '.activation-request-Def456'), { force: true });
+      const externalScratch = join(subject.root, 'external-scratch');
+      await mkdir(externalScratch);
+      await writeFile(join(externalScratch, 'install-session.log'), 'outside-secret\n');
+      await rm(join(subject.channelRoot, '.attempt.Abc123', 'runtime'), { recursive: true });
+      await symlink(externalScratch, join(subject.channelRoot, '.attempt.Abc123', 'runtime'));
+
+      const parentOutput = await collectInitialInstallFailureDiagnostics(
+        subject.root,
+        subject.channelRoot,
+      );
+      expect(parentOutput).toContain('attempts=1');
+      expect(parentOutput).toContain('install-session.log status=unsafe');
+      expect(parentOutput).not.toContain('outside-secret');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps prefixed multibyte lines whole within the aggregate output cap', async () => {
+    const subject = await fixture();
+    try {
+      const dense = 'é\n'.repeat(4096);
+      await writeFile(join(subject.scratch, 'install-session.log'), dense);
+      await writeFile(join(subject.scratch, 'server-start.log'), dense);
+      await writeFile(join(subject.activation, 'result.log'), dense);
+
+      const output = await collectInitialInstallFailureDiagnostics(
+        subject.root,
+        subject.channelRoot,
+      );
+      const lines = output.split('\n').filter(Boolean);
+
+      expect(Buffer.byteLength(output)).toBeLessThanOrEqual(16 * 1024);
+      expect(output).toContain('status=output-truncated');
+      expect(output).toContain(' | é');
+      expect(lines.every((line) => line.startsWith('POSIX_INSTALL_DIAGNOSTIC '))).toBe(true);
+      expect(output).not.toContain('\uFFFD');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('strips controls before secret redaction so escape sequences cannot split credentials', async () => {
+    const subject = await fixture();
+    try {
+      await writeFile(
+        join(subject.scratch, 'install-session.log'),
+        'pass\u001b[31mword=escape-secret\n',
+      );
+
+      const output = await collectInitialInstallFailureDiagnostics(
+        subject.root,
+        subject.channelRoot,
+      );
+
+      expect(output).toContain('password=[redacted]');
+      expect(output).not.toContain('escape-secret');
+      expect(output).not.toContain('\u001b');
+    } finally {
+      await rm(subject.root, { recursive: true, force: true });
+    }
+  });
+
+  it('captures before cleanup and preserves the original scenario failure if collection is incomplete', async () => {
+    const subject = await fixture();
+    const sequence: string[] = [];
+    const scenarioFailure = new Error('original installer assertion');
+    await rm(subject.root, { recursive: true, force: true });
+    await expect(
+      runWithPortableToolchainCleanup(
+        subject.root,
+        async () => {
+          sequence.push('capture');
+          const diagnostics = await collectInitialInstallFailureDiagnostics(
+            subject.root,
+            subject.channelRoot,
+          );
+          expect(diagnostics).toContain('status=diagnostics-incomplete');
+          throw scenarioFailure;
+        },
+        async () => {
+          sequence.push('cleanup');
+        },
+      ),
+    ).rejects.toBe(scenarioFailure);
+    expect(sequence).toEqual(['capture', 'cleanup']);
+  });
+});
+
 it.each(['extra-key', 'oversized', 'symlink'] as const)(
   'real helper rejects an unsafe %s request without changing current state',
   async (kind) => {
-    const subject = await portableToolchain('stable', undefined, false, true);
-    const requestRoot = await mkdtemp(join(subject.root, 'request-'));
+    const subject = await activationScenario();
     try {
-      expect(await subject.startInstaller().finish).toBe(0);
-      const before = validActivation(await readActivation(join(subject.root, 'state', 'stable')));
+      await chmod(subject.channelRoot, 0o700);
       const helper = join(
-        subject.root,
-        'state',
-        'stable',
-        before.record.packageRef,
-        'dist/bin/revo-install-activate.js',
+        subject.first.packageDirectory,
+        'dist',
+        'bin',
+        'revo-install-activate.js',
       );
+      const compiledDirectory = join(subject.first.packageDirectory, 'dist');
+      await cp(new URL('../dist/', import.meta.url), compiledDirectory, {
+        recursive: true,
+      });
+      await writeFile(join(compiledDirectory, 'package.json'), '{"type":"module"}\n', {
+        mode: 0o644,
+      });
+      await symlink(join(process.cwd(), 'node_modules'), join(compiledDirectory, 'node_modules'));
+      expect(await realpath(resolvePath(dirname(helper), '../../../../..'))).toBe(
+        await realpath(subject.channelRoot),
+      );
+      expect((await subject.activate()).status).toBe('activated');
+      const before = validActivation(await readActivation(subject.channelRoot));
+      const home = join(subject.root, 'helper-home');
+      const directories = {
+        HOME: join(home, 'home'),
+        XDG_CONFIG_HOME: join(home, 'config'),
+        XDG_DATA_HOME: join(home, 'data'),
+        XDG_STATE_HOME: join(home, 'state'),
+        XDG_CACHE_HOME: join(home, 'cache'),
+        XDG_RUNTIME_DIR: join(home, 'runtime'),
+      };
+      await Promise.all(
+        Object.values(directories).map((directory) =>
+          mkdir(directory, { recursive: true, mode: 0o700 }),
+        ),
+      );
+      const environment = {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        ...directories,
+        REVO_CHANNEL: 'stable',
+        REVO_DATA_DIR: directories.XDG_DATA_HOME,
+        REVO_INSTALL_ROOT: subject.channelRoot,
+      };
+      const requestRoot = join(
+        subject.channelRoot,
+        '.attempt.HelperTest123',
+        'runtime',
+        'scratch',
+        '.activation-request-InvalidTest456',
+      );
+      await mkdir(requestRoot, { recursive: true, mode: 0o700 });
+      const requestDirectories = [
+        join(subject.channelRoot, '.attempt.HelperTest123'),
+        join(subject.channelRoot, '.attempt.HelperTest123', 'runtime'),
+        join(subject.channelRoot, '.attempt.HelperTest123', 'runtime', 'scratch'),
+        requestRoot,
+      ];
+      const directoryModes = await Promise.all(
+        requestDirectories.map(async (directory) => (await lstat(directory)).mode & 0o777),
+      );
+      expect((await lstat(subject.channelRoot)).mode & 0o777).toBe(0o700);
+      expect(directoryModes).toEqual([0o700, 0o700, 0o700, 0o700]);
       const valid = {
         schemaVersion: 'revo-install-activate/v1',
-        channelRoot: join(subject.root, 'state'),
-        packagePlan: subject.plan,
-        nodeArchiveSha256: subject.nodeArchiveSha256,
-        pnpmArchiveSha256: subject.pnpmArchiveSha256,
+        channelRoot: subject.channelRoot,
+        packagePlan: subject.first.plan,
+        nodeArchiveSha256: subject.first.nodeArchiveSha256,
+        pnpmArchiveSha256: subject.first.pnpmArchiveSha256,
       };
       const requestPath = join(requestRoot, 'request.json');
+      const runHelper = (path: string) =>
+        new Promise<{
+          readonly code: number | null;
+          readonly signal: NodeJS.Signals | null;
+          readonly stdout: string;
+          readonly stderr: string;
+          readonly timedOut: boolean;
+          readonly outputExceeded: boolean;
+          readonly spawnFailed: boolean;
+        }>((resolve) => {
+          const child = spawn(process.execPath, [helper, path], {
+            env: environment,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          let stdout = '';
+          let stderr = '';
+          let timedOut = false;
+          let outputExceeded = false;
+          let spawnFailed = false;
+          let terminationStarted = false;
+          let killTimer: ReturnType<typeof setTimeout> | undefined;
+          const terminate = () => {
+            if (terminationStarted) {
+              return;
+            }
+            terminationStarted = true;
+            child.kill('SIGTERM');
+            killTimer = setTimeout(() => child.kill('SIGKILL'), 1_000);
+          };
+          const appendBounded = (current: string, chunk: string): string => {
+            if (Buffer.byteLength(current) + Buffer.byteLength(chunk) > 8 * 1024) {
+              outputExceeded = true;
+              terminate();
+              return current;
+            }
+            return current + chunk;
+          };
+          child.stdout.setEncoding('utf8');
+          child.stderr.setEncoding('utf8');
+          child.stdout.on('data', (chunk: string) => {
+            stdout = appendBounded(stdout, chunk);
+          });
+          child.stderr.on('data', (chunk: string) => {
+            stderr = appendBounded(stderr, chunk);
+          });
+          const deadline = setTimeout(() => {
+            timedOut = true;
+            terminate();
+          }, 5_000);
+          child.once('error', () => {
+            spawnFailed = true;
+          });
+          child.once('close', (code, signal) => {
+            clearTimeout(deadline);
+            if (killTimer !== undefined) {
+              clearTimeout(killTimer);
+            }
+            resolve({ code, signal, stdout, stderr, timedOut, outputExceeded, spawnFailed });
+          });
+        });
+
+      const initialRequest = `${JSON.stringify(valid)}\n`;
+      const targetPath = join(requestRoot, 'target.json');
+      await writeFile(targetPath, initialRequest, { mode: 0o600 });
+      await writeFile(requestPath, initialRequest, { mode: 0o600 });
+      const positive = await runHelper(requestPath);
+      expect(positive).toMatchObject({
+        code: 0,
+        signal: null,
+        timedOut: false,
+        outputExceeded: false,
+        spawnFailed: false,
+        stderr: '',
+      });
+      expect(JSON.parse(positive.stdout)).toMatchObject({
+        schemaVersion: 'revo-install-activate/v1',
+        status: 'unchanged',
+        generationId: before.record.generationId,
+      });
+      expect(await readActivation(subject.channelRoot)).toEqual(before);
+
       if (kind === 'extra-key') {
         await writeFile(requestPath, `${JSON.stringify({ ...valid, extra: true })}\n`, {
           mode: 0o600,
         });
       } else if (kind === 'oversized') {
-        await writeFile(requestPath, `${'x'.repeat(64 * 1024 + 1)}\n`, { mode: 0o600 });
+        const prefix = JSON.stringify(valid);
+        await writeFile(requestPath, `${prefix}${' '.repeat(65_537 - Buffer.byteLength(prefix))}`, {
+          mode: 0o600,
+        });
       } else {
-        const targetPath = join(requestRoot, 'target.json');
-        await writeFile(targetPath, `${JSON.stringify(valid)}\n`, { mode: 0o600 });
+        await rm(requestPath);
         await symlink(targetPath, requestPath);
       }
-      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-        const child = spawn(process.execPath, [helper, requestPath], {
-          stdio: ['ignore', 'ignore', 'pipe'],
-        });
-        let stderr = '';
-        child.stderr.setEncoding('utf8');
-        child.stderr.on('data', (chunk: string) => (stderr += chunk));
-        child.once('close', (code) => resolve({ code, stderr }));
+      const requestStat = await lstat(requestPath);
+      const requestContents = await readFile(requestPath, 'utf8');
+      const targetContents = await readFile(targetPath, 'utf8');
+      const extraKeyRequest = `${JSON.stringify({ ...valid, extra: true })}\n`;
+      const fixtureValid =
+        kind === 'extra-key'
+          ? requestStat.isFile() &&
+            (requestStat.mode & 0o777) === 0o600 &&
+            requestContents === extraKeyRequest
+          : kind === 'oversized'
+            ? requestStat.isFile() &&
+              (requestStat.mode & 0o777) === 0o600 &&
+              requestStat.size === 65_537 &&
+              requestContents.trimEnd() === JSON.stringify(valid)
+            : requestStat.isSymbolicLink() && requestContents === initialRequest;
+      expect(fixtureValid).toBe(true);
+      expect(targetContents).toBe(initialRequest);
+      const result = await runHelper(requestPath);
+      expect(result).toMatchObject({
+        code: 1,
+        signal: null,
+        stdout: '',
+        stderr: 'activation helper failed\n',
+        timedOut: false,
+        outputExceeded: false,
+        spawnFailed: false,
       });
-      expect(result.code).not.toBe(0);
-      expect(result.stderr).toBe('activation helper failed\n');
-      expect(await readActivation(join(subject.root, 'state', 'stable'))).toEqual(before);
+      expect(await readActivation(subject.channelRoot)).toEqual(before);
+      expect(await readFile(targetPath, 'utf8')).toBe(initialRequest);
     } finally {
-      await cleanupPortableToolchain(subject.root);
+      await subject.cleanup();
     }
   },
-  180_000,
+  60_000,
 );
 
-it('real activation refuses during startup and succeeds after the owner closes', async () => {
-  const first = await portableToolchain('stable', undefined, false, true);
-  const second = await portableToolchain('stable', '0.0.1', false, true, join(first.root, 'state'));
-  const data = join(first.root, 'user-data');
-  const scenario = await new ServerOwnerScenario().setup({ dataDir: data });
-  let started: Awaited<ReturnType<ServerOwnerScenario['openInstalledCandidate']>> | undefined;
-  try {
-    await mkdir(data, { recursive: true, mode: 0o700 });
-    await writeFile(join(data, 'sentinel'), 'sentinel\n');
-    expect(await first.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
-    await first.stopServer(data);
-    const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+it.skipIf(process.env.REVO_RUN_REAL_INSTALLER_INTEGRATION !== '1')(
+  'real activation refuses during startup and succeeds after the owner closes',
+  async () => {
+    const first = await portableToolchain('stable', undefined, false, true);
+    const second = await portableToolchain(
+      'stable',
+      '0.0.1',
+      false,
+      true,
+      join(first.root, 'state'),
+    );
+    const data = join(first.root, 'user-data');
+    const scenario = await new ServerOwnerScenario().setup({ dataDir: data });
+    let started: Awaited<ReturnType<ServerOwnerScenario['openInstalledCandidate']>> | undefined;
+    try {
+      await mkdir(data, { recursive: true, mode: 0o700 });
+      await writeFile(join(data, 'sentinel'), 'sentinel\n');
+      expect(await first.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
+      await first.stopServer(data);
+      const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+      const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
+      const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
+      await writeFile(gate, 'hold\n', { mode: 0o600 });
+      const prewarm = second.startInstaller({
+        REVO_DATA_DIR: data,
+        REVO_TEST_ACTIVATION_FAULT: 'cancel',
+      });
+      await vi.waitFor(async () => expect(await readFile(marker, 'utf8')).toContain('held'), {
+        timeout: 120_000,
+        interval: 25,
+      });
+      prewarm.child.kill('SIGTERM');
+      expect(await prewarm.finish).not.toBe(0);
+      await vi.waitFor(
+        async () => expect((await new ServerOwnershipService().inspect(data)).kind).toBe('free'),
+        { timeout: 120_000, interval: 25 },
+      );
+      expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
+      await rm(gate, { force: true });
+      const channelRoot = join(first.root, 'state', 'stable');
+      started = await scenario.openInstalledCandidate({
+        channelRoot,
+        generationId: before.record.generationId,
+        version: before.record.release.version,
+        executable: join(channelRoot, before.record.toolchain.nodeRef, 'bin', 'node'),
+        coreEntry: join(channelRoot, before.record.packageRef, 'dist/bin/revo-core-host.js'),
+      });
+      expect(started.owner.status().phase).toBe('starting');
+      expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).not.toBe(0);
+      expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
+      started.releaseReady();
+      await started.started;
+      expect(started.owner.status().phase).toBe('running');
+      expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).not.toBe(0);
+      expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
+      await started.owner.close();
+      expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
+      const after = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+      expect(after.record.generationId).not.toBe(before.record.generationId);
+      expect(after.record.release.version).toBe('0.0.1');
+      expect(await readFile(join(data, 'sentinel'), 'utf8')).toBe('sentinel\n');
+    } finally {
+      started?.releaseReady();
+      await scenario.cleanup();
+      await cleanupPortableToolchain(second.root);
+      await cleanupPortableToolchain(first.root);
+    }
+  },
+  360_000,
+);
+
+it.skipIf(process.env.REVO_RUN_REAL_INSTALLER_INTEGRATION !== '1')(
+  'real activation cancellation before commit preserves current and retains the attempt',
+  async () => {
+    const first = await portableToolchain('stable', undefined, false, true);
+    const second = await portableToolchain(
+      'stable',
+      '0.0.1',
+      false,
+      true,
+      join(first.root, 'state'),
+    );
     const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
     const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
-    await writeFile(gate, 'hold\n', { mode: 0o600 });
-    const prewarm = second.startInstaller({
-      REVO_DATA_DIR: data,
-      REVO_TEST_ACTIVATION_FAULT: 'cancel',
-    });
-    await vi.waitFor(async () => expect(await readFile(marker, 'utf8')).toContain('held'), {
-      timeout: 120_000,
-      interval: 25,
-    });
-    prewarm.child.kill('SIGTERM');
-    expect(await prewarm.finish).not.toBe(0);
-    await vi.waitFor(
-      async () => expect((await new ServerOwnershipService().inspect(data)).kind).toBe('free'),
-      { timeout: 120_000, interval: 25 },
-    );
-    expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
-    await rm(gate, { force: true });
     const channelRoot = join(first.root, 'state', 'stable');
-    started = await scenario.openInstalledCandidate({
-      channelRoot,
-      generationId: before.record.generationId,
-      version: before.record.release.version,
-      executable: join(channelRoot, before.record.toolchain.nodeRef, 'bin', 'node'),
-      coreEntry: join(channelRoot, before.record.packageRef, 'dist/bin/revo-core-host.js'),
-    });
-    expect(started.owner.status().phase).toBe('starting');
-    expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).not.toBe(0);
-    expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
-    started.releaseReady();
-    await started.started;
-    expect(started.owner.status().phase).toBe('running');
-    expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).not.toBe(0);
-    expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
-    await started.owner.close();
-    expect(await second.startInstaller({ REVO_DATA_DIR: data }).finish).toBe(0);
-    const after = validActivation(await readActivation(join(first.root, 'state', 'stable')));
-    expect(after.record.generationId).not.toBe(before.record.generationId);
-    expect(after.record.release.version).toBe('0.0.1');
-    expect(await readFile(join(data, 'sentinel'), 'utf8')).toBe('sentinel\n');
-  } finally {
-    started?.releaseReady();
-    await scenario.cleanup();
-    await cleanupPortableToolchain(second.root);
-    await cleanupPortableToolchain(first.root);
-  }
-}, 360_000);
-
-it('real activation cancellation before commit preserves current and retains the attempt', async () => {
-  const first = await portableToolchain('stable', undefined, false, true);
-  const second = await portableToolchain('stable', '0.0.1', false, true, join(first.root, 'state'));
-  const gate = join(first.root, 'state', 'stable', 'activation-barrier.gate');
-  const marker = join(first.root, 'state', 'stable', 'activation-barrier.held');
-  let initialSucceeded = false;
-  let cancellationPreserved = false;
-  let retryStarted = false;
-  let testOutcome: 'passed' | 'failed' | 'incomplete' = 'incomplete';
-  let hasFailure = false;
-  let primaryFailure: unknown;
-  let cleanupAllowed = false;
-  const cleanupOutcome: Record<string, string> = {
-    beforeCleanupSnapshot: 'not-run',
-    gate: 'not-run',
-    secondFixture: 'not-run',
-    firstFixture: 'not-run',
-  };
-  try {
-    await prepareIntelInvocation('initial', [first.diagnosticContext]);
-    const initial = first.startInstaller({}, 'initial');
-    const initialCode = await initial.finish;
-    initialSucceeded = initialCode === 0;
-    expect(initialCode).toBe(0);
-    await first.stopServer();
-    await captureIntelSnapshot(
-      'after-initial',
-      [first.diagnosticContext],
-      [
-        {
-          root: first.root,
-          expectation: 'required',
-          reason: 'initial installation completed and server startup was exercised',
+    let initialSucceeded = false;
+    let cancellationPreserved = false;
+    let retryStarted = false;
+    let testOutcome: 'passed' | 'failed' | 'incomplete' = 'incomplete';
+    let hasFailure = false;
+    let primaryFailure: unknown;
+    let cleanupAllowed = false;
+    const cleanupOutcome: Record<string, string> = {
+      beforeCleanupSnapshot: 'not-run',
+      gate: 'not-run',
+      secondFixture: 'not-run',
+      firstFixture: 'not-run',
+    };
+    try {
+      await prepareIntelInvocation('initial', [first.diagnosticContext]);
+      const initial = first.startInstaller({}, 'initial');
+      const initialCode = await initial.finish;
+      initialSucceeded = initialCode === 0;
+      expect(initialCode).toBe(0);
+      await first.stopServer();
+      await captureIntelSnapshot(
+        'after-initial',
+        [first.diagnosticContext],
+        [
+          {
+            root: first.root,
+            expectation: 'required',
+            reason: 'initial installation completed and server startup was exercised',
+          },
+        ],
+      );
+      const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+      await writeFile(gate, 'hold\n', { mode: 0o600 });
+      await prepareIntelInvocation('cancel-before-commit', [second.diagnosticContext]);
+      const running = second.startInstaller(
+        { REVO_TEST_ACTIVATION_FAULT: 'cancel' },
+        'cancel-before-commit',
+      );
+      await vi.waitFor(async () => expect(await readFile(marker, 'utf8')).toContain('held'), {
+        timeout: 120_000,
+        interval: 25,
+      });
+      running.child.kill('SIGTERM');
+      const cancellationCode = await running.finish;
+      expect(cancellationCode).not.toBe(0);
+      expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
+      await reportRecoveryAttempt({
+        phase: 'after-cancellation',
+        fixtureRoot: first.root,
+        channelRoot,
+        expectedCandidateVersion: second.plan.release.version,
+        expectedGenerationId: before.record.generationId,
+        installer: {
+          finishCode: cancellationCode,
+          outcome: running.outcome,
+          stdoutTail: running.stdoutTail,
+          stderrTail: running.stderrTail,
         },
-      ],
-    );
-    const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
-    await writeFile(gate, 'hold\n', { mode: 0o600 });
-    await prepareIntelInvocation('cancel-before-commit', [second.diagnosticContext]);
-    const running = second.startInstaller(
-      { REVO_TEST_ACTIVATION_FAULT: 'cancel' },
-      'cancel-before-commit',
-    );
-    await vi.waitFor(async () => expect(await readFile(marker, 'utf8')).toContain('held'), {
-      timeout: 120_000,
-      interval: 25,
-    });
-    running.child.kill('SIGTERM');
-    const cancellationCode = await running.finish;
-    expect(cancellationCode).not.toBe(0);
-    expect(await readActivation(join(first.root, 'state', 'stable'))).toEqual(before);
-    expect(
-      (await readdir(join(first.root, 'state', 'stable'))).some((name) =>
-        name.startsWith('.attempt.'),
-      ),
-    ).toBe(true);
-    cancellationPreserved = true;
-    await captureIntelSnapshot(
-      'after-cancellation',
-      [first.diagnosticContext, second.diagnosticContext],
-      [
-        {
-          root: first.root,
-          expectation: 'required',
-          reason: 'first fixture previously completed initial server startup',
-        },
-        {
-          root: second.root,
-          expectation: 'absent-permitted',
-          reason: 'second fixture was cancelled before commit and before autostart',
-        },
-      ],
-    );
-    await rm(gate, { force: true });
-    await prepareIntelInvocation('retry-after-cancel', [second.diagnosticContext]);
-    retryStarted = true;
-    const retry = second.startInstaller({}, 'retry-after-cancel');
-    const retryCode = await retry.finish;
-    await captureIntelSnapshot(
-      'after-retry',
-      [first.diagnosticContext, second.diagnosticContext],
-      [
-        {
-          root: first.root,
-          expectation: 'required',
-          reason: 'initial installation completed and server startup was exercised',
-        },
-        {
-          root: second.root,
-          expectation: 'required',
-          reason: 'retry reached the server-start invocation',
-        },
-      ],
-    );
-    expect(retryCode).toBe(0);
-    const after = validActivation(await readActivation(join(first.root, 'state', 'stable')));
-    expect(after.record.generationId).not.toBe(before.record.generationId);
-    testOutcome = 'passed';
-  } catch (error) {
-    testOutcome = 'failed';
-    hasFailure = true;
-    primaryFailure = error;
-  } finally {
-    if (intelCollectorsQuiescent()) {
-      cleanupOutcome.beforeCleanupSnapshot = (await captureIntelSnapshot(
-        'before-cleanup',
+      });
+      expect(
+        (await readdir(join(first.root, 'state', 'stable'))).some((name) =>
+          name.startsWith('.attempt.'),
+        ),
+      ).toBe(true);
+      cancellationPreserved = true;
+      await captureIntelSnapshot(
+        'after-cancellation',
         [first.diagnosticContext, second.diagnosticContext],
         [
           {
             root: first.root,
-            expectation: initialSucceeded ? 'required' : 'unknown',
-            reason: initialSucceeded
-              ? 'initial installation reached server startup'
-              : 'initial phase was not confirmed',
+            expectation: 'required',
+            reason: 'first fixture previously completed initial server startup',
           },
           {
             root: second.root,
-            expectation: retryStarted
-              ? 'required'
-              : cancellationPreserved
-                ? 'absent-permitted'
-                : 'unknown',
-            reason: retryStarted
-              ? 'retry reached the server-start invocation'
-              : cancellationPreserved
-                ? 'cancellation was confirmed before commit and retry did not start'
-                : 'second fixture startup phase is unknown',
+            expectation: 'absent-permitted',
+            reason: 'second fixture was cancelled before commit and before autostart',
           },
         ],
-      ))
-        ? 'captured'
-        : 'incomplete';
-      cleanupAllowed = intelCollectorsQuiescent();
-      if (!cleanupAllowed) {
+      );
+      await rm(gate, { force: true });
+      await prepareIntelInvocation('retry-after-cancel', [second.diagnosticContext]);
+      retryStarted = true;
+      const retry = second.startInstaller({}, 'retry-after-cancel');
+      const retryCode = await retry.finish;
+      await reportRecoveryAttempt({
+        phase: 'after-retry',
+        fixtureRoot: first.root,
+        channelRoot,
+        expectedCandidateVersion: second.plan.release.version,
+        expectedGenerationId: before.record.generationId,
+        installer: {
+          finishCode: retryCode,
+          outcome: retry.outcome,
+          stdoutTail: retry.stdoutTail,
+          stderrTail: retry.stderrTail,
+        },
+      });
+      await captureIntelSnapshot(
+        'after-retry',
+        [first.diagnosticContext, second.diagnosticContext],
+        [
+          {
+            root: first.root,
+            expectation: 'required',
+            reason: 'initial installation completed and server startup was exercised',
+          },
+          {
+            root: second.root,
+            expectation: 'required',
+            reason: 'retry reached the server-start invocation',
+          },
+        ],
+      );
+      expect(retryCode).toBe(0);
+      const after = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+      expect(after.record.generationId).not.toBe(before.record.generationId);
+      testOutcome = 'passed';
+    } catch (error) {
+      testOutcome = 'failed';
+      hasFailure = true;
+      primaryFailure = error;
+    } finally {
+      if (intelCollectorsQuiescent()) {
+        cleanupOutcome.beforeCleanupSnapshot = (await captureIntelSnapshot(
+          'before-cleanup',
+          [first.diagnosticContext, second.diagnosticContext],
+          [
+            {
+              root: first.root,
+              expectation: initialSucceeded ? 'required' : 'unknown',
+              reason: initialSucceeded
+                ? 'initial installation reached server startup'
+                : 'initial phase was not confirmed',
+            },
+            {
+              root: second.root,
+              expectation: retryStarted
+                ? 'required'
+                : cancellationPreserved
+                  ? 'absent-permitted'
+                  : 'unknown',
+              reason: retryStarted
+                ? 'retry reached the server-start invocation'
+                : cancellationPreserved
+                  ? 'cancellation was confirmed before commit and retry did not start'
+                  : 'second fixture startup phase is unknown',
+            },
+          ],
+        ))
+          ? 'captured'
+          : 'incomplete';
+        cleanupAllowed = intelCollectorsQuiescent();
+        if (!cleanupAllowed) {
+          cleanupOutcome.gate = 'skipped-collector-stop-unconfirmed';
+          cleanupOutcome.secondFixture = 'skipped-collector-stop-unconfirmed';
+          cleanupOutcome.firstFixture = 'skipped-collector-stop-unconfirmed';
+          if (!hasFailure) {
+            hasFailure = true;
+            testOutcome = 'failed';
+            primaryFailure = new Error('diagnostic collector stop was not confirmed');
+          }
+        }
+      } else {
+        cleanupOutcome.beforeCleanupSnapshot = 'skipped-collector-stop-unconfirmed';
         cleanupOutcome.gate = 'skipped-collector-stop-unconfirmed';
         cleanupOutcome.secondFixture = 'skipped-collector-stop-unconfirmed';
         cleanupOutcome.firstFixture = 'skipped-collector-stop-unconfirmed';
@@ -911,96 +1529,174 @@ it('real activation cancellation before commit preserves current and retains the
           primaryFailure = new Error('diagnostic collector stop was not confirmed');
         }
       }
-    } else {
-      cleanupOutcome.beforeCleanupSnapshot = 'skipped-collector-stop-unconfirmed';
-      cleanupOutcome.gate = 'skipped-collector-stop-unconfirmed';
-      cleanupOutcome.secondFixture = 'skipped-collector-stop-unconfirmed';
-      cleanupOutcome.firstFixture = 'skipped-collector-stop-unconfirmed';
-      if (!hasFailure) {
-        hasFailure = true;
-        testOutcome = 'failed';
-        primaryFailure = new Error('diagnostic collector stop was not confirmed');
-      }
-    }
-    if (cleanupAllowed) {
-      try {
-        await rm(gate, { force: true });
-        cleanupOutcome.gate = 'complete';
-      } catch {
-        cleanupOutcome.gate = 'failed';
-        if (!hasFailure) {
-          hasFailure = true;
-          testOutcome = 'failed';
-          primaryFailure = new Error('activation diagnostic gate cleanup failed');
+      if (cleanupAllowed) {
+        try {
+          await rm(gate, { force: true });
+          cleanupOutcome.gate = 'complete';
+        } catch {
+          cleanupOutcome.gate = 'failed';
+          if (!hasFailure) {
+            hasFailure = true;
+            testOutcome = 'failed';
+            primaryFailure = new Error('activation diagnostic gate cleanup failed');
+          }
+        }
+        try {
+          await cleanupPortableToolchain(second.root);
+          cleanupOutcome.secondFixture = 'complete';
+        } catch {
+          cleanupOutcome.secondFixture = 'failed';
+          if (!hasFailure) {
+            hasFailure = true;
+            testOutcome = 'failed';
+            primaryFailure = new Error('second fixture cleanup failed');
+          }
+        }
+        try {
+          await cleanupPortableToolchain(first.root);
+          cleanupOutcome.firstFixture = 'complete';
+        } catch {
+          cleanupOutcome.firstFixture = 'failed';
+          if (!hasFailure) {
+            hasFailure = true;
+            testOutcome = 'failed';
+            primaryFailure = new Error('first fixture cleanup failed');
+          }
         }
       }
-      try {
-        await cleanupPortableToolchain(second.root);
-        cleanupOutcome.secondFixture = 'complete';
-      } catch {
-        cleanupOutcome.secondFixture = 'failed';
-        if (!hasFailure) {
-          hasFailure = true;
-          testOutcome = 'failed';
-          primaryFailure = new Error('second fixture cleanup failed');
+      if (intelCollectorsQuiescent()) {
+        try {
+          await writeIntelDiagnosticSummary({ testOutcome, cleanupOutcome });
+        } catch {
+          if (!hasFailure) {
+            hasFailure = true;
+            testOutcome = 'failed';
+            primaryFailure = new Error('activation diagnostic summary could not be written');
+          }
+          console.error('Intel diagnostic summary could not be written.');
         }
-      }
-      try {
-        await cleanupPortableToolchain(first.root);
-        cleanupOutcome.firstFixture = 'complete';
-      } catch {
-        cleanupOutcome.firstFixture = 'failed';
-        if (!hasFailure) {
-          hasFailure = true;
-          testOutcome = 'failed';
-          primaryFailure = new Error('first fixture cleanup failed');
-        }
-      }
-    }
-    if (intelCollectorsQuiescent()) {
-      try {
-        await writeIntelDiagnosticSummary({ testOutcome, cleanupOutcome });
-      } catch {
-        if (!hasFailure) {
-          hasFailure = true;
-          testOutcome = 'failed';
-          primaryFailure = new Error('activation diagnostic summary could not be written');
-        }
+      } else {
         console.error('Intel diagnostic summary could not be written.');
       }
-    } else {
-      console.error('Intel diagnostic summary could not be written.');
     }
-  }
-  if (hasFailure) {
-    throw primaryFailure;
-  }
-}, 360_000);
+    if (hasFailure) {
+      throw primaryFailure;
+    }
+  },
+  360_000,
+);
 
-it('real activation retains a committed generation when helper acknowledgement is lost', async () => {
-  const first = await portableToolchain('stable', undefined, false, true);
-  const second = await portableToolchain('stable', '0.0.1', false, true, join(first.root, 'state'));
-  try {
-    expect(await first.startInstaller().finish).toBe(0);
-    await first.stopServer();
-    const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
-    const running = second.startInstaller({ REVO_TEST_ACTIVATION_FAULT: 'unknown' });
-    expect(await running.finish).not.toBe(0);
-    const committed = validActivation(await readActivation(join(first.root, 'state', 'stable')));
-    expect(committed.record.generationId).not.toBe(before.record.generationId);
-    expect(
-      (await readdir(join(first.root, 'state', 'stable'))).some((name) =>
-        name.startsWith('.attempt.'),
-      ),
-    ).toBe(true);
-    expect(await second.startInstaller().finish).toBe(0);
-    const retry = validActivation(await readActivation(join(first.root, 'state', 'stable')));
-    expect(retry.record.generationId).toBe(committed.record.generationId);
-  } finally {
-    await cleanupPortableToolchain(second.root);
-    await cleanupPortableToolchain(first.root);
-  }
-}, 360_000);
+it.skipIf(process.env.REVO_RUN_REAL_INSTALLER_INTEGRATION !== '1')(
+  'real activation retains a committed generation when helper acknowledgement is lost',
+  async () => {
+    const first = await portableToolchain('stable', undefined, false, true);
+    const second = await portableToolchain(
+      'stable',
+      '0.0.1',
+      false,
+      true,
+      join(first.root, 'state'),
+    );
+    const channelRoot = join(first.root, 'state', 'stable');
+    const postgresObserverPath = join(second.root, 'postgres-observer.log');
+    try {
+      expect(await first.startInstaller().finish).toBe(0);
+      await recoveryRuntimeSnapshot({
+        phase: 'before-first-stop',
+        dataDir: first.dataDir,
+        redactionRoots: [first.root, second.root],
+        status: (await first.status()).kind,
+      });
+      await first.stopServer();
+      await recoveryRuntimeSnapshot({
+        phase: 'after-first-stop',
+        dataDir: first.dataDir,
+        redactionRoots: [first.root, second.root],
+        status: (await first.status()).kind,
+      });
+      const before = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+      const running = second.startInstaller({ REVO_TEST_ACTIVATION_FAULT: 'unknown' });
+      const faultCode = await running.finish;
+      const faultAttempts = await second.attempts();
+      const faultAttemptPath = faultAttempts[0];
+      const faultAttemptName =
+        faultAttempts.length === 1 && faultAttemptPath !== undefined
+          ? basename(faultAttemptPath)
+          : undefined;
+      await reportRecoveryAttempt({
+        phase: 'after-ack-loss-fault',
+        fixtureRoot: first.root,
+        channelRoot,
+        ...(faultAttemptName === undefined ? {} : { attemptName: faultAttemptName }),
+        expectedCandidateVersion: second.plan.release.version,
+        expectedGenerationId: before.record.generationId,
+        installer: {
+          finishCode: faultCode,
+          outcome: running.outcome,
+          stdoutTail: running.stdoutTail,
+          stderrTail: running.stderrTail,
+        },
+      });
+      expect(faultCode).not.toBe(0);
+      const committed = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+      expect(committed.record.generationId).not.toBe(before.record.generationId);
+      expect(
+        (await readdir(join(first.root, 'state', 'stable'))).some((name) =>
+          name.startsWith('.attempt.'),
+        ),
+      ).toBe(true);
+      await recoveryRuntimeSnapshot({
+        phase: 'after-ack-loss-fault',
+        dataDir: first.dataDir,
+        redactionRoots: [first.root, second.root],
+        status: (await first.status()).kind,
+      });
+      const attemptsBeforeRetry = new Set(await second.attempts());
+      await writeFile(postgresObserverPath, '', { mode: 0o600 });
+      const retryInstaller = second.startInstaller(
+        { REVO_TEST_POSTGRES_DIAGNOSTIC: postgresObserverPath },
+        'retry-after-ack-loss',
+      );
+      const retryCode = await retryInstaller.finish;
+      const retryAttempts = (await second.attempts()).filter(
+        (attempt) => !attemptsBeforeRetry.has(attempt),
+      );
+      const retryAttemptPath = retryAttempts[0];
+      const retryAttemptName =
+        retryAttempts.length === 1 && retryAttemptPath !== undefined
+          ? basename(retryAttemptPath)
+          : undefined;
+      await reportRecoveryAttempt({
+        phase: 'after-ack-loss-retry',
+        fixtureRoot: first.root,
+        channelRoot,
+        ...(retryAttemptName === undefined ? {} : { attemptName: retryAttemptName }),
+        postgresObserverPath,
+        expectedCandidateVersion: second.plan.release.version,
+        expectedGenerationId: committed.record.generationId,
+        installer: {
+          finishCode: retryCode,
+          outcome: retryInstaller.outcome,
+          stdoutTail: retryInstaller.stdoutTail,
+          stderrTail: retryInstaller.stderrTail,
+        },
+      });
+      await recoveryRuntimeSnapshot({
+        phase: 'after-ack-loss-retry',
+        dataDir: first.dataDir,
+        redactionRoots: [first.root, second.root],
+        status: (await first.status()).kind,
+      });
+      expect(retryCode).toBe(0);
+      const retry = validActivation(await readActivation(join(first.root, 'state', 'stable')));
+      expect(retry.record.generationId).toBe(committed.record.generationId);
+    } finally {
+      await cleanupPortableToolchain(second.root);
+      await cleanupPortableToolchain(first.root);
+    }
+  },
+  360_000,
+);
 
 describe('generated POSIX toolchain installer', () => {
   it.each(['stable', 'alpha'] as const)(
@@ -1057,10 +1753,10 @@ describe('generated POSIX toolchain installer', () => {
           'pnpm',
           process.versions.node,
           identity,
-          '12.4.1',
+          '12.5.1',
         );
         expect(await readFile(join(target, 'install-receipt.json'), 'utf8')).toContain(identity);
-        expect(await readFile(join(pnpm, 'install-receipt.json'), 'utf8')).toContain('12.4.1');
+        expect(await readFile(join(pnpm, 'install-receipt.json'), 'utf8')).toContain('12.5.1');
         expect(await readFile(subject.calls, 'utf8')).toHaveLength(1);
         await writeFile(join(target, 'install-receipt.json'), '{}\n');
         expect(await subject.runInstaller()).not.toBe(0);

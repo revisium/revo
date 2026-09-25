@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { lstat } from 'node:fs/promises';
 
 import { Inject, Injectable } from '@nestjs/common';
 
@@ -26,8 +27,10 @@ import { LoopbackPortAllocator } from './loopback-port-allocator.js';
 const HOST = '127.0.0.1' as const;
 const DATABASE = 'revo' as const;
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
-const STOP_GRACE_MS = 1000;
+const STOP_GRACE_MS = 20_000;
 const STOP_KILL_WAIT_MS = 5000;
+const POSTGRES_SETTLEMENT_TIMEOUT_MS = 5000;
+const POSTGRES_SETTLEMENT_POLL_MS = 25;
 const ATTEMPTS = 3;
 const LOOPBACK_BIND_CONFLICT = 'could not bind IPv4 address "127.0.0.1": Address already in use';
 
@@ -57,10 +60,11 @@ export class OwnedEmbeddedPostgresResource {
   private active: Promise<StartedEmbeddedDatabase> | undefined;
   private readonly readiness = new EmbeddedPostgresReadiness();
   private closing = false;
-  private closeOperation: Promise<void> | undefined;
+  private closeOperation: CloseAttempt | undefined;
   private controller: AbortController | undefined;
   private server: OwnedProcess | undefined;
   private serverCompletion: Promise<void> | undefined;
+  private settlement: PostgresSettlementAttempt | undefined;
   private started: StartedEmbeddedDatabase | undefined;
   private stopFailure = false;
 
@@ -105,13 +109,72 @@ export class OwnedEmbeddedPostgresResource {
   close(): Promise<void> {
     this.closing = true;
     this.controller?.abort();
-    this.closeOperation ??= this.performClose();
-    return this.closeOperation;
+    const previous = this.closeOperation;
+    if (previous && (previous.state !== 'rejected' || !this.canRetryClose(previous))) {
+      return previous.promise;
+    }
+    if (previous && this.closeOperation === previous) {
+      this.closeOperation = undefined;
+    }
+    const retryMarkerCheck = this.settlement?.checkFailure === 'marker';
+    if (retryMarkerCheck && this.settlement) {
+      this.settlement.retryCheck = undefined;
+    }
+    const operation: CloseAttempt = {
+      promise: Promise.resolve(),
+      settlement: this.settlement,
+      startup: this.active,
+      state: 'pending',
+      mayRetryAfterChildExit: false,
+      retryableMarkerFailure: false,
+      readinessFailed: false,
+      preparationFailed: false,
+    };
+    operation.promise = this.performClose(retryMarkerCheck, operation).then(
+      () => {
+        operation.state = 'fulfilled';
+      },
+      (error: unknown) => {
+        operation.state = 'rejected';
+        throw error;
+      },
+    );
+    this.closeOperation = operation;
+    return operation.promise;
   }
 
   async settled(): Promise<void> {
     await this.active?.catch(() => undefined);
     await this.serverCompletion;
+    const closeOperation = this.closeOperation;
+    if (
+      closeOperation &&
+      closeOperation.settlement === undefined &&
+      closeOperation.startup !== undefined &&
+      this.settlement?.startup === closeOperation.startup
+    ) {
+      closeOperation.settlement = this.settlement;
+    }
+    try {
+      await this.requireSettlement(false);
+    } catch (error) {
+      const operation = this.closeOperation;
+      if (
+        this.settlement?.checkFailure === 'marker' &&
+        !this.server &&
+        !this.serverCompletion &&
+        !this.active &&
+        !this.stopFailure &&
+        operation?.state === 'rejected' &&
+        operation.settlement === this.settlement &&
+        operation.mayRetryAfterChildExit &&
+        !operation.readinessFailed &&
+        !operation.preparationFailed
+      ) {
+        operation.retryableMarkerFailure = true;
+      }
+      throw error;
+    }
     await this.readiness.close().catch(() => undefined);
     await this.preparation.settled();
   }
@@ -296,17 +359,39 @@ export class OwnedEmbeddedPostgresResource {
       diagnostic: captureDiagnostic(child.stderr),
       exited: undefined,
     };
-    const serverCompletion = child.completion.then((completion) => {
-      attempt.exited = completion;
+    const completion: Promise<PostgresCompletion> = child.completion.then(
+      (result) => ({ kind: 'exited', completion: result }),
+      () => ({ kind: 'failed', error: new EmbeddedPostgresError('process') }),
+    );
+    const serverCompletion = completion.then((result) => {
+      if (result.kind === 'exited') {
+        attempt.exited = result.completion;
+      }
       if (this.server === child) {
         this.server = undefined;
         this.started = undefined;
+        if (result.kind === 'exited') {
+          this.stopFailure = false;
+        }
       }
       if (this.serverCompletion === serverCompletion) {
         this.serverCompletion = undefined;
       }
     });
     this.serverCompletion = serverCompletion;
+    const settlement: PostgresSettlementAttempt = {
+      child,
+      clusterDir,
+      completion,
+      check: Promise.resolve({ kind: 'settled' }),
+      retryCheck: undefined,
+      checkState: 'pending',
+      checkFailure: undefined,
+      checkError: undefined,
+      startup: this.active,
+    };
+    settlement.check = this.checkSettlement(settlement);
+    this.settlement = settlement;
     return attempt;
   }
 
@@ -343,6 +428,7 @@ export class OwnedEmbeddedPostgresResource {
       !signal.aborted &&
       isBindConflict(await attempt.diagnostic, attempt.exited)
     ) {
+      await this.requireSettlement(false);
       return { kind: 'bind-conflict' };
     }
     throw failure;
@@ -385,36 +471,120 @@ export class OwnedEmbeddedPostgresResource {
     }
   }
 
-  private async stopServer() {
-    const server = this.server;
-    if (!server) {
+  private canRetryClose(operation: CloseAttempt): boolean {
+    const settlement = this.settlement;
+    return (
+      operation.retryableMarkerFailure &&
+      operation.settlement === settlement &&
+      settlement?.checkFailure === 'marker' &&
+      !this.server &&
+      !this.serverCompletion &&
+      !this.active &&
+      !this.stopFailure
+    );
+  }
+
+  private checkSettlement(settlement: PostgresSettlementAttempt): Promise<SettlementResult> {
+    return settlement.completion.then(async (completion) => {
+      if (completion.kind === 'failed') {
+        settlement.checkState = 'failed';
+        settlement.checkFailure = 'completion';
+        settlement.checkError = completion.error;
+        return { kind: 'failed', stage: 'completion', error: completion.error };
+      }
+      try {
+        await waitForPostgresSettlement(settlement.clusterDir);
+        settlement.checkState = 'settled';
+        settlement.checkFailure = undefined;
+        settlement.checkError = undefined;
+        return { kind: 'settled' };
+      } catch {
+        const error = new EmbeddedPostgresError('process');
+        settlement.checkState = 'failed';
+        settlement.checkFailure = 'marker';
+        settlement.checkError = error;
+        return { kind: 'failed', stage: 'marker', error };
+      }
+    });
+  }
+
+  private async requireSettlement(retryFailedMarkerCheck: boolean): Promise<void> {
+    const settlement = this.settlement;
+    if (!settlement) {
       return;
     }
-    try {
-      await this.processes.stop(server, { graceMs: STOP_GRACE_MS, killWaitMs: STOP_KILL_WAIT_MS });
-      await server.completion;
-    } catch {
-      this.stopFailure = true;
-      throw new EmbeddedPostgresError('process');
+    let result = await settlement.check;
+    if (
+      result.kind === 'failed' &&
+      retryFailedMarkerCheck &&
+      settlement.checkState === 'failed' &&
+      (await settlement.completion).kind === 'exited'
+    ) {
+      settlement.retryCheck ??= this.checkSettlement(settlement);
+      settlement.check = settlement.retryCheck;
+      result = await settlement.retryCheck;
+    }
+    if (result.kind === 'failed') {
+      throw result.error;
     }
   }
 
-  private async performClose() {
-    let failed = false;
+  private async stopServer(retryFailedMarkerCheck = false) {
+    const server = this.server;
+    if (server) {
+      try {
+        await this.processes.stop(server, {
+          graceMs: STOP_GRACE_MS,
+          killWaitMs: STOP_KILL_WAIT_MS,
+          escalationSignal: 'SIGINT',
+        });
+      } catch {
+        this.stopFailure = true;
+        throw new EmbeddedPostgresError('process');
+      }
+      try {
+        await server.completion;
+      } catch {
+        this.stopFailure = true;
+        throw new EmbeddedPostgresError('process');
+      }
+    }
+    await this.requireSettlement(retryFailedMarkerCheck);
+  }
+
+  private async performClose(retryFailedMarkerCheck: boolean, operation: CloseAttempt) {
+    let readinessFailed = false;
+    let preparationFailed = false;
+    let serverStopFailed = false;
     const readinessClose = this.readiness.close().catch(() => {
-      failed = true;
+      readinessFailed = true;
     });
-    const serverStop = this.stopServer().catch(() => {
-      failed = true;
+    const serverStop = this.stopServer(retryFailedMarkerCheck).catch(() => {
+      serverStopFailed = true;
     });
     await Promise.all([readinessClose, serverStop]);
-    if (this.active) {
-      failed = true;
-    }
     await this.preparation.close().catch(() => {
-      failed = true;
+      preparationFailed = true;
     });
-    if (failed || this.serverCompletion || this.stopFailure) {
+    operation.readinessFailed = readinessFailed;
+    operation.preparationFailed = preparationFailed;
+    operation.mayRetryAfterChildExit =
+      !readinessFailed && !preparationFailed && this.settlement?.checkFailure !== 'completion';
+    operation.retryableMarkerFailure =
+      operation.mayRetryAfterChildExit &&
+      !this.server &&
+      !this.serverCompletion &&
+      !this.stopFailure &&
+      this.settlement?.checkFailure === 'marker';
+    if (
+      readinessFailed ||
+      preparationFailed ||
+      serverStopFailed ||
+      this.active ||
+      this.serverCompletion ||
+      this.stopFailure ||
+      operation.retryableMarkerFailure
+    ) {
       throw new EmbeddedPostgresError('process');
     }
   }
@@ -431,6 +601,41 @@ interface TrackedAttempt {
   readonly child: OwnedProcess;
   readonly diagnostic: Promise<string>;
   exited: ProcessCompletion | undefined;
+}
+
+type PostgresCompletion =
+  | { readonly kind: 'exited'; readonly completion: ProcessCompletion }
+  | { readonly kind: 'failed'; readonly error: EmbeddedPostgresError };
+
+type SettlementResult =
+  | { readonly kind: 'settled' }
+  | {
+      readonly kind: 'failed';
+      readonly stage: 'completion' | 'marker';
+      readonly error: EmbeddedPostgresError;
+    };
+
+interface PostgresSettlementAttempt {
+  readonly child: OwnedProcess;
+  readonly clusterDir: string;
+  readonly completion: Promise<PostgresCompletion>;
+  readonly startup: Promise<StartedEmbeddedDatabase> | undefined;
+  check: Promise<SettlementResult>;
+  retryCheck: Promise<SettlementResult> | undefined;
+  checkState: 'pending' | 'settled' | 'failed';
+  checkFailure: 'completion' | 'marker' | undefined;
+  checkError: EmbeddedPostgresError | undefined;
+}
+
+interface CloseAttempt {
+  promise: Promise<void>;
+  settlement: PostgresSettlementAttempt | undefined;
+  readonly startup: Promise<StartedEmbeddedDatabase> | undefined;
+  state: 'pending' | 'fulfilled' | 'rejected';
+  mayRetryAfterChildExit: boolean;
+  retryableMarkerFailure: boolean;
+  readinessFailed: boolean;
+  preparationFailed: boolean;
 }
 
 const validateRequest = (request: StartDatabaseRequest) => {
@@ -496,6 +701,67 @@ const captureDiagnostic = (stderr: NodeJS.ReadableStream | undefined) => {
     stderr.once('error', finish);
   });
 };
+
+async function waitForPostgresSettlement(clusterDir: string): Promise<void> {
+  const pidPath = `${clusterDir}/postmaster.pid`;
+  const deadline = performance.now() + POSTGRES_SETTLEMENT_TIMEOUT_MS;
+  for (;;) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- settlement must observe each filesystem state in order.
+      const metadata = await lstatBeforeDeadline(pidPath, deadline);
+      if (performance.now() > deadline) {
+        throw new EmbeddedPostgresError('process');
+      }
+      if (metadata.isSymbolicLink() || !metadata.isFile()) {
+        throw new EmbeddedPostgresError('process');
+      }
+    } catch (error) {
+      if (error instanceof EmbeddedPostgresError) {
+        throw error;
+      }
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'ENOENT'
+      ) {
+        if (performance.now() <= deadline) {
+          return;
+        }
+        throw new EmbeddedPostgresError('process');
+      }
+      throw new EmbeddedPostgresError('process');
+    }
+    const settlementRemainingMs = deadline - performance.now();
+    if (settlementRemainingMs <= 0) {
+      throw new EmbeddedPostgresError('process');
+    }
+    // oxlint-disable-next-line no-await-in-loop -- bounded polling waits for the owned PostgreSQL shutdown marker.
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(POSTGRES_SETTLEMENT_POLL_MS, settlementRemainingMs)),
+    );
+  }
+}
+
+async function lstatBeforeDeadline(pidPath: string, deadline: number) {
+  const remainingMs = deadline - performance.now();
+  if (remainingMs <= 0) {
+    throw new EmbeddedPostgresError('process');
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      lstat(pidPath),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new EmbeddedPostgresError('process')), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
 
 const waitForRetry = (signal: AbortSignal, deadline: number) =>
   raceCancellation(

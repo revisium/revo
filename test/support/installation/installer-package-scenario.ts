@@ -19,22 +19,27 @@ export async function installerPackageScenario() {
   const root = await mkdtemp(join(tmpdir(), 'revo-installer-package-'));
   const channelRoot = join(root, 'stable');
   const stage = join(root, 'stage');
-  await mkdir(channelRoot, { recursive: true });
-  await mkdir(stage, { recursive: true });
-  await mkdir(join(stage, 'node_modules'), { recursive: true });
-  await writeFile(join(stage, 'package.json'), fixture.bytes.packageJson);
-  await writeFile(join(stage, 'pnpm-lock.yaml'), fixture.bytes.pnpmLock);
-  await writeFile(join(stage, 'pnpm-workspace.yaml'), fixture.bytes.pnpmWorkspace);
+  await mkdir(channelRoot, { recursive: true, mode: 0o700 });
+  await mkdir(stage, { recursive: true, mode: 0o700 });
+  await mkdir(join(stage, 'node_modules'), { recursive: true, mode: 0o700 });
+  await writeFile(join(stage, 'package.json'), fixture.bytes.packageJson, { mode: 0o600 });
+  await writeFile(join(stage, 'pnpm-lock.yaml'), fixture.bytes.pnpmLock, { mode: 0o600 });
+  await writeFile(join(stage, 'pnpm-workspace.yaml'), fixture.bytes.pnpmWorkspace, {
+    mode: 0o600,
+  });
   const prepareAttempt = async (label: string, options: { invalid?: boolean } = {}) => {
     const attempt = join(root, `attempt-${label}`);
-    await mkdir(join(attempt, 'node_modules'), { recursive: true });
+    await mkdir(join(attempt, 'node_modules'), { recursive: true, mode: 0o700 });
     await writeFile(
       join(attempt, 'package.json'),
       options.invalid ? '{"name":"foreign"}\n' : fixture.bytes.packageJson,
+      { mode: 0o600 },
     );
     if (!options.invalid) {
-      await writeFile(join(attempt, 'pnpm-lock.yaml'), fixture.bytes.pnpmLock);
-      await writeFile(join(attempt, 'pnpm-workspace.yaml'), fixture.bytes.pnpmWorkspace);
+      await writeFile(join(attempt, 'pnpm-lock.yaml'), fixture.bytes.pnpmLock, { mode: 0o600 });
+      await writeFile(join(attempt, 'pnpm-workspace.yaml'), fixture.bytes.pnpmWorkspace, {
+        mode: 0o600,
+      });
     }
     return { stage: attempt };
   };
@@ -80,6 +85,7 @@ export async function installerPackageScenario() {
         ),
         {
           recursive: true,
+          mode: 0o700,
         },
       );
       if (!corrupt) {
@@ -88,6 +94,7 @@ export async function installerPackageScenario() {
       await writeFile(
         join(preparedPackageTarget(channelRoot, plan), 'package.json'),
         '{"name":"foreign"}\n',
+        { mode: 0o600 },
       );
     },
     readPublishedPackage: () => readPreparedPackage(channelRoot, plan),

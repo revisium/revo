@@ -66,12 +66,7 @@ export class OwnedEmbeddedPostgresPreparation {
   async close(): Promise<void> {
     this.closing = true;
     this.controller?.abort();
-    try {
-      await this.active;
-    } catch {
-      // Closing drains owned work; its caller already observes preparation failure.
-    }
-    if (this.childCompletion || this.stopFailure) {
+    if (this.active || this.childCompletion || this.stopFailure) {
       throw new EmbeddedPostgresError('process');
     }
   }

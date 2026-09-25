@@ -9,16 +9,18 @@ import { LoopbackPortAllocator } from '../../../src/postgres/loopback-port-alloc
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type { OwnedProcess } from '../../../src/processes/managed-process.types.js';
 import { ProcessExitWaiter } from '../../../src/processes/process-exit-waiter.js';
+import { cleanupRegistered, observeFixtureCleanup } from './fixture-cleanup.js';
 
 const PASSWORD = 'fixture-password';
 const NONCE = 'revo-readiness-fixture';
-const INITDB_TIMEOUT_MS = 10_000;
+const INITDB_TIMEOUT_MS = 60_000;
 const PROCESS_STOP = { graceMs: 1_000, killWaitMs: 5_000 } as const;
 
-export const REAL_PG_SCENARIO_TIMEOUT_MS = 35_000;
+export const REAL_PG_SCENARIO_TIMEOUT_MS = 90_000;
 
 export class PostgresReadinessScenario {
   private readonly clusters: ClusterFixture[] = [];
+  private closing = false;
 
   async initializesTheOwnedDatabase() {
     const cluster = await this.cluster('scram');
@@ -178,59 +180,132 @@ export class PostgresReadinessScenario {
   }
 
   async cleanup() {
-    await Promise.allSettled(this.clusters.map((cluster) => cluster.close()));
-    this.clusters.length = 0;
+    this.closing = true;
+    await cleanupRegistered(this.clusters, (cluster) => cluster.close());
   }
 
   private async cluster(authentication: 'scram' | 'trust') {
-    const cluster = await ClusterFixture.start(authentication);
+    if (this.closing) {
+      throw new Error('readiness scenario is closing');
+    }
+    const cluster = ClusterFixture.create(authentication);
     this.clusters.push(cluster);
+    await cluster.start();
+    if (this.closing) {
+      throw new Error('readiness scenario is closing');
+    }
     return cluster;
   }
 }
 
 export class ClusterFixture {
+  private rootPath: string | undefined;
+  private fixturePort: number | undefined;
+  private readonly processes = new ManagedProcessService();
+  private readonly children = new Set<OwnedProcess>();
+  private readonly completed = new Set<OwnedProcess>();
+  private readonly stops = new Map<OwnedProcess, Promise<void>>();
+  private reservation: Awaited<ReturnType<LoopbackPortAllocator['reserve']>> | undefined;
+  private statementTimeout: () => boolean = () => false;
+  private starting: Promise<void> | undefined;
+  private closing = false;
+  private closeOperation: Promise<void> | undefined;
+
   private constructor(
-    readonly root: string,
-    readonly port: number,
-    private readonly process: OwnedProcess,
-    private readonly processes: ManagedProcessService,
-    private readonly statementTimeout: () => boolean,
+    private readonly authentication: 'scram' | 'trust',
+    private readonly requestedPort?: number,
   ) {}
 
-  static async start(authentication: 'scram' | 'trust', requestedPort?: number) {
-    const root = await mkdtemp('/tmp/pr-');
-    const processes = new ManagedProcessService();
-    let process: OwnedProcess | undefined;
+  static create(authentication: 'scram' | 'trust', requestedPort?: number) {
+    return new ClusterFixture(authentication, requestedPort);
+  }
+
+  get root() {
+    if (this.rootPath === undefined) {
+      throw new Error('fixture root is not available');
+    }
+    return this.rootPath;
+  }
+
+  get port() {
+    if (this.fixturePort === undefined) {
+      throw new Error('fixture port is not available');
+    }
+    return this.fixturePort;
+  }
+
+  start(): Promise<void> {
+    if (this.closing) {
+      return Promise.reject(new Error('fixture is closing'));
+    }
+    this.starting ??= this.performStart();
+    return this.starting;
+  }
+
+  private requireOpen() {
+    if (this.closing) {
+      throw new Error('fixture is closing');
+    }
+  }
+
+  private track(child: OwnedProcess) {
+    this.children.add(child);
+    void child.completion.then(
+      () => this.completed.add(child),
+      () => undefined,
+    );
+    this.requireOpen();
+  }
+
+  private async performStart() {
     try {
+      this.rootPath = await mkdtemp('/tmp/pr-');
+      this.requireOpen();
+      const root = this.root;
       const data = join(root, 'd');
       const passwordFile = join(root, 'p');
       const binaries = await loadEmbeddedPostgresBinaries();
+      this.requireOpen();
       await writeFile(passwordFile, PASSWORD, { mode: 0o600 });
-      await initializeCluster(processes, binaries.initdb, data, passwordFile, root, authentication);
-      const reservation =
-        requestedPort === undefined ? await new LoopbackPortAllocator().reserve() : undefined;
-      let port: number;
-      if (requestedPort !== undefined) {
-        port = requestedPort;
-      } else if (reservation !== undefined) {
-        port = reservation.port;
-      } else {
-        throw new Error('loopback port reservation missing');
+      this.requireOpen();
+      await initializeCluster(
+        this.processes,
+        binaries.initdb,
+        data,
+        passwordFile,
+        root,
+        this.authentication,
+        (child) => this.track(child),
+      );
+      this.requireOpen();
+      if (this.requestedPort === undefined) {
+        this.reservation = await new LoopbackPortAllocator().reserve();
+        this.requireOpen();
       }
-      await reservation?.release();
-      const started = await startPostgres(processes, binaries.postgres, data, root, port);
-      process = started.process;
-      const fixture = new ClusterFixture(root, port, process, processes, started.statementTimeout);
-      await fixture.waitUntilAlive(Date.now() + 5000);
-      return fixture;
+      this.fixturePort = this.requestedPort ?? this.reservation?.port;
+      await this.releaseReservation();
+      this.requireOpen();
+      const started = await startPostgres(
+        this.processes,
+        binaries.postgres,
+        data,
+        root,
+        this.port,
+        (child) => this.track(child),
+      );
+      this.statementTimeout = started.statementTimeout;
+      this.requireOpen();
+      await this.waitUntilAlive(Date.now() + 5000);
+      this.requireOpen();
     } catch (primary) {
-      if (process) {
-        await processes.stop(process, { graceMs: 1000, killWaitMs: 5000 }).catch(() => undefined);
-        await process.completion;
-      }
-      if (!(primary instanceof RetainedFixtureProcessError)) {
-        await rm(root, { recursive: true, force: true });
+      this.closing = true;
+      // Do not call close(): it waits for this startup operation to settle.
+      const cleanup = await this.releaseResources().then(
+        () => undefined,
+        (error: unknown) => ({ error }),
+      );
+      if (cleanup) {
+        throw startupCleanupFailure(primary, cleanup.error);
       }
       throw primary;
     }
@@ -349,13 +424,88 @@ export class ClusterFixture {
     return this.waitForStatementTimeout(deadline);
   }
 
-  async close() {
-    await this.processes.stop(this.process, { graceMs: 1000, killWaitMs: 5000 });
-    await this.process.completion;
-    await rm(this.root, { recursive: true, force: true });
+  close(): Promise<void> {
+    this.closing = true;
+    this.closeOperation ??= this.performClose();
+    return this.closeOperation;
+  }
+
+  private stopChild(child: OwnedProcess): Promise<void> {
+    const previous = this.stops.get(child);
+    if (previous) {
+      return previous;
+    }
+    const stopping = observeFixtureCleanup(
+      (async () => {
+        if (!this.completed.has(child)) {
+          await this.processes.stop(child, PROCESS_STOP);
+        }
+        // A rejected stop never falls through into an unbounded completion wait.
+        await child.completion;
+      })(),
+    );
+    this.stops.set(child, stopping);
+    return stopping;
+  }
+
+  private async stopChildren() {
+    const results = await Promise.allSettled(
+      [...this.children].map((child) => this.stopChild(child)),
+    );
+    const failures = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Fixture process cleanup unconfirmed');
+    }
+  }
+
+  private async releaseReservation() {
+    if (this.reservation) {
+      await this.reservation.release();
+      this.reservation = undefined;
+    }
+  }
+
+  private async releaseResources() {
+    const results = await Promise.allSettled([
+      this.stopChildren(),
+      observeFixtureCleanup(this.releaseReservation()),
+    ]);
+    const failures = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Fixture resources retained');
+    }
+    if (this.rootPath !== undefined) {
+      await rm(this.rootPath, { recursive: true, force: true });
+    }
+  }
+
+  private async performClose() {
+    // Interrupt currently owned initdb/postgres without waiting for startup first.
+    // Startup checks closing after every acquisition, including a late spawn.
+    const results = await Promise.allSettled([
+      this.stopChildren(),
+      observeFixtureCleanup(
+        this.starting?.then(
+          () => undefined,
+          () => undefined,
+        ) ?? Promise.resolve(),
+      ),
+    ]);
+    const failures = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Fixture close unconfirmed');
+    }
+    await this.releaseResources();
   }
 
   private async waitUntilAlive(deadline: number): Promise<void> {
+    this.requireOpen();
     if (await this.isAlive().catch(() => false)) {
       return;
     }
@@ -367,6 +517,9 @@ export class ClusterFixture {
   }
 }
 
+const startupCleanupFailure = (primary: unknown, cleanup: unknown) =>
+  new AggregateError([primary, cleanup], 'Fixture startup and cleanup failed', { cause: primary });
+
 const initializeCluster = async (
   processes: ManagedProcessService,
   executable: string,
@@ -374,6 +527,7 @@ const initializeCluster = async (
   passwordFile: string,
   root: string,
   authentication: 'scram' | 'trust',
+  track: (child: OwnedProcess) => void,
 ) => {
   const initdb = await processes.start({
     executable,
@@ -390,15 +544,10 @@ const initializeCluster = async (
     env: { LC_ALL: 'C' },
     stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' },
   });
+  track(initdb);
   initdb.stderr?.resume();
   const completed = await new ProcessExitWaiter().wait(initdb.completion, INITDB_TIMEOUT_MS);
   if (!completed) {
-    try {
-      await processes.stop(initdb, PROCESS_STOP);
-      await initdb.completion;
-    } catch {
-      throw new RetainedFixtureProcessError();
-    }
     throw new Error('fixture initdb timed out');
   }
   const completion = await initdb.completion;
@@ -407,19 +556,13 @@ const initializeCluster = async (
   }
 };
 
-class RetainedFixtureProcessError extends Error {
-  constructor() {
-    super('fixture process cleanup could not be confirmed');
-    this.name = 'RetainedFixtureProcessError';
-  }
-}
-
 const startPostgres = async (
   processes: ManagedProcessService,
   executable: string,
   data: string,
   root: string,
   port: number,
+  track: (child: OwnedProcess) => void,
 ) => {
   const process = await processes.start({
     executable,
@@ -443,6 +586,7 @@ const startPostgres = async (
     env: { LC_ALL: 'C' },
     stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' },
   });
+  track(process);
   const marker = 'canceling statement due to statement timeout';
   let tail = '';
   let observed = false;

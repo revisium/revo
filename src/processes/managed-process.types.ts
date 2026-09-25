@@ -32,6 +32,7 @@ export interface ProcessCompletion {
 export interface StopProcessRequest {
   readonly graceMs: number;
   readonly killWaitMs: number;
+  readonly escalationSignal?: 'SIGINT' | 'SIGKILL';
 }
 
 export type ProcessCancellationResult =

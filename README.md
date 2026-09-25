@@ -65,9 +65,32 @@ settings, including host, port, public URL, database URL, and log directory, com
 configuration file or environment. Unknown arguments and options fail with exit code 2. The package
 manifest remains private during the foundation stage.
 
+If an old `revo-tui@0.1.0-alpha.1` process left an empty command-storage lock,
+stop all old TUI clients and prevent new alpha.1 launches before migrating. The
+maintenance command does not start Revo or connect to its API; provide the exact
+GraphQL URL used by the legacy TUI so it selects the same storage namespace:
+
+```sh
+revo tui storage migrate \
+  --channel stable \
+  --data-dir /path/to/revo-data \
+  --api-url http://127.0.0.1:3210/graphql \
+  --confirm-offline
+```
+
+The shared Revo options `--channel`, `--config`, and `--data-dir` may also be
+placed before `storage`; `--data-dir` always denotes the Revo root, and the
+migration target is its `tui` child directory. Repeated shared options and
+`--startup-timeout` are rejected.
+It resolves the same Revo configuration and migrates
+`<REVO_DATA_DIR>/tui`. The acknowledgement is not a process fence. Back up the
+data directory first, and do not migrate while a legacy process can access it.
+The command requires a Revo release that bundles the migration-capable TUI
+launcher.
+
 ## Development
 
-Use Node.js 26.8.2 and pnpm 12.4.1 in an isolated development environment:
+Use Node.js 26.8.2 and pnpm 12.5.1 in an isolated development environment:
 
 ```sh
 pnpm install --frozen-lockfile

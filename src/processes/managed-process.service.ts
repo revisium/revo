@@ -285,7 +285,7 @@ class ManagedOwnedProcess implements OwnedProcess {
     if (await this.exitWaiter.wait(this.completion, request.graceMs)) {
       return;
     }
-    this.signal('SIGKILL');
+    this.signal(request.escalationSignal ?? 'SIGKILL');
     if (!(await this.exitWaiter.wait(this.completion, request.killWaitMs))) {
       throw new ManagedProcessError(
         'revo.process.stop-timeout',

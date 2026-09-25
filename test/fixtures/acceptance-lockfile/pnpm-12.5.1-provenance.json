@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "description": "Unmodified lockfile before/after from a real pnpm 12.5.1 lockfile-only run; source and after YAML fixtures are byte-for-byte copies.",
+  "sandbox": "revo-revo-posix-installer-diagnostics-20260920-r-8dcb1c48",
+  "experimentRoot": "/tmp/revo-lock-c0.neQLPO",
+  "nodeVersion": "v26.8.2",
+  "pnpmVersion": "12.5.1",
+  "pnpmArguments": [
+    "install",
+    "--lockfile-only",
+    "--ignore-scripts",
+    "--no-frozen-lockfile",
+    "--pm-on-fail=error",
+    "--config.strict-ssl=true",
+    "--store-dir",
+    "<private-c0-root>/store"
+  ],
+  "sourcePackageSha256": "ac484a022d7325ebae8c672d5de6e013dc2cae4052dc5b3e12034223d7410984",
+  "sourceLockSha256": "a2e290f7eda530c693fb5e87df4427cf75c6ff0b29745a933d54bbe4336d1457",
+  "sourceWorkspaceSha256": "69e52ea4c52dd2316f2f8e780a5c9ae7266789afe396ce5ac0b08ecbd11fc460",
+  "stagingPackageSha256": "deca7cf57e5321acf0b0a519a64d9490f10ed2e4b87024a8ec1a6d85c513223c",
+  "afterLockSha256": "68b87fa64f0de2e8809acb1d388122c1d1c6ec4163b0b00384dd84b15adbea00",
+  "diffSha256": "cf6e09a67c77dfbc2c92a0f41f3525cf3cee6af8c6112d80dd0c1413120c3e40",
+  "tui": {
+    "name": "@revisium/revo-tui",
+    "sourceVersion": "0.1.0-alpha.1",
+    "tarballVersion": "0.0.0",
+    "tarballFilename": "final-acceptance-revo-tui-0.0.0.tgz",
+    "tarballSha256": "8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2",
+    "tarballSha512Hex": "22bb6f175cd83e6bb5404e82566056a5f7d02a80b3798cfd0501c3484f0b8929ab194112feb2b71351276224555ac023e5b64fbc054027da632cc49de090f576",
+    "integrity": "sha512-IrtvF1zYPmu1QE6CVmBWpffQKoCzeYz9BQHDSE8LiSmrGUES/rK3E1EnYiRVWsAj5bZPvAVAJ9pjLMSd4JD1dg==",
+    "url": "https://127.0.0.1:18446/tui/8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2/final-acceptance-revo-tui-0.0.0.tgz?sha256=8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2"
+  },
+  "observedStructure": {
+    "documentCount": 2,
+    "toolchainDocumentIndex": 0,
+    "applicationDocumentIndex": 1,
+    "importer": ".",
+    "sourcePackageKey": "@revisium/revo-tui@0.1.0-alpha.1",
+    "targetPackageKey": "@revisium/revo-tui@https://127.0.0.1:18446/tui/8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2/final-acceptance-revo-tui-0.0.0.tgz?sha256=8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2",
+    "sourceSnapshotKey": "@revisium/revo-tui@0.1.0-alpha.1(react-devtools-core@7.0.1)(typescript@7.0.2)(web-tree-sitter@0.25.10)(ws@8.21.3)",
+    "targetSnapshotKey": "@revisium/revo-tui@https://127.0.0.1:18446/tui/8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2/final-acceptance-revo-tui-0.0.0.tgz?sha256=8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2(react-devtools-core@7.0.1)(typescript@7.0.2)(web-tree-sitter@0.25.10)(ws@8.21.3)",
+    "peerSuffix": "(react-devtools-core@7.0.1)(typescript@7.0.2)(web-tree-sitter@0.25.10)(ws@8.21.3)",
+    "resolution": {
+      "integrity": "sha512-IrtvF1zYPmu1QE6CVmBWpffQKoCzeYz9BQHDSE8LiSmrGUES/rK3E1EnYiRVWsAj5bZPvAVAJ9pjLMSd4JD1dg==",
+      "tarball": "https://127.0.0.1:18446/tui/8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2/final-acceptance-revo-tui-0.0.0.tgz?sha256=8562690a2a995b0754470604b3ff38c499984ca3d8ab444bab311737cd6a5bd2"
+    },
+    "snapshotValueUnchanged": true,
+    "workspaceUnchanged": true
+  }
+}

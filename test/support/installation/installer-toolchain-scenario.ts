@@ -1,11 +1,16 @@
 // oxlint-disable no-unsafe-type-assertion, typescript/unbound-method -- ordered bounded diagnostics and dynamic builder fixture
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import {
+  appendFile,
   chmod,
   copyFile,
+  lstat,
   mkdir,
   mkdtemp,
+  open,
+  opendir,
   readFile,
   realpath,
   readdir,
@@ -14,14 +19,15 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { release as osRelease, tmpdir } from 'node:os';
-import { join, resolve as resolvePath } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join, relative as relativePath, resolve as resolvePath, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { vi } from 'vitest';
 
 import { LoopbackPortAllocator } from '../../../src/postgres/loopback-port-allocator.js';
 import { ServerStatusService } from '../../../src/server/server-status.service.js';
 import { ServerStopService } from '../../../src/server/server-stop.service.js';
+import { assertActivationTestModes } from './activation-test-modes.js';
 import {
   bootstrapPolicy,
   embeddedBootstrap,
@@ -40,6 +46,9 @@ const INTEL_BUNDLE_LIMIT = 1536 * 1024;
 const INTEL_SUMMARY_RESERVE = 128 * 1024;
 const INTEL_COLLECTOR_KILL_AT = 4_000;
 const INTEL_COLLECTOR_DEADLINE = 5_000;
+const INITIAL_INSTALL_DIAGNOSTIC_MAX_ENTRIES = 64;
+const INITIAL_INSTALL_DIAGNOSTIC_TAIL_BYTES = 4096;
+const INITIAL_INSTALL_DIAGNOSTIC_OUTPUT_BYTES = 16 * 1024;
 const INTEL_ENVIRONMENT_KEYS = [
   'REVO_INTEL_DIAGNOSTICS_DIR',
   'REVO_INTEL_BASE_SHA',
@@ -117,6 +126,491 @@ function redactDiagnosticText(value: string, roots: readonly string[] = []): str
     result = result.replaceAll(root, '<fixture>');
   }
   return result;
+}
+
+type InitialInstallDiagnosticStatus =
+  | 'captured'
+  | 'missing'
+  | 'ambiguous'
+  | 'unsafe'
+  | 'io-error'
+  | 'too-large';
+
+interface InitialInstallDiagnosticFile {
+  readonly label: string;
+  readonly status: InitialInstallDiagnosticStatus;
+  readonly sizeBytes: number | null;
+  readonly truncated: boolean;
+  readonly tail?: string;
+}
+
+function initialDiagnosticErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return undefined;
+  }
+  return typeof error.code === 'string' ? error.code : undefined;
+}
+
+function isPathWithin(parent: string, candidate: string): boolean {
+  const relative = relativePath(parent, candidate);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${sep}`));
+}
+
+async function inspectFixtureDirectory(
+  canonicalRoot: string,
+  segments: readonly string[],
+): Promise<{ readonly status: 'ok' | 'missing' | 'unsafe' | 'io-error'; readonly path: string }> {
+  let current = canonicalRoot;
+  for (const segment of segments) {
+    if (!segment || segment === '.' || segment === '..' || segment.includes(sep)) {
+      return { status: 'unsafe', path: current };
+    }
+    current = join(current, segment);
+    let metadata;
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- each path component must be validated before resolving the next one.
+      metadata = await lstat(current);
+    } catch (error) {
+      return {
+        status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
+        path: current,
+      };
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      return { status: 'unsafe', path: current };
+    }
+  }
+  return { status: 'ok', path: current };
+}
+
+async function listFixtureEntries(directory: string): Promise<{
+  readonly status: 'ok' | 'missing' | 'unsafe' | 'io-error' | 'limit-reached';
+  readonly names: readonly string[];
+}> {
+  const names: string[] = [];
+  let handle;
+  try {
+    handle = await opendir(directory);
+    for await (const entry of handle) {
+      names.push(entry.name);
+      if (names.length === INITIAL_INSTALL_DIAGNOSTIC_MAX_ENTRIES) {
+        return { status: 'limit-reached', names };
+      }
+    }
+    return { status: 'ok', names };
+  } catch (error) {
+    return {
+      status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
+      names,
+    };
+  } finally {
+    if (handle) {
+      await handle.close().catch(() => undefined);
+    }
+  }
+}
+
+function cleanInitialDiagnosticText(value: string, roots: readonly string[]): string {
+  const withoutControls = value
+    // oxlint-disable-next-line no-control-regex -- remove ANSI escape sequences from untrusted diagnostic text.
+    .replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu, '')
+    // oxlint-disable-next-line no-control-regex -- strip remaining ASCII and C1 control bytes before redaction.
+    .replace(/[\u0000-\u0008\u000b-\u000d\u000e-\u001f\u007f-\u009f]/gu, '');
+  return redactDiagnosticText(withoutControls, roots);
+}
+
+async function readInitialDiagnosticFile(
+  canonicalRoot: string,
+  relativeSegments: readonly string[],
+  label: string,
+  rootsToRedact: readonly string[],
+): Promise<InitialInstallDiagnosticFile> {
+  const parent = await inspectFixtureDirectory(canonicalRoot, relativeSegments.slice(0, -1));
+  if (parent.status !== 'ok') {
+    return {
+      label,
+      status: parent.status === 'io-error' ? 'io-error' : parent.status,
+      sizeBytes: null,
+      truncated: false,
+    };
+  }
+
+  const path = join(parent.path, relativeSegments.at(-1) ?? '');
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    return {
+      label,
+      status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
+      sizeBytes: null,
+      truncated: false,
+    };
+  }
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    return { label, status: 'unsafe', sizeBytes: null, truncated: false };
+  }
+
+  let file;
+  try {
+    file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await file.stat();
+    if (!opened.isFile() || !Number.isSafeInteger(opened.size) || opened.size < 0) {
+      return { label, status: 'unsafe', sizeBytes: null, truncated: false };
+    }
+    const sizeBytes = opened.size;
+    const readBytes = Math.min(sizeBytes, INITIAL_INSTALL_DIAGNOSTIC_TAIL_BYTES);
+    const offset = sizeBytes - readBytes;
+    const buffer = Buffer.alloc(readBytes);
+    const { bytesRead } = await file.read(buffer, 0, readBytes, offset);
+    if (bytesRead !== readBytes) {
+      return { label, status: 'io-error', sizeBytes, truncated: sizeBytes > readBytes };
+    }
+
+    let text = buffer.subarray(0, bytesRead).toString('utf8');
+    const lines = text.split('\n');
+    if (offset > 0) {
+      lines.shift();
+    }
+    if (lines.at(-1) === '') {
+      lines.pop();
+    } else if (lines.length > 0) {
+      lines.pop();
+    }
+    text = lines.join('\n');
+    const tail = cleanInitialDiagnosticText(text, rootsToRedact);
+    return {
+      label,
+      status: 'captured',
+      sizeBytes,
+      truncated: offset > 0,
+      ...(tail.length === 0 ? {} : { tail }),
+    };
+  } catch (error) {
+    return {
+      label,
+      status: initialDiagnosticErrorCode(error) === 'ENOENT' ? 'missing' : 'io-error',
+      sizeBytes: null,
+      truncated: false,
+    };
+  } finally {
+    await file?.close().catch(() => undefined);
+  }
+}
+
+/** @internal Test-only bounded collector; production callers use the fixture-bound closure. */
+export async function collectInitialInstallFailureDiagnostics(
+  fixtureRoot: string,
+  fixtureChannelRoot: string,
+): Promise<string> {
+  const lines: string[] = [];
+  const prefix = 'POSIX_INSTALL_DIAGNOSTIC ';
+  const truncationMarker = `${prefix}status=output-truncated`;
+  const outputBudget =
+    INITIAL_INSTALL_DIAGNOSTIC_OUTPUT_BYTES - Buffer.byteLength(`${truncationMarker}\n`);
+  let emittedBytes = 0;
+  let outputTruncated = false;
+  const emit = (line: string) => {
+    if (outputTruncated) {
+      return;
+    }
+    const rendered = `${prefix}${line}`;
+    const lineBytes = Buffer.byteLength(rendered) + 1;
+    if (emittedBytes + lineBytes > outputBudget) {
+      outputTruncated = true;
+      return;
+    }
+    lines.push(rendered);
+    emittedBytes += lineBytes;
+  };
+  const finish = () => `${[...lines, ...(outputTruncated ? [truncationMarker] : [])].join('\n')}\n`;
+  try {
+    const canonicalRoot = await realpath(fixtureRoot);
+    const canonicalRootStat = await lstat(canonicalRoot);
+    if (canonicalRootStat.isSymbolicLink() || !canonicalRootStat.isDirectory()) {
+      return 'POSIX_INSTALL_DIAGNOSTIC status=diagnostics-incomplete reason=unsafe-fixture-root\n';
+    }
+    const relativeChannelRoot = relativePath(
+      resolvePath(fixtureRoot),
+      resolvePath(fixtureChannelRoot),
+    );
+    if (!isPathWithin(resolvePath(fixtureRoot), resolvePath(fixtureChannelRoot))) {
+      return 'POSIX_INSTALL_DIAGNOSTIC status=diagnostics-incomplete reason=channel-outside-fixture\n';
+    }
+    const channelSegments = relativeChannelRoot ? relativeChannelRoot.split(sep) : [];
+    const channel = await inspectFixtureDirectory(canonicalRoot, channelSegments);
+    if (channel.status !== 'ok') {
+      emit(
+        `status=${channel.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempts=${channel.status}`,
+      );
+      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
+        emit(
+          `${label} status=${channel.status === 'missing' ? 'missing' : channel.status} sizeBytes=unknown truncated=false`,
+        );
+      }
+      return finish();
+    }
+
+    const attemptsListing = await listFixtureEntries(channel.path);
+    const attemptNames = attemptsListing.names.filter((name) =>
+      /^\.attempt\.[A-Za-z0-9_-]+$/u.test(name),
+    );
+    const attemptName = attemptNames[0];
+    if (attemptsListing.status !== 'ok' || attemptNames.length !== 1 || attemptName === undefined) {
+      const attemptStatus =
+        attemptsListing.status === 'limit-reached' || attemptNames.length > 1
+          ? 'ambiguous'
+          : attemptsListing.status === 'missing'
+            ? 'missing'
+            : attemptsListing.status === 'ok'
+              ? 'missing'
+              : 'io-error';
+      emit(
+        `status=${attemptStatus === 'io-error' ? 'diagnostics-incomplete' : 'complete'} attempts=${attemptStatus}`,
+      );
+      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
+        emit(`${label} status=${attemptStatus} sizeBytes=unknown truncated=false`);
+      }
+      return finish();
+    }
+
+    const attempt = await inspectFixtureDirectory(canonicalRoot, [...channelSegments, attemptName]);
+    if (attempt.status !== 'ok') {
+      emit(`status=diagnostics-incomplete attempts=${attempt.status}`);
+      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
+        emit(`${label} status=${attempt.status} sizeBytes=unknown truncated=false`);
+      }
+      return finish();
+    }
+    const scratch = await inspectFixtureDirectory(canonicalRoot, [
+      ...channelSegments,
+      attemptName,
+      'runtime',
+      'scratch',
+    ]);
+    if (scratch.status !== 'ok') {
+      emit(
+        `status=${scratch.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempts=1 scratch=${scratch.status}`,
+      );
+      for (const label of ['install-session.log', 'server-start.log', 'activation-result.log']) {
+        emit(`${label} status=${scratch.status} sizeBytes=unknown truncated=false`);
+      }
+      return finish();
+    }
+
+    const activationListing = await listFixtureEntries(scratch.path);
+    const activationNames = activationListing.names.filter((name) =>
+      /^\.activation-request-[A-Za-z0-9_-]+$/u.test(name),
+    );
+    const activationName = activationNames[0];
+    const activationStatus =
+      activationListing.status === 'limit-reached' || activationNames.length > 1
+        ? 'ambiguous'
+        : activationListing.status === 'missing'
+          ? 'missing'
+          : activationListing.status === 'ok'
+            ? activationNames.length === 0
+              ? 'missing'
+              : 'captured'
+            : 'io-error';
+    if (activationNames.length === 1 && activationName !== undefined) {
+      const activationDirectory = await inspectFixtureDirectory(canonicalRoot, [
+        ...channelSegments,
+        attemptName,
+        'runtime',
+        'scratch',
+        activationName,
+      ]);
+      if (activationDirectory.status !== 'ok') {
+        emit(
+          `status=diagnostics-incomplete attempts=1 activationRequest=${activationDirectory.status}`,
+        );
+      }
+    }
+
+    const rootsToRedact = [fixtureRoot, fixtureChannelRoot, canonicalRoot, channel.path];
+    const files: InitialInstallDiagnosticFile[] = [
+      await readInitialDiagnosticFile(
+        canonicalRoot,
+        [...channelSegments, attemptName, 'runtime', 'scratch', 'install-session.log'],
+        'install-session.log',
+        rootsToRedact,
+      ),
+      await readInitialDiagnosticFile(
+        canonicalRoot,
+        [...channelSegments, attemptName, 'runtime', 'scratch', 'server-start.log'],
+        'server-start.log',
+        rootsToRedact,
+      ),
+      activationNames.length === 1 &&
+      activationName !== undefined &&
+      activationStatus === 'captured'
+        ? await readInitialDiagnosticFile(
+            canonicalRoot,
+            [...channelSegments, attemptName, 'runtime', 'scratch', activationName, 'result.log'],
+            'activation-result.log',
+            rootsToRedact,
+          )
+        : {
+            label: 'activation-result.log',
+            status: activationStatus,
+            sizeBytes: null,
+            truncated: false,
+          },
+    ];
+    const incomplete =
+      attemptsListing.status !== 'ok' ||
+      activationStatus === 'io-error' ||
+      files.some((file) => ['unsafe', 'io-error', 'too-large'].includes(file.status));
+    emit(
+      `status=${incomplete ? 'diagnostics-incomplete' : 'complete'} attempts=1 activationRequest=${activationStatus}`,
+    );
+    for (const file of files) {
+      emit(
+        `${file.label} status=${file.status} sizeBytes=${file.sizeBytes ?? 'unknown'} truncated=${file.truncated}`,
+      );
+      if (file.tail) {
+        for (const line of file.tail.split('\n')) {
+          emit(`${file.label} | ${line}`);
+        }
+      } else if (file.status === 'captured') {
+        emit(`${file.label} | tail-unavailable`);
+      }
+    }
+  } catch {
+    return 'POSIX_INSTALL_DIAGNOSTIC status=diagnostics-incomplete reason=collector-error\n';
+  }
+
+  return finish();
+}
+
+/** @internal Test-only collector for a caller-identified retained attempt. */
+export async function collectInstallAttemptDiagnostics(
+  fixtureRoot: string,
+  fixtureChannelRoot: string,
+  attemptName: string | undefined,
+): Promise<string> {
+  const prefix = 'POSIX_INSTALL_DIAGNOSTIC ';
+  const truncationMarker = `${prefix}status=output-truncated`;
+  const outputBudget =
+    INITIAL_INSTALL_DIAGNOSTIC_OUTPUT_BYTES - Buffer.byteLength(`${truncationMarker}\n`);
+  const lines: string[] = [];
+  let emittedBytes = 0;
+  let outputTruncated = false;
+  const emit = (line: string) => {
+    if (outputTruncated) {
+      return;
+    }
+    const rendered = `${prefix}${line}`;
+    const lineBytes = Buffer.byteLength(rendered) + 1;
+    if (emittedBytes + lineBytes > outputBudget) {
+      outputTruncated = true;
+      return;
+    }
+    lines.push(rendered);
+    emittedBytes += lineBytes;
+  };
+  const finish = () => `${[...lines, ...(outputTruncated ? [truncationMarker] : [])].join('\n')}\n`;
+  try {
+    if (attemptName === undefined || !/^\.attempt\.[A-Za-z0-9_-]+$/u.test(attemptName)) {
+      emit('status=attempt-unresolved reason=invalid-attempt-name');
+      return finish();
+    }
+    const canonicalRoot = await realpath(fixtureRoot);
+    const rootStat = await lstat(canonicalRoot);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      emit('status=diagnostics-incomplete reason=unsafe-fixture-root');
+      return finish();
+    }
+    if (!isPathWithin(resolvePath(fixtureRoot), resolvePath(fixtureChannelRoot))) {
+      emit('status=diagnostics-incomplete reason=channel-outside-fixture');
+      return finish();
+    }
+    const channelRelative = relativePath(resolvePath(fixtureRoot), resolvePath(fixtureChannelRoot));
+    const channelSegments = channelRelative ? channelRelative.split(sep) : [];
+    const attempt = await inspectFixtureDirectory(canonicalRoot, [...channelSegments, attemptName]);
+    if (attempt.status !== 'ok') {
+      emit(
+        `status=${attempt.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempt=${attemptName} attemptStatus=${attempt.status}`,
+      );
+      return finish();
+    }
+    const scratch = await inspectFixtureDirectory(canonicalRoot, [
+      ...channelSegments,
+      attemptName,
+      'runtime',
+      'scratch',
+    ]);
+    if (scratch.status !== 'ok') {
+      emit(
+        `status=${scratch.status === 'missing' ? 'complete' : 'diagnostics-incomplete'} attempt=${attemptName} scratch=${scratch.status}`,
+      );
+      return finish();
+    }
+    const rootsToRedact = [fixtureRoot, fixtureChannelRoot, canonicalRoot, attempt.path];
+    const files: InitialInstallDiagnosticFile[] = [
+      await readInitialDiagnosticFile(
+        canonicalRoot,
+        [...channelSegments, attemptName, 'runtime', 'scratch', 'install-session.log'],
+        'install-session.log',
+        rootsToRedact,
+      ),
+      await readInitialDiagnosticFile(
+        canonicalRoot,
+        [...channelSegments, attemptName, 'runtime', 'scratch', 'server-start.log'],
+        'server-start.log',
+        rootsToRedact,
+      ),
+    ];
+    const activationListing = await listFixtureEntries(scratch.path);
+    const activationNames = activationListing.names.filter((name) =>
+      /^\.activation-request-[A-Za-z0-9_-]+$/u.test(name),
+    );
+    const activationName = activationNames[0];
+    if (activationNames.length === 1 && activationName !== undefined) {
+      files.push(
+        await readInitialDiagnosticFile(
+          canonicalRoot,
+          [...channelSegments, attemptName, 'runtime', 'scratch', activationName, 'result.log'],
+          'activation-result.log',
+          rootsToRedact,
+        ),
+      );
+    } else {
+      files.push({
+        label: 'activation-result.log',
+        status:
+          activationListing.status === 'ok' && activationNames.length === 0
+            ? 'missing'
+            : activationNames.length > 1 || activationListing.status === 'limit-reached'
+              ? 'ambiguous'
+              : 'io-error',
+        sizeBytes: null,
+        truncated: false,
+      });
+    }
+    const incomplete = files.some((file) =>
+      ['unsafe', 'io-error', 'too-large'].includes(file.status),
+    );
+    emit(
+      `status=${incomplete ? 'diagnostics-incomplete' : 'complete'} attempt=${attemptName} activationRequest=${activationNames.length === 1 ? 'captured' : 'unresolved'}`,
+    );
+    for (const file of files) {
+      emit(
+        `${file.label} status=${file.status} sizeBytes=${file.sizeBytes ?? 'unknown'} truncated=${file.truncated}`,
+      );
+      if (file.tail) {
+        for (const line of file.tail.split('\n')) {
+          emit(`${file.label} | ${line}`);
+        }
+      } else if (file.status === 'captured') {
+        emit(`${file.label} | tail-unavailable`);
+      }
+    }
+  } catch {
+    emit('status=diagnostics-incomplete reason=collector-error');
+  }
+  return finish();
 }
 
 function appendDiagnosticTail(previous: string, chunk: string): string {
@@ -1746,7 +2240,7 @@ export async function portableToolchain(
   await chmod(join(nodeSource, 'bin', 'node'), 0o755);
   await writeFile(
     join(pnpmSource, 'pnpm'),
-    '#!/bin/sh\nif [ "$1" = "--version" ]; then printf \'12.4.1\\n\'; else trap \'[ -z "${REVO_PNPM_TERMINATED:-}" ] || : >"$REVO_PNPM_TERMINATED"; exit 143\' HUP INT TERM; [ -z "${REVO_PNPM_STARTED:-}" ] || : >"$REVO_PNPM_STARTED"; while [ -n "${REVO_PNPM_HOLD:-}" ] && [ -e "$REVO_PNPM_HOLD" ]; do :; done; [ -z "${REVO_PNPM_INSTALLS:-}" ] || : >>"$REVO_PNPM_INSTALLS"; [ -n "${REVO_PNPM_FAIL:-}" ] && exit 7 || :; printf \'{"name":"pnpm:install"}\\n\'; : >"$PWD/install-complete"; fi\n',
+    '#!/bin/sh\nif [ "$1" = "--version" ] || { [ "$1" = "--pm-on-fail=ignore" ] && [ "$2" = "--version" ]; }; then printf \'12.5.1\\n\'; else trap \'[ -z "${REVO_PNPM_TERMINATED:-}" ] || : >"$REVO_PNPM_TERMINATED"; exit 143\' HUP INT TERM; [ -z "${REVO_PNPM_STARTED:-}" ] || : >"$REVO_PNPM_STARTED"; while [ -n "${REVO_PNPM_HOLD:-}" ] && [ -e "$REVO_PNPM_HOLD" ]; do :; done; [ -z "${REVO_PNPM_INSTALLS:-}" ] || : >>"$REVO_PNPM_INSTALLS"; [ -n "${REVO_PNPM_FAIL:-}" ] && exit 7 || :; printf \'{"name":"pnpm:install"}\\n\'; : >"$PWD/install-complete"; fi\n',
   );
   await chmod(join(pnpmSource, 'pnpm'), 0o755);
   await writeFile(
@@ -1760,7 +2254,7 @@ export async function portableToolchain(
   await chmod(join(pnpmSource, 'pnpm'), 0o755);
   await writeFile(
     join(pnpmSource, 'launcher.mjs'),
-    "import { appendFile, access, writeFile } from 'node:fs/promises';\nconst codes = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };\nfor (const [signal, code] of Object.entries(codes)) process.once(signal, async () => { if (process.env.REVO_PNPM_TERMINATED) await writeFile(process.env.REVO_PNPM_TERMINATED, 'ack\\n'); process.exit(code); });\nif (process.argv[2] === '--version') process.stdout.write('12.4.1\\n');\nelse { if (process.env.REVO_PNPM_STARTED) await writeFile(process.env.REVO_PNPM_STARTED, 'ready\\n'); while (process.env.REVO_PNPM_HOLD && await access(process.env.REVO_PNPM_HOLD).then(() => true, () => false)) await new Promise((resolve) => setTimeout(resolve, 10)); if (process.env.REVO_PNPM_INSTALLS) await appendFile(process.env.REVO_PNPM_INSTALLS, 'install\\n'); if (process.env.REVO_PNPM_NODE_RECORD) await writeFile(process.env.REVO_PNPM_NODE_RECORD, `${process.execPath}\\n`); if (process.env.REVO_PNPM_FAIL) process.exit(7); process.stdout.write('{\"name\":\"pnpm:install\"}\\n'); await writeFile(`${process.cwd()}/install-complete`, 'done\\n'); }\n",
+    "import { appendFile, access, writeFile } from 'node:fs/promises';\nconst codes = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };\nfor (const [signal, code] of Object.entries(codes)) process.once(signal, async () => { if (process.env.REVO_PNPM_TERMINATED) await writeFile(process.env.REVO_PNPM_TERMINATED, 'ack\\n'); process.exit(code); });\nconst args = process.argv.slice(2);\nif (args[0] === '--version' || (args[0] === '--pm-on-fail=ignore' && args[1] === '--version')) process.stdout.write('12.5.1\\n');\nelse { if (process.env.REVO_PNPM_STARTED) await writeFile(process.env.REVO_PNPM_STARTED, 'ready\\n'); while (process.env.REVO_PNPM_HOLD && await access(process.env.REVO_PNPM_HOLD).then(() => true, () => false)) await new Promise((resolve) => setTimeout(resolve, 10)); if (process.env.REVO_PNPM_INSTALLS) await appendFile(process.env.REVO_PNPM_INSTALLS, 'install\\n'); if (process.env.REVO_PNPM_NODE_RECORD) await writeFile(process.env.REVO_PNPM_NODE_RECORD, `${process.execPath}\\n`); if (process.env.REVO_PNPM_FAIL) process.exit(7); process.stdout.write('{\"name\":\"pnpm:install\"}\\n'); await writeFile(`${process.cwd()}/install-complete`, 'done\\n'); }\n",
   );
   const nodeFormat = process.platform === 'darwin' ? 'tar.gz' : 'tar.xz';
   const nodeArchive = join(root, `node.${nodeFormat}`);
@@ -1877,11 +2371,129 @@ export async function portableToolchain(
   responses[pnpmDescriptor.url] = (await readFile(pnpmArchive)).toString('base64');
   const responseMap = join(root, 'responses.json');
   await writeFile(responseMap, JSON.stringify(responses), { mode: 0o600 });
+  const postgresObserver = join(root, 'postgres-observer.mjs');
+  const postgresObserverOutput = join(root, 'postgres-observer.log');
+  await writeFile(postgresObserverOutput, '', { mode: 0o600 });
+  await writeFile(
+    postgresObserver,
+    String.raw`import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { appendFileSync } from 'node:fs';
+import { basename } from 'node:path';
+
+const metadata = new URL(import.meta.url);
+const output = metadata.searchParams.get('output');
+const fixtureRoot = metadata.searchParams.get('root');
+const MAX_STDERR_BYTES = 12 * 1024;
+let capturedStderrBytes = 0;
+
+const clean = (value) => value
+  .replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu, '')
+  .replace(/[\u0000-\u0008\u000b-\u000d\u000e-\u001f\u007f-\u009f]/gu, '')
+  .replace(/\b(postgres(?:ql)?:\/\/)[^\s/@]+@/giu, '$1[redacted]@')
+  .replace(/\b(password|secret|token|authorization|cookie)(\s*[:=]\s*)(["']?)[^\s,;"']+/giu, '$1$2[redacted]')
+  .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/giu, 'Bearer [redacted]')
+  .replace(fixtureRoot ?? '', '<fixture>');
+const write = (event) => {
+  if (!output) return;
+  try { appendFileSync(output, JSON.stringify(event) + '\\n', { mode: 0o600 }); } catch {}
+};
+const insideFixture = (value) => typeof fixtureRoot === 'string' &&
+  (value === fixtureRoot || value.startsWith(fixtureRoot + '/'));
+const postgresInvocation = (command, args, options) => {
+  const executable = typeof command === 'string' ? command : '';
+  const values = Array.isArray(args) ? args.map((value) => String(value)) : [];
+  const dataIndex = values.indexOf('-D');
+  const clusterDir = dataIndex >= 0 ? values[dataIndex + 1] : undefined;
+  const cwd = typeof options?.cwd === 'string' ? options.cwd : '';
+  return basename(executable) === 'postgres' &&
+    executable.startsWith('/') &&
+    typeof clusterDir === 'string' && insideFixture(clusterDir) &&
+    insideFixture(cwd);
+};
+const originalSpawn = cp.spawn;
+cp.spawn = (command, args, options) => {
+  const values = Array.isArray(args) ? args.map((value) => String(value)) : [];
+  const isServerEntry = typeof command === 'string' &&
+    command === process.execPath &&
+    values.length === 1 &&
+    values[0].endsWith('/dist/bin/revo-server.js');
+  if (isServerEntry && output && options && typeof options.env === 'object' && options.env !== null) {
+    const current = typeof options.env.NODE_OPTIONS === 'string' ? options.env.NODE_OPTIONS : '';
+    const option = '--import=' + metadata.href;
+    const env = current.includes(option) ? options.env : { ...options.env, NODE_OPTIONS: current ? current + ' ' + option : option };
+    return originalSpawn(command, args, { ...options, env });
+  }
+  const child = originalSpawn(command, args, options);
+  if (!postgresInvocation(command, args, options)) return child;
+  write({ event: 'postgres-spawn-matched', executable: basename(String(command)), cwdInsideFixture: true });
+  const chunks = [];
+  let bytes = 0;
+  const stderr = child.stderr;
+  stderr?.on('data', (chunk) => {
+    if (bytes >= MAX_STDERR_BYTES || capturedStderrBytes >= MAX_STDERR_BYTES) return;
+    const buffer = Buffer.from(chunk);
+    const available = Math.min(MAX_STDERR_BYTES - bytes, MAX_STDERR_BYTES - capturedStderrBytes);
+    const bounded = buffer.subarray(0, available);
+    chunks.push(bounded);
+    bytes += bounded.length;
+    capturedStderrBytes += bounded.length;
+  });
+  child.once('error', (error) => write({ event: 'postgres-spawn-error', code: typeof error?.code === 'string' ? error.code : 'unknown' }));
+  child.once('close', (code, signal) => write({
+    event: 'postgres-close',
+    code,
+    signal,
+    stderrBytes: bytes,
+    stderrTruncated: bytes < capturedStderrBytes || capturedStderrBytes >= MAX_STDERR_BYTES,
+    stderr: clean(Buffer.concat(chunks, bytes).toString('utf8')),
+  }));
+  return child;
+};
+syncBuiltinESMExports();
+write({ event: 'observer-loaded' });
+`,
+    { mode: 0o600 },
+  );
+  const postgresObserverUrl = `${pathToFileURL(postgresObserver).href}?output=${encodeURIComponent(postgresObserverOutput)}&root=${encodeURIComponent(effectiveInstallRoot)}`;
   const preload = join(root, 'fetch-preload.mjs');
   const hookUrl = new URL('./activation-barrier.mjs', import.meta.url).href;
   await writeFile(
     preload,
     `import cp from 'node:child_process';\nimport { syncBuiltinESMExports } from 'node:module';\nimport { appendFileSync, readFileSync } from 'node:fs';\nimport { resolve } from 'node:path';\nconst originalSpawn = cp.spawn;\ncp.spawn = (command, args, options) => { const mode = process.env.REVO_TEST_ACTIVATION_FAULT; const text = [String(command), ...(args ?? [])].join(' '); if (text.includes('pnpm') && text.includes(' install')) appendFileSync(process.env.REVO_PNPM_CALLS, JSON.stringify({ command: 'pnpm', args: (args ?? []).filter((arg) => /install|frozen|prod/.test(String(arg))).length }) + '\\n'); const match = mode && args?.length === 2 && typeof options?.cwd === 'string' && args[0] === resolve(options.cwd, 'dist/bin/revo-install-activate.js'); if (match) { const hook = new URL(${JSON.stringify(hookUrl)}); hook.searchParams.set('mode', mode); hook.searchParams.set('root', process.env.REVO_INSTALL_ROOT); return originalSpawn(command, ['--import', hook.href, ...args], options); } return originalSpawn(command, args, options); };\nsyncBuiltinESMExports();\nconst map = JSON.parse(readFileSync(process.env.REVO_TEST_RESPONSES, 'utf8'));\nglobalThis.fetch = async (url) => { appendFileSync(process.env.REVO_FETCH_CALLS, \`\${url}\\n\`); const encoded = map[url]; if (encoded === undefined) return new Response(null, { status: 404 }); const body = Buffer.from(encoded, 'base64'); return { status: 200, headers: new Headers({ 'content-length': String(body.length) }), body: (async function* () { yield body; })() }; };\n`,
+    { mode: 0o600 },
+  );
+  const activationDiagnosticProbeUrl = new URL('./activation-diagnostic-probe.mjs', import.meta.url)
+    .href;
+  const activationInvocationMatcherUrl = new URL(
+    './activation-helper-invocation.mjs',
+    import.meta.url,
+  ).href;
+  await appendFile(
+    preload,
+    `\nconst { activationHelperSpawnArguments } = await import(${JSON.stringify(activationInvocationMatcherUrl)});\nconst diagnosticOriginalSpawn = cp.spawn;\nconst diagnosticProbeUrl = ${JSON.stringify(activationDiagnosticProbeUrl)};\ncp.spawn = (command, args, options) => diagnosticOriginalSpawn(command, activationHelperSpawnArguments(command, args, options, process.env, process.env.REVO_TEST_ACTIVATION_DIAGNOSTICS === '1', diagnosticProbeUrl), options);\nsyncBuiltinESMExports();\n`,
+    { mode: 0o600 },
+  );
+  await appendFile(
+    preload,
+    `\nconst postgresObserverUrl = ${JSON.stringify(postgresObserverUrl)};
+const postgresObserverOriginalSpawn = cp.spawn;
+cp.spawn = (command, args, options) => {
+  const installRoot = process.env.REVO_INSTALL_ROOT;
+  const commandPath = typeof command === 'string' ? resolve(command) : '';
+  const injectObserver = process.env.REVO_TEST_POSTGRES_DIAGNOSTIC &&
+    typeof options?.env === 'object' && options.env !== null &&
+    typeof installRoot === 'string' &&
+    commandPath.startsWith(resolve(installRoot) + '/') &&
+    commandPath.endsWith('/revo') &&
+    args?.[0] === 'server' && args?.[1] === 'start';
+  if (!injectObserver) return postgresObserverOriginalSpawn(command, args, options);
+  const current = typeof options.env.NODE_OPTIONS === 'string' ? options.env.NODE_OPTIONS : '';
+  const option = '--import=' + postgresObserverUrl;
+  const env = current.includes(option) ? options.env : { ...options.env, NODE_OPTIONS: current ? current + ' ' + option : option };
+  return postgresObserverOriginalSpawn(command, args, { ...options, env });
+};
+syncBuiltinESMExports();\n`,
     { mode: 0o600 },
   );
   const calls = join(root, 'curl.calls');
@@ -1900,6 +2512,7 @@ export async function portableToolchain(
   await chmod(join(tools, 'curl'), 0o755);
   await writeFile(join(root, 'install.sh'), script, { mode: 0o700 });
   const startInstaller = (extra: Record<string, string> = {}, diagnosticLabel?: string) => {
+    assertActivationTestModes(extra, process.env);
     if (realActivation) {
       const paths = installedData.get(root) ?? new Set<string>();
       paths.add(extra.REVO_DATA_DIR ?? dataDir);
@@ -2099,6 +2712,7 @@ export async function portableToolchain(
       child,
       finish,
       stdout: () => stdout,
+      stdoutTail: () => redactDiagnosticText(stdout, [root]).slice(-4096),
       outcome: () => observedExit,
       stderrTail: () => redactDiagnosticText(stderrTail, [root]).slice(-4096),
     };
@@ -2136,6 +2750,8 @@ export async function portableToolchain(
     nodeArchiveSha256: nodeSha,
     pnpmArchiveSha256: pnpmSha,
     diagnosticContext: diagnosticContextFor(),
+    initialInstallFailureDiagnostics: () =>
+      collectInitialInstallFailureDiagnostics(root, channelRoot),
   };
 }
 
@@ -2211,7 +2827,7 @@ export async function toolchainInstaller(channel: 'stable' | 'alpha' = 'stable')
   const input = pnpmReleaseManifestFixture({
     channel,
     version: channel === 'stable' ? '2.7.1' : '2.7.1-alpha.1',
-    versions: { core: '4.3.2', admin: '5.4.3', node: '26.8.2', pnpm: '12.4.1' },
+    versions: { core: '4.3.2', admin: '5.4.3', node: '26.8.2', pnpm: '12.5.1' },
   });
   const template = await installerTemplateBytes();
   const { buildPayload } = await vi.importActual<{ buildPayload: () => Promise<string> }>(
@@ -2229,17 +2845,19 @@ export async function nodeInstaller() {
   const { buildInstaller } = await vi.importActual<Builder>(
     new URL('../../../installer/build-installer.mjs', import.meta.url).href,
   );
+  const { buildPayload } = await vi.importActual<{
+    buildPayload: (input: { readonly entry: string }) => Promise<string>;
+  }>(new URL('../../../installer/build-payload.mjs', import.meta.url).href);
   const input = installerBuilderScenario({
     core: '4.3.2',
     admin: '5.4.3',
     node: '26.8.2',
-    pnpm: '12.4.1',
+    pnpm: '12.5.1',
   });
   const template = await installerTemplateBytes();
-  const payload = await readFile(
-    new URL('../../../installer/node-bootstrap.mjs', import.meta.url),
-    'utf8',
-  );
+  const payload = await buildPayload({
+    entry: fileURLToPath(new URL('../../../installer/node-bootstrap.mjs', import.meta.url)),
+  });
   return buildInstaller({ ...input, template, payload });
 }
 

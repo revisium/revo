@@ -22,7 +22,7 @@ const engine = new URL('../installer/node-bootstrap.mjs', import.meta.url).pathn
 const { buildInstaller } = await vi.importActual<{ buildInstaller: (input: unknown) => string }>(
   new URL('../installer/build-installer.mjs', import.meta.url).href,
 );
-const versions = { core: '4.3.2', admin: '5.4.3', node: process.versions.node, pnpm: '12.4.1' };
+const versions = { core: '4.3.2', admin: '5.4.3', node: process.versions.node, pnpm: '12.5.1' };
 const build = (v3: boolean) =>
   embeddedBootstrap(
     buildInstaller(
@@ -119,7 +119,7 @@ describe('toolchain runtime handoff', () => {
     const options = await input(data);
     const result = await api.runInstallMode(options);
     expect(result).toMatchObject({
-      version: '12.4.1',
+      version: '12.5.1',
       reused: false,
       nodeExecutable: process.execPath,
     });
@@ -160,14 +160,31 @@ describe('toolchain runtime handoff', () => {
     data.value.pnpmVersion = '12.4.2';
     data.value.pnpmArchives = data.value.pnpmArchives.map((entry: Data) => ({
       ...entry,
-      url: entry.url.replace('/v12.4.1/', '/v12.4.2/'),
+      url: entry.url.replace('/v12.5.1/', '/v12.4.2/'),
       ...(entry.platform === 'linux' && entry.arch === 'x64'
         ? { sha256: data.archive.sha256 }
         : {}),
     }));
     await data.scenario.write(data.value);
     const options = await input(data);
-    await expect(api.runInstallMode(options)).rejects.toThrow(/pnpm probe/iu);
+    const packageInstaller = vi.fn();
+    const activatePackage = vi.fn();
+    const startPackage = vi.fn();
+    const stages: string[] = [];
+    await expect(
+      api.runInstallMode({
+        ...options,
+        packageInstaller,
+        activatePackage,
+        startPackage,
+        onProgress: (stage: string) => stages.push(stage),
+      }),
+    ).rejects.toThrow(/pnpm probe/iu);
+    expect(stages).toContain('probe');
+    expect(stages).not.toContain('package-prepare');
+    expect(packageInstaller).not.toHaveBeenCalled();
+    expect(activatePackage).not.toHaveBeenCalled();
+    expect(startPackage).not.toHaveBeenCalled();
     expect(await readdir(data.scenario.root)).not.toContain(
       expect.stringMatching(/^\.pnpm-stage-/u),
     );

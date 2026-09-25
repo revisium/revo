@@ -74,6 +74,7 @@ export class ControlScenario {
       () => 'accepted' as const,
       () => 'rejected' as const,
     );
+    await new Promise<void>((resolve) => setTimeout(resolve, LIMITS.timeoutMs + 50));
     const beforeCleanup = settled;
     releaseCleanup();
     return { beforeCleanup, admission, completion: await stopping };

@@ -4,6 +4,8 @@ import { ControlClientService } from '../processes/control-client.service.js';
 import { ControlDiscoveryService } from '../processes/control-discovery.service.js';
 import type { ControlLimits } from '../processes/control-endpoint.types.js';
 
+export const DEFAULT_SERVER_STOP_COMPLETION_TIMEOUT_MS = 45_000;
+
 export type ServerStopResult =
   | { readonly kind: 'completed' }
   | { readonly kind: 'unconfirmed'; readonly ownership?: 'retained' | 'unconfirmed' };

@@ -8,7 +8,7 @@ export const NODE_SHASUMS_SNAPSHOT_SHA256 =
 
 export const nodeBootstrapScenario = (nodeVersion = '26.8.2') => {
   const fixture = futureReleaseManifestFixture({
-    versions: { core: '0.0.0', admin: '0.0.0', node: nodeVersion, pnpm: '12.4.1' },
+    versions: { core: '0.0.0', admin: '0.0.0', node: nodeVersion, pnpm: '12.5.1' },
   });
   const archives = fixture.manifest.toolchain.nodeArchives;
   const bootstrap = {

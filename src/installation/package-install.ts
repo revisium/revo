@@ -1,6 +1,7 @@
 // oxlint-disable curly -- compact validation guards keep the command boundary readable
 
-import { lstat, mkdir } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
 import type { PackageArtifactPolicy, PackageArtifactRequest } from './package-artifacts.js';
@@ -20,27 +21,58 @@ export const PACKAGE_INSTALL_ARGS = Object.freeze([
   '--reporter=ndjson',
   '--store-dir',
   'channel-local',
-  '--config.manage-package-manager-versions=false',
+  '--pm-on-fail=error',
   '--config.strict-dep-builds=true',
   '--config.verify-store-integrity=true',
 ]);
 const registry = 'https://registry.npmjs.org/';
 const error = (reason: string): Error => new Error(`package install: ${reason}`);
+const privatePnpmConfig = async () => {
+  const root = await mkdtemp(join(tmpdir(), 'revo-pnpm-install-'));
+  const paths = {
+    home: join(root, 'home'),
+    config: join(root, 'config'),
+    cache: join(root, 'cache'),
+    data: join(root, 'data'),
+    state: join(root, 'state'),
+    tmp: join(root, 'tmp'),
+  };
+  try {
+    await Promise.all(Object.values(paths).map((path) => mkdir(path, { mode: 0o700 })));
+    return { root, paths };
+  } catch (cause) {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+    throw cause;
+  }
+};
 const absoluteRegularFile = async (value: string, label: string): Promise<void> => {
   if (!value.startsWith('/')) throw error(`${label} must be absolute`);
   const info = await lstat(value).catch(() => undefined);
   if (info === undefined || !info.isFile() || info.isSymbolicLink())
     throw error(`${label} must be a regular file`);
 };
-const environment = (nodeExecutable: string, pnpmExecutable: string): Record<string, string> => {
+const environment = (
+  nodeExecutable: string,
+  pnpmExecutable: string,
+  isolated: Awaited<ReturnType<typeof privatePnpmConfig>>['paths'],
+): Record<string, string> => {
   const values: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !/^(?:npm_config_|NPM_CONFIG_|pnpm_|PNPM_|NODE_OPTIONS$)/u.test(key))
+    if (
+      value !== undefined &&
+      !/^(?:HOME$|XDG_|npm_config_|NPM_CONFIG_|pnpm_|PNPM_|NODE_OPTIONS$)/u.test(key)
+    )
       values[key] = value;
   }
   const dirs = [...new Set([dirname(nodeExecutable), dirname(pnpmExecutable)])];
   return {
     ...values,
+    HOME: isolated.home,
+    XDG_CONFIG_HOME: isolated.config,
+    XDG_CACHE_HOME: isolated.cache,
+    XDG_DATA_HOME: isolated.data,
+    XDG_STATE_HOME: isolated.state,
+    TMPDIR: isolated.tmp,
     PATH: [...dirs, '/usr/bin', '/bin'].join(delimiter),
     CI: '1',
     NO_COLOR: '1',
@@ -83,25 +115,32 @@ export async function installPackage({
   if (info === undefined || !info.isDirectory() || info.isSymbolicLink())
     throw error('package stage is unavailable');
   await mkdir(join(stage.packageDirectory, 'channel-local'), { recursive: true, mode: 0o700 });
-  const result = await runPackageProcess({
-    executable: pnpmExecutable,
-    args: PACKAGE_INSTALL_ARGS,
-    cwd: stage.packageDirectory,
-    env: environment(nodeExecutable, pnpmExecutable),
-    diagnosticPath,
-    ...(progress === undefined ? {} : { progress }),
-    ...(signal === undefined ? {} : { signal }),
-    ...(policy === undefined ? {} : { policy }),
-  });
-  if (result.exitCode !== 0 || result.signal !== null)
-    throw Object.assign(error(`pnpm exited with ${result.exitCode ?? result.signal}`), { result });
-  return {
-    directory: stage.directory,
-    packageDirectory: stage.packageDirectory,
-    version: stage.version,
-    diagnosticPath,
-    process: result,
-  };
+  const isolated = await privatePnpmConfig();
+  try {
+    const result = await runPackageProcess({
+      executable: pnpmExecutable,
+      args: PACKAGE_INSTALL_ARGS,
+      cwd: stage.packageDirectory,
+      env: environment(nodeExecutable, pnpmExecutable, isolated.paths),
+      diagnosticPath,
+      ...(progress === undefined ? {} : { progress }),
+      ...(signal === undefined ? {} : { signal }),
+      ...(policy === undefined ? {} : { policy }),
+    });
+    if (result.exitCode !== 0 || result.signal !== null)
+      throw Object.assign(error(`pnpm exited with ${result.exitCode ?? result.signal}`), {
+        result,
+      });
+    return {
+      directory: stage.directory,
+      packageDirectory: stage.packageDirectory,
+      version: stage.version,
+      diagnosticPath,
+      process: result,
+    };
+  } finally {
+    await rm(isolated.root, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 export async function acquireAndInstallPackage({

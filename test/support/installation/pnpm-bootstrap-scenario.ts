@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   chmod,
   copyFile,
+  link,
   mkdtemp,
   mkdir,
   readFile,
@@ -23,6 +24,16 @@ type ChildResult = {
 };
 type NodeAttempt = { readonly stage: string; readonly executable: string };
 type NodeInput = Record<string, unknown>;
+
+const PUBLISHER_CHILD_TIMEOUT_MS = 15_000;
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+const emitChunks = (chunks: readonly string[] | undefined, fallback: string, fd = '') =>
+  (chunks ?? [fallback])
+    .map(
+      (chunk, index, values) =>
+        `printf '%s' ${shellQuote(chunk)}${fd}${index + 1 < values.length ? '\nsleep 0.01' : ''}`,
+    )
+    .join('\n');
 
 export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unknown) {
   const root = await mkdtemp(join(tmpdir(), 'revo-bootstrap-data-'));
@@ -82,26 +93,37 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
     },
     publishNodeTogether: async (attempts: NodeAttempt[], input: NodeInput) => {
       const script = fileURLToPath(new URL('./node-publication-process.mjs', import.meta.url));
+      const testPublisherMode = input.testPublisherMode;
+      const publicationInput = { ...input };
+      delete publicationInput.testPublisherMode;
       const children = attempts.map(() =>
-        fork(script, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] }),
+        fork(script, [], {
+          env: {
+            ...process.env,
+            ...(typeof testPublisherMode === 'string'
+              ? { REVO_TEST_PUBLISHER_MODE: testPublisherMode }
+              : {}),
+          },
+          stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        }),
       );
-      await Promise.all(
-        children.map(
-          (child) => new Promise<void>((resolve) => child.once('message', () => resolve())),
-        ),
-      );
-      const outcomes = children.map(
-        (child, index) =>
-          new Promise<{ readonly ok: boolean; readonly result?: unknown }>((resolve) => {
-            const attempt = attempts[index];
-            if (attempt === undefined) {
-              throw new Error('node publication attempt is missing');
-            }
-            child.once('message', resolve);
-            child.send({ ...input, stage: attempt.stage });
-          }),
-      );
-      return Promise.all(outcomes);
+      const exits = children.map((child) => childExit(child));
+      try {
+        await Promise.all(children.map((child) => waitForPublisherMessage(child, 'ready')));
+        const outcomes = children.map(async (child, index) => {
+          const attempt = attempts[index];
+          if (attempt === undefined) {
+            throw new Error('node publication attempt is missing');
+          }
+          child.send({ ...publicationInput, stage: attempt.stage });
+          return waitForPublisherMessage(child, 'result');
+        });
+        const results = await Promise.all(outcomes);
+        await Promise.all(exits.map((exit) => withTimeout(exit, PUBLISHER_CHILD_TIMEOUT_MS)));
+        return results;
+      } finally {
+        await stopPublisherChildren(children, exits);
+      }
     },
     write,
     receipt: async () => readFile(receiptPath, 'utf8').catch(() => undefined),
@@ -110,12 +132,51 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
         .then((info) => info.mode & 0o777)
         .catch(() => undefined),
     runDirect,
-    archive: async () => {
+    archive: async ({
+      hardlink = false,
+      version = '12.5.1',
+      shebang = '#!/bin/sh',
+      probeStdout,
+      probeStderr,
+      stdoutChunks,
+      stderrChunks,
+      probeExitCode = 0,
+    }: {
+      readonly hardlink?: boolean;
+      readonly version?: string;
+      readonly shebang?: string;
+      readonly probeStdout?: string;
+      readonly probeStderr?: string;
+      readonly stdoutChunks?: readonly string[];
+      readonly stderrChunks?: readonly string[];
+      readonly probeExitCode?: number;
+    } = {}) => {
       const source = await mkdtemp(join(root, 'payload-'));
       await mkdir(join(source, 'dist'));
-      await writeFile(join(source, 'pnpm'), '#!/bin/sh\nprintf "12.4.1\\n"\n');
+      await writeFile(
+        join(source, 'pnpm'),
+        `${shebang}
+set -eu
+if [ "$1" != "--pm-on-fail=ignore" ] || [ "$2" != "--version" ]; then
+  echo "pnpm probe arguments were not isolated" >&2
+  exit 91
+fi
+case "$PWD" in "${root}"/.pnpm-probe-*) ;; *) echo "pnpm probe cwd was not isolated" >&2; exit 92 ;; esac
+case "$HOME" in "${root}"/.pnpm-probe-*/home) ;; *) echo "pnpm probe home was not isolated" >&2; exit 93 ;; esac
+test -d "$XDG_CONFIG_HOME" || exit 94
+test -d "$XDG_CACHE_HOME" || exit 95
+test -d "$XDG_DATA_HOME" || exit 96
+test -d "$XDG_STATE_HOME" || exit 97
+${emitChunks(stdoutChunks, probeStdout ?? `${version}\n`)}
+${emitChunks(stderrChunks, probeStderr ?? '', ' >&2')}
+exit ${probeExitCode}
+`,
+      );
       await chmod(join(source, 'pnpm'), 0o755);
       await writeFile(join(source, 'dist', 'index.js'), 'export {}\n');
+      if (hardlink) {
+        await link(join(source, 'dist', 'index.js'), join(source, 'dist', 'copy.js'));
+      }
       const archivePath = join(root, 'pnpm.tar.gz');
       await new Promise<void>((resolve, reject) => {
         const child = spawn('tar', ['-czf', archivePath, '-C', source, '.'], {
@@ -130,4 +191,89 @@ export async function pnpmBootstrapScenario(enginePath: string, bootstrap: unkno
       return { bytes, sha256: createHash('sha256').update(bytes).digest('hex') };
     },
   };
+}
+
+type PublisherMessage = {
+  readonly ready?: boolean;
+  readonly ok?: boolean;
+  readonly result?: unknown;
+};
+
+function waitForPublisherMessage(
+  child: ReturnType<typeof fork>,
+  expected: 'ready' | 'result',
+): Promise<PublisherMessage> {
+  return withTimeout(
+    new Promise<PublisherMessage>((resolve, reject) => {
+      const onMessage = (message: PublisherMessage) => {
+        if (
+          (expected === 'ready' && message.ready === true) ||
+          (expected === 'result' && 'ok' in message)
+        ) {
+          cleanup();
+          resolve(message);
+        }
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error(`publisher child ${expected} IPC failed`));
+      };
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        cleanup();
+        reject(
+          new Error(`publisher child exited before ${expected} (code=${code}, signal=${signal})`),
+        );
+      };
+      const cleanup = () => {
+        child.off('message', onMessage);
+        child.off('error', onError);
+        child.off('exit', onExit);
+      };
+      child.on('message', onMessage);
+      child.once('error', onError);
+      child.once('exit', onExit);
+    }),
+    PUBLISHER_CHILD_TIMEOUT_MS,
+  );
+}
+
+function childExit(child: ReturnType<typeof fork>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => child.once('exit', () => resolve()));
+}
+
+async function stopPublisherChildren(
+  children: readonly ReturnType<typeof fork>[],
+  exits: readonly Promise<void>[],
+): Promise<void> {
+  for (const child of children) {
+    if (child.connected) {
+      child.disconnect();
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+    }
+  }
+  await Promise.all(exits.map((exit) => withTimeout(exit, 1000).catch(() => undefined)));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('publisher child observation timed out')),
+      timeoutMs,
+    );
+    void promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }

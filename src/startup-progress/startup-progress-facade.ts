@@ -68,8 +68,12 @@ export class OwnedStartupProgress implements StartupProgressFacade {
     );
   }
   close(): Promise<void> {
-    this.closed = true;
+    this.seal();
     return this.queue;
+  }
+
+  seal(): void {
+    this.closed = true;
   }
 
   private enqueue(

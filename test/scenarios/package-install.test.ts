@@ -30,12 +30,29 @@ describe('managed package installation', () => {
       diagnosticPath: `${data.root}/install.log`,
     });
     const capture = await data.readCapture();
+    const privateHome = capture.env.HOME;
+    if (typeof privateHome !== 'string') {
+      throw new Error('private pnpm HOME was not captured');
+    }
     expect(capture.argv).toEqual(PACKAGE_INSTALL_ARGS);
+    expect(capture.argv).toContain('--pm-on-fail=error');
     expect(capture.env.PATH).toContain(dirname(data.node));
+    expect(privateHome).toContain('/revo-pnpm-install-');
+    expect(privateHome).not.toBe(process.env.HOME);
+    for (const name of [
+      'XDG_CONFIG_HOME',
+      'XDG_CACHE_HOME',
+      'XDG_DATA_HOME',
+      'XDG_STATE_HOME',
+      'TMPDIR',
+    ]) {
+      expect(capture.env[name]).toContain('/revo-pnpm-install-');
+    }
     expect(capture.env.PNPM_CONFIG_USER_AGENT).toBeUndefined();
     expect(capture.env.npm_config_registry).toBe('https://registry.npmjs.org/');
     expect(result.process.exitCode).toBe(0);
     expect(await data.mode(result.diagnosticPath)).toBe(0o600);
+    await expect(stat(privateHome)).rejects.toMatchObject({ code: 'ENOENT' });
     await data.cleanup();
     delete process.env.PNPM_CONFIG_USER_AGENT;
   });

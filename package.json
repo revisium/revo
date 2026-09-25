@@ -31,6 +31,7 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint --type-aware --type-check --deny-warnings --report-unused-disable-directives .",
     "sonar:issues:local": "bash scripts/sonar-issues-local.sh",
+    "build:release-bundle": "pnpm build && node scripts/build-release-bundle.mjs",
     "test": "pnpm build && vitest run",
     "test:cov": "pnpm build && vitest run --coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -60,7 +61,8 @@
     "rolldown": "1.2.8",
     "typescript": "7.0.2",
     "unplugin-swc": "1.5.10",
-    "vitest": "4.1.10"
+    "vitest": "4.1.10",
+    "yaml": "2.9.1"
   },
   "optionalDependencies": {
     "@embedded-postgres/darwin-arm64": "17.10.0-beta.17",
@@ -71,5 +73,5 @@
   "engines": {
     "node": ">=26.8.2 <27"
   },
-  "packageManager": "pnpm@12.4.1"
+  "packageManager": "pnpm@12.5.1"
 }
