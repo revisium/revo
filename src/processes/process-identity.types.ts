@@ -30,6 +30,17 @@ export type IdentityObservation =
       { readonly kind: 'confirmed' } | { readonly kind: 'mismatch' }
     >;
 
+export interface DirectoryIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+}
+
+export type WorkingDirectoryObservation =
+  | { readonly kind: 'captured'; readonly directory: DirectoryIdentity }
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'unknown' };
+
 export interface ProcessIdentityAdapter {
   capture(pid: number): Promise<IdentityObservation>;
+  workingDirectory(pid: number): Promise<WorkingDirectoryObservation>;
 }

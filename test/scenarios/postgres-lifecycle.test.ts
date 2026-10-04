@@ -187,6 +187,22 @@ describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () =
     await expect(scenario.isRunning(supervisor.postmasterPid)).resolves.toBe(false);
   });
 
+  it('keeps an orphaned server and its lock file when the clock moved after it started', async () => {
+    const supervisor = await scenario.runningSupervisor();
+    await supervisor.kill();
+    await scenario.clockSteppedForwardSinceTheServerStarted();
+    const lockFile = await scenario.lockFile();
+
+    const restart = await scenario.start();
+
+    expect(restart).toMatchObject({ kind: 'rejected', reason: 'locked' });
+    await expect(scenario.lockFile()).resolves.toBe(lockFile);
+    await expect(scenario.isRunning(supervisor.postmasterPid)).resolves.toBe(true);
+    await expect(scenario.postgresLog()).resolves.toContain(
+      `process ${String(supervisor.postmasterPid)} works in the cluster directory`,
+    );
+  });
+
   describe('an interrupted first initialization', () => {
     it.each(['before-initdb', 'inside-initdb', 'after-initdb'] as const)(
       'completes on the next start when interrupted %s',
@@ -233,10 +249,9 @@ describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () =
       await expect(bystander.receivedSignals()).resolves.toEqual([]);
     });
 
-    it('replaces a lock file written before the current boot without signalling its process', async () => {
+    it('replaces a lock file whose live process works outside the cluster without signalling it', async () => {
       const bystander = await scenario.bystander();
       await scenario.lockFileNaming(bystander.pid, 'an hour later');
-      await scenario.lockFileWrittenBeforeBoot();
 
       const restart = await scenario.start();
 
@@ -244,17 +259,27 @@ describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () =
       await expect(bystander.receivedSignals()).resolves.toEqual([]);
     });
 
-    it('refuses an incomplete lock file and leaves it in place', async () => {
+    it('replaces an incomplete lock file written before the current boot', async () => {
+      await scenario.incompleteLockFile();
+      await scenario.lockFileWrittenBeforeBoot();
+
+      await expect(scenario.start()).resolves.toMatchObject({ kind: 'started' });
+    });
+
+    it('refuses an incomplete lock file, leaves it in place and logs why', async () => {
       await scenario.incompleteLockFile();
 
       const restart = await scenario.start();
 
       expect(restart).toMatchObject({ kind: 'rejected', reason: 'locked' });
       await expect(scenario.lockFile()).resolves.toBe('');
+      await expect(scenario.postgresLog()).resolves.toMatch(
+        /revo: the lock file \S+postmaster\.pid was left in place because it is incomplete/u,
+      );
     });
 
-    it('refuses without a signal when the named process started before the recorded server', async () => {
-      const bystander = await scenario.bystander();
+    it('refuses without a signal when a process in the cluster does not match the recorded start', async () => {
+      const bystander = await scenario.bystanderInsideTheCluster();
       await scenario.lockFileNaming(bystander.pid, 'an hour later');
       const lockFile = await scenario.lockFile();
 

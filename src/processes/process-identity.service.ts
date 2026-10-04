@@ -10,6 +10,7 @@ import type {
   ProcessIdentity,
   ProcessIdentityAdapter,
   ProcessIdentityInspection,
+  WorkingDirectoryObservation,
 } from './process-identity.types.js';
 
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
@@ -51,6 +52,10 @@ export class ProcessIdentityService {
       return { kind: 'unknown', reason: 'invalid-record' };
     }
     return (await this.adapter()?.capture(pid)) ?? { kind: 'unknown', reason: 'unavailable' };
+  }
+
+  async workingDirectory(pid: number): Promise<WorkingDirectoryObservation> {
+    return (await this.adapter()?.workingDirectory(pid)) ?? { kind: 'unknown' };
   }
 
   bootedAt(): number {

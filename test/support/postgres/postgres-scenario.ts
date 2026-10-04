@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   symlink,
@@ -119,18 +120,22 @@ export class PostgresScenario {
     if (held.kind !== 'held' || !held.prepareEmbeddedPostgres || !held.progress) {
       throw new Error('owner missing');
     }
-    const outcome = await held
+    const refusal = await held
       .prepareEmbeddedPostgres({ signal: new AbortController().signal, timeoutMs: 1000 })
       .then(
-        () => 'resolved',
-        () => 'rejected',
+        () => undefined,
+        (error: unknown) => error,
       );
     await held.close();
     const clusterKept = await lstat(join(fixture.dataDir, 'postgres')).then(
       () => true,
       () => false,
     );
-    return { outcome, clusterKept };
+    return {
+      outcome: refusal === undefined ? 'resolved' : 'rejected',
+      clusterKept,
+      reasonLogged: await this.postgresLogRecords(fixture.logDir, refusal),
+    };
   }
 
   async closeCancelsOwnedInitialization() {
@@ -254,6 +259,18 @@ export class PostgresScenario {
     await Promise.all(
       this.roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
     );
+  }
+
+  private async postgresLogRecords(logDir: string, refusal: unknown) {
+    if (!(refusal instanceof EmbeddedPostgresError) || refusal.detail === undefined) {
+      return false;
+    }
+    const entries = await readdir(logDir, { recursive: true });
+    const log = entries.find((entry) => entry.endsWith('postgres.log'));
+    if (log === undefined) {
+      return false;
+    }
+    return (await readFile(join(logDir, log), 'utf8')).includes(`revo: ${refusal.detail}`);
   }
 
   private async fixture() {

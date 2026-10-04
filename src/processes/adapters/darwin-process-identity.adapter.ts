@@ -1,10 +1,16 @@
 import { Injectable } from '@nestjs/common';
 
 import { validPid, validUid } from '../process-identity.parser.js';
-import type { IdentityObservation, ProcessIdentityAdapter } from '../process-identity.types.js';
+import type {
+  IdentityObservation,
+  ProcessIdentityAdapter,
+  WorkingDirectoryObservation,
+} from '../process-identity.types.js';
 
 const BSD_INFO_SIZE = 136;
 const PROC_PIDTBSDINFO = 3;
+const PROC_PIDVNODEPATHINFO = 9;
+const VNODE_PATH_INFO_SIZE = 2352;
 const SZOMB = 5;
 
 export interface DarwinBinding {
@@ -28,11 +34,8 @@ export class DarwinProcessIdentityAdapter implements ProcessIdentityAdapter {
     if (!validPid(pid)) {
       return { kind: 'unknown', reason: 'invalid-record' };
     }
-    let binding: DarwinBinding;
-    try {
-      this.binding ??= this.loadBinding();
-      binding = await this.binding;
-    } catch {
+    const binding = await this.loadedBinding();
+    if (!binding) {
       return { kind: 'unknown', reason: 'unavailable' };
     }
     const buffer = Buffer.alloc(BSD_INFO_SIZE);
@@ -79,6 +82,37 @@ export class DarwinProcessIdentityAdapter implements ProcessIdentityAdapter {
         birth: { seconds: seconds.toString(), microseconds: microseconds.toString() },
       },
     };
+  }
+
+  async workingDirectory(pid: number): Promise<WorkingDirectoryObservation> {
+    if (!validPid(pid)) {
+      return { kind: 'unknown' };
+    }
+    const binding = await this.loadedBinding();
+    if (!binding) {
+      return { kind: 'unknown' };
+    }
+    const buffer = Buffer.alloc(VNODE_PATH_INFO_SIZE);
+    const read = binding.pidInfo(pid, PROC_PIDVNODEPATHINFO, 0n, buffer, buffer.length);
+    if (read === 0 && binding.noSuchProcess.includes(binding.errno())) {
+      return { kind: 'missing' };
+    }
+    if (read !== VNODE_PATH_INFO_SIZE) {
+      return { kind: 'unknown' };
+    }
+    return {
+      kind: 'captured',
+      directory: { device: BigInt(buffer.readUInt32LE(0)), inode: buffer.readBigUInt64LE(8) },
+    };
+  }
+
+  private async loadedBinding(): Promise<DarwinBinding | undefined> {
+    try {
+      this.binding ??= this.loadBinding();
+      return await this.binding;
+    } catch {
+      return undefined;
+    }
   }
 
   protected async loadBinding(): Promise<DarwinBinding> {

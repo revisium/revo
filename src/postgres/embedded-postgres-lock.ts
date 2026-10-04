@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { type FileHandle, open, unlink } from 'node:fs/promises';
+import { type FileHandle, open, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
@@ -30,6 +30,12 @@ type ClusterLock =
   | { readonly kind: 'running'; readonly pid: number }
   | { readonly kind: 'uncertain'; readonly reason: string };
 
+type LockRecovery =
+  | { readonly kind: 'released' }
+  | { readonly kind: 'refused'; readonly detail: string };
+
+type WorkingLocation = 'cluster' | 'elsewhere' | 'gone' | 'unknown';
+
 /** Callers hold the data-directory ownership lock, so no other Revo server races this recovery. */
 @Injectable()
 export class EmbeddedPostgresLockRecovery {
@@ -41,18 +47,30 @@ export class EmbeddedPostgresLockRecovery {
   ) {}
 
   async releaseAbandonedLock(request: ReleaseClusterLockRequest): Promise<void> {
+    const recovery = await this.recover(request);
+    if (recovery.kind === 'refused') {
+      await request.log.record(recovery.detail);
+      throw new EmbeddedPostgresError('locked', false, undefined, { detail: recovery.detail });
+    }
+  }
+
+  private async recover(request: ReleaseClusterLockRequest): Promise<LockRecovery> {
     let lock = await this.inspect(request.clusterDir);
     if (lock.kind === 'running') {
-      await this.stopOrphanedServer(request, lock.pid);
+      if (!(await this.stopOrphanedServer(request))) {
+        return refused(
+          `the earlier PostgreSQL server (PID ${String(lock.pid)}) of ${request.clusterDir} did not stop`,
+        );
+      }
       lock = await this.inspect(request.clusterDir);
     }
     if (lock.kind === 'stale') {
-      await discardStaleLock(request.clusterDir);
-      return;
+      return discardStaleLock(request.clusterDir);
     }
-    if (lock.kind !== 'absent') {
-      throw refusal(request.clusterDir, lock);
+    if (lock.kind === 'absent') {
+      return { kind: 'released' };
     }
+    return refused(refusalDetail(request.clusterDir, lock));
   }
 
   private async inspect(clusterDir: string): Promise<ClusterLock> {
@@ -63,44 +81,67 @@ export class EmbeddedPostgresLockRecovery {
     if (file.kind === 'unsafe') {
       return { kind: 'uncertain', reason: 'it is not a private regular file' };
     }
+    const server = parseRecordedServer(file.content);
+    if (server?.dataDir === clusterDir) {
+      return this.identify(server, clusterDir);
+    }
     if (file.modifiedAt < this.identity.bootedAt() - START_TOLERANCE_SECONDS) {
       return { kind: 'stale' };
     }
-    const server = parseRecordedServer(file.content);
     if (!server) {
       return { kind: 'uncertain', reason: 'it is incomplete' };
     }
-    if (server.dataDir !== clusterDir) {
-      return { kind: 'uncertain', reason: `it names another data directory, ${server.dataDir}` };
-    }
-    return this.identify(server);
+    return { kind: 'uncertain', reason: `it names another data directory, ${server.dataDir}` };
   }
 
-  private async identify(server: RecordedServer): Promise<ClusterLock> {
+  private async identify(server: RecordedServer, clusterDir: string): Promise<ClusterLock> {
+    const pid = String(server.pid);
     const observation = await this.identity.observe(server.pid);
     if (observation.kind === 'missing') {
       return { kind: 'stale' };
     }
     if (observation.kind !== 'captured') {
-      return { kind: 'uncertain', reason: `process ${String(server.pid)} cannot be inspected` };
+      return { kind: 'uncertain', reason: `process ${pid} cannot be inspected` };
     }
     if (observation.identity.uid !== process.getuid?.()) {
       return { kind: 'stale' };
+    }
+    const location = await this.workingLocation(server.pid, clusterDir);
+    if (location === 'gone' || location === 'elsewhere') {
+      return { kind: 'stale' };
+    }
+    if (location === 'unknown') {
+      return {
+        kind: 'uncertain',
+        reason: `the working directory of process ${pid} cannot be inspected`,
+      };
     }
     const startedAt = this.identity.startedAt(observation.identity);
     if (Math.abs(startedAt - server.startedAt) <= START_TOLERANCE_SECONDS) {
       return { kind: 'running', pid: server.pid };
     }
-    if (startedAt > server.startedAt) {
-      return { kind: 'stale' };
-    }
     return {
       kind: 'uncertain',
-      reason: `process ${String(server.pid)} started before the server it records`,
+      reason: `process ${pid} works in the cluster directory but did not start when the lock file records`,
     };
   }
 
-  private async stopOrphanedServer(request: ReleaseClusterLockRequest, pid: number) {
+  private async workingLocation(pid: number, clusterDir: string): Promise<WorkingLocation> {
+    const [observed, cluster] = await Promise.all([
+      this.identity.workingDirectory(pid),
+      stat(clusterDir, { bigint: true }),
+    ]);
+    if (observed.kind === 'missing') {
+      return 'gone';
+    }
+    if (observed.kind === 'unknown') {
+      return 'unknown';
+    }
+    const { device, inode } = observed.directory;
+    return device === cluster.dev && inode === cluster.ino ? 'cluster' : 'elsewhere';
+  }
+
+  private async stopOrphanedServer(request: ReleaseClusterLockRequest): Promise<boolean> {
     const seconds = Math.min(
       MAX_STOP_SECONDS,
       Math.max(1, Math.floor((request.deadline - Date.now()) / 1000)),
@@ -120,11 +161,7 @@ export class EmbeddedPostgresLockRecovery {
       }),
     );
     const completion = await pgCtl.completion;
-    if (completion.exitCode !== 0) {
-      throw locked(
-        `the earlier PostgreSQL server (PID ${String(pid)}) of ${request.clusterDir} did not stop`,
-      );
-    }
+    return completion.exitCode === 0;
   }
 }
 
@@ -182,35 +219,32 @@ function parseRecordedServer(content: string): RecordedServer | undefined {
   return { pid: Number(pid), dataDir, startedAt: Number(startedAt) };
 }
 
-async function discardStaleLock(clusterDir: string) {
+async function discardStaleLock(clusterDir: string): Promise<LockRecovery> {
   const path = join(clusterDir, LOCK_FILE);
   try {
     await unlink(path);
   } catch (error) {
     if (errorCode(error) !== 'ENOENT') {
-      throw locked(`the stale lock file ${path} could not be removed`);
+      return refused(`the stale lock file ${path} could not be removed`);
     }
   }
+  return { kind: 'released' };
 }
 
-function refusal(
+function refusalDetail(
   clusterDir: string,
   lock: Extract<ClusterLock, { readonly kind: 'running' | 'uncertain' }>,
 ) {
   if (lock.kind === 'running') {
-    return locked(
-      `the earlier PostgreSQL server (PID ${String(lock.pid)}) of ${clusterDir} is still running`,
-    );
+    return `the earlier PostgreSQL server (PID ${String(lock.pid)}) of ${clusterDir} is still running`;
   }
-  const path = join(clusterDir, LOCK_FILE);
-  return locked(
-    `the lock file ${path} was left in place because ${lock.reason}; no signal was sent. ` +
-      `If no PostgreSQL server uses ${clusterDir}, remove the lock file and start again`,
+  return (
+    `the lock file ${join(clusterDir, LOCK_FILE)} was left in place because ${lock.reason}; ` +
+    `no signal was sent. If no PostgreSQL server uses ${clusterDir}, remove the lock file and start again`
   );
 }
 
-const locked = (detail: string) =>
-  new EmbeddedPostgresError('locked', false, undefined, { detail });
+const refused = (detail: string): LockRecovery => ({ kind: 'refused', detail });
 
 const errorCode = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

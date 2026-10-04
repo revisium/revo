@@ -125,6 +125,7 @@ export class OwnedEmbeddedPostgresPreparation {
       return prepared(layout, binaries, false);
     }
     if (state.kind === 'invalid') {
+      await this.log.record(state.detail);
       throw new EmbeddedPostgresError('invalid', false, undefined, { detail: state.detail });
     }
 

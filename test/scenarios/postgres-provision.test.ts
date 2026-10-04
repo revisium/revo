@@ -28,10 +28,11 @@ describe('embedded PostgreSQL provision', () => {
     'public-credential',
     'symlink',
     'wrong-major',
-  ] as const)('rejects an existing %s cluster without replacing it', async (kind) => {
+  ] as const)('rejects an existing %s cluster without replacing it and logs why', async (kind) => {
     await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toEqual({
       outcome: 'rejected',
       clusterKept: true,
+      reasonLogged: true,
     });
   });
 

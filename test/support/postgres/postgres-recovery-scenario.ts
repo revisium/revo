@@ -3,6 +3,7 @@ import {
   copyFile,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -38,6 +39,7 @@ export type StartOutcome =
   | { readonly kind: 'rejected'; readonly reason: string; readonly message: string };
 
 const HOUR_SECONDS = 3600;
+const CLOCK_STEP_SECONDS = 10;
 const SUPERVISOR = new URL('./embedded-postgres-supervisor.mjs', import.meta.url);
 const BYSTANDER = `
 for (const signal of ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGUSR1', 'SIGUSR2']) {
@@ -109,23 +111,12 @@ export class PostgresRecoveryScenario {
     }
   }
 
-  async bystander(): Promise<Bystander> {
-    const child = spawn(process.execPath, ['-e', BYSTANDER], {
-      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
-    });
-    this.children.add(child);
-    await new Promise<void>((resolve, reject) => {
-      child.once('message', () => resolve());
-      child.once('error', reject);
-    });
-    return {
-      pid: requiredPid(child),
-      receivedSignals: () =>
-        new Promise((resolve) => {
-          child.once('message', (message: { received: string[] }) => resolve(message.received));
-          child.send('report');
-        }),
-    };
+  bystander(): Promise<Bystander> {
+    return this.spawnBystander(this.root);
+  }
+
+  bystanderInsideTheCluster(): Promise<Bystander> {
+    return this.spawnBystander(this.clusterDir());
   }
 
   async exitedProcess(): Promise<number> {
@@ -152,6 +143,12 @@ export class PostgresRecoveryScenario {
     await utimes(this.lockPath(), beforeBoot, beforeBoot);
   }
 
+  async clockSteppedForwardSinceTheServerStarted(): Promise<void> {
+    const lines = (await readFile(this.lockPath(), 'utf8')).split('\n');
+    lines[2] = String(Number(lines[2]) - CLOCK_STEP_SECONDS);
+    await writeFile(this.lockPath(), lines.join('\n'));
+  }
+
   async incompleteLockFile(): Promise<void> {
     await writeFile(this.lockPath(), '', { mode: 0o600 });
   }
@@ -162,6 +159,12 @@ export class PostgresRecoveryScenario {
 
   lockFile(): Promise<string | undefined> {
     return readFile(this.lockPath(), 'utf8').catch(() => undefined);
+  }
+
+  async postgresLog(): Promise<string> {
+    const entries = await readdir(this.logDir, { recursive: true });
+    const log = entries.find((entry) => entry.endsWith('postgres.log'));
+    return log === undefined ? '' : readFile(join(this.logDir, log), 'utf8');
   }
 
   async start(): Promise<StartOutcome> {
@@ -238,6 +241,26 @@ export class PostgresRecoveryScenario {
     });
     this.children.add(child);
     return child;
+  }
+
+  private async spawnBystander(cwd: string): Promise<Bystander> {
+    const child = spawn(process.execPath, ['-e', BYSTANDER], {
+      cwd,
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    this.children.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once('message', () => resolve());
+      child.once('error', reject);
+    });
+    return {
+      pid: requiredPid(child),
+      receivedSignals: () =>
+        new Promise((resolve) => {
+          child.once('message', (message: { received: string[] }) => resolve(message.received));
+          child.send('report');
+        }),
+    };
   }
 
   private async open() {
