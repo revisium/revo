@@ -1,4 +1,7 @@
 import { CoreChildEntry, type CoreChildProcessPort } from '../core-host/core-child-entry.js';
+import { ignoreOutputFailures } from '../server-logs/process-output.js';
+
+ignoreOutputFailures();
 
 const processPort: CoreChildProcessPort = {
   connected: () => process.connected,

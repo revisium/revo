@@ -23,7 +23,6 @@ export interface ServerLaunchBinding {
   readonly entry: string;
   readonly env: Readonly<Record<string, string>>;
   readonly executable: string;
-  /** Where the detached server, and the Core it hosts, append their output. */
   readonly log?: ServerLogLocation;
 }
 
@@ -82,7 +81,6 @@ export class ServerLaunchProcessService {
     }
   }
 
-  /** Logging is diagnostics: an unusable log never prevents the server from starting. */
   private async openLog(location: ServerLogLocation): Promise<OpenedServerLog | undefined> {
     try {
       return await openServerLog(location);

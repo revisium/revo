@@ -76,7 +76,6 @@ export class StartupProgressJournalWriter {
   }
 }
 
-/** Ready is published only for a live server; a failed check is a real failure, not I/O. */
 function assertStillReady(readyContext: StartupReadyContext): void {
   if (readyContext.signal.aborted || Date.now() >= readyContext.deadline) {
     throw new StartupProgressError('closed');

@@ -116,7 +116,6 @@ export class CoreChildEntry {
   }
 }
 
-/** Loaded only on failure so the boot path stays as light as before the runner loads. */
 async function logLoadFailure(error: unknown): Promise<void> {
   try {
     const { RevoConsoleLogger } = await import('../server-logs/revo-console-logger.js');

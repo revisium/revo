@@ -16,11 +16,6 @@ import {
 
 const logger = new RevoConsoleLogger('StartupProgress');
 
-/**
- * Persists startup progress for observers. Progress is decoration: an I/O failure skips that tick
- * and the next write republishes the whole journal; only failures, limits, and readiness checks
- * still reject.
- */
 export class OwnedStartupProgress implements StartupProgressFacade {
   private readonly operation: ProgressOperation;
   private queue = Promise.resolve();
@@ -182,7 +177,6 @@ export class OwnedStartupProgress implements StartupProgressFacade {
   }
 }
 
-/** A plain I/O failure of a progress tick; failures and readiness checks are never skipped. */
 function skippable(error: unknown, event: ProgressEvent): boolean {
   const reason = error instanceof StartupProgressError ? error.reason : 'io';
   return reason === 'io' && event.status !== 'failed';

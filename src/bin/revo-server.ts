@@ -1,8 +1,11 @@
 import process from 'node:process';
 
+import { ignoreOutputFailures } from '../server-logs/process-output.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import { NodeServerHostProcessPort } from '../server/server-host-process-port.js';
 import { SERVER_HOST_PROTOCOL } from '../server/server-host-protocol.js';
+
+ignoreOutputFailures();
 
 const SEND_MILLISECONDS = 250;
 const processPort = new NodeServerHostProcessPort();

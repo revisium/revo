@@ -573,7 +573,6 @@ function normalizeOwnerError(error: unknown, signal: AbortSignal): ServerOwnerEr
   );
 }
 
-/** One readable sentence for the server log; transport codes stay as supporting detail. */
 function startFailureReason(primary: ServerOwnerError, cause: unknown): string {
   if (primary.code === 'revo.server-owner.database') {
     return `the database did not start (${databaseFailureDetail(primary.databaseFailure)})`;

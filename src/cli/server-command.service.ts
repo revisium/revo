@@ -30,7 +30,6 @@ const DIAGNOSTICS: Readonly<Record<string, string>> = {
   START_OUTCOME_UNKNOWN: 'Server start outcome is unknown.',
   'revo.process.cancelled': 'Server start was cancelled.',
 };
-/** Failures whose cause is in the server log rather than in the launch transport. */
 const LOGGED_FAILURES: ReadonlySet<string> = new Set(['START_FAILED', 'START_OUTCOME_UNKNOWN']);
 const CLEANUP: Readonly<Record<string, string>> = {
   retained: ' Resources may remain active.',
@@ -171,7 +170,6 @@ export class ServerCommandService {
     }
   }
 
-  /** Appends the failed start's own server output so the reason is readable without a code. */
   private async withServerLog(
     input: Readonly<ConfigurationInput>,
     diagnosed: unknown,

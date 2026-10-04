@@ -42,12 +42,10 @@ export class ServerLogError extends Error {
   }
 }
 
-/** Resolves the same path the server derives from its canonical data directory. */
 export async function serverLogPath(location: ServerLogLocation): Promise<string> {
   return join(serverLogDirectory(await lifecycleConfiguration(location)), SERVER_LOG_FILE);
 }
 
-/** Opens the private append-only log that receives server and Core output for one start. */
 export async function openServerLog(
   location: ServerLogLocation,
   now: () => number = Date.now,
@@ -67,7 +65,6 @@ export async function openServerLog(
   }
 }
 
-/** Returns the latest start attempt's last lines, or nothing when no private log exists. */
 export async function readServerLogTail(
   location: ServerLogLocation,
   maxLines = SERVER_LOG_TAIL_LINES,

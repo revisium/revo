@@ -2,16 +2,11 @@ import { ConsoleLogger, type LogLevel } from '@nestjs/common';
 
 import { redactLog } from './log-redaction.js';
 
-/**
- * Plain-text Nest logging for the server log: no terminal colors, and database credentials are
- * redacted from every message and stack trace before they are written.
- */
 export class RevoConsoleLogger extends ConsoleLogger {
   constructor(context?: string) {
     super({ colors: false, ...(context === undefined ? {} : { context }) });
   }
 
-  /** Logs why an operation failed, with the cause's own message and stack when it has them. */
   failure(message: string, cause: unknown): void {
     if (!(cause instanceof Error)) {
       this.error(`${message}: ${String(cause)}`);

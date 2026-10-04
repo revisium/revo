@@ -150,6 +150,18 @@ describe('short private control socket directory', () => {
     },
   );
 
+  it.each([
+    ['private', { outcome: 'answered', statusRequests: 1 }],
+    ['public socket directory', { outcome: 'CONTROL_TRANSPORT_ERROR', statusRequests: 0 }],
+    ['public user directory', { outcome: 'CONTROL_TRANSPORT_ERROR', statusRequests: 0 }],
+    ['symlinked socket directory', { outcome: 'CONTROL_TRANSPORT_ERROR', statusRequests: 0 }],
+  ] as const)(
+    'asks for status through a %s only when the whole path is private',
+    async (state, expected) => {
+      await expect(scenario.asksStatusThrough(state)).resolves.toEqual(expected);
+    },
+  );
+
   it('explains every refused directory when no socket path is usable', async () => {
     const failure = await scenario.refusesWhenNoDirectoryIsUsable();
 

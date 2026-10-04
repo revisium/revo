@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, rm, stat, symlink } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rename, rm, stat, symlink } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -19,6 +19,11 @@ const TOKEN = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 const LIMITS = { timeoutMs: 150, maxFrameBytes: 512 };
 
 type UnsafeShortDirectory = 'symlink' | 'public';
+type SocketDirectoryState =
+  | 'private'
+  | 'public socket directory'
+  | 'public user directory'
+  | 'symlinked socket directory';
 
 export class ControlScenario {
   private readonly roots = new Set<string>();
@@ -399,6 +404,25 @@ export class ControlScenario {
     };
   }
 
+  async asksStatusThrough(state: SocketDirectoryState) {
+    const root = await this.ensureShortRoot();
+    let statusRequests = 0;
+    const { endpoint, record } = await this.listen(
+      await this.service(),
+      { runtimeDir: await this.runtimeDir(), channel: 'stable', canonicalDataDir: '/data/revo' },
+      () => {
+        statusRequests += 1;
+        return { phase: 'unknown' };
+      },
+    );
+    await exposeSocketDirectory(dirname(endpoint.endpoint), state);
+    const outcome = await new ControlClientService(root).requestStatus(record, LIMITS).then(
+      () => 'answered' as const,
+      (error: unknown) => (error instanceof Error && 'code' in error ? error.code : 'unexpected'),
+    );
+    return { outcome, statusRequests };
+  }
+
   async refusesWhenNoDirectoryIsUsable() {
     const ownedRoot = await this.runtimeDir();
     const runtimeDir = join(ownedRoot, 'r'.repeat(120));
@@ -495,6 +519,7 @@ export class ControlScenario {
       readonly channel: string;
       readonly canonicalDataDir: string;
     },
+    onStatus?: ListenControlEndpointRequest['onStatus'],
   ) {
     const process = await new ProcessIdentityService().capture(globalThis.process.pid);
     const instanceId = randomBytes(16).toString('hex');
@@ -504,6 +529,7 @@ export class ControlScenario {
       token: TOKEN,
       limits: LIMITS,
       onStop: () => undefined,
+      ...(onStatus ? { onStatus } : {}),
       identity: {
         version: '1.2.3',
         channel: scope.channel,
@@ -555,6 +581,19 @@ export class ControlScenario {
 }
 
 const userDirectory = () => `revo-${String(process.getuid?.())}`;
+
+async function exposeSocketDirectory(directory: string, state: SocketDirectoryState) {
+  if (state === 'public socket directory') {
+    await chmod(directory, 0o777);
+  }
+  if (state === 'public user directory') {
+    await chmod(dirname(directory), 0o777);
+  }
+  if (state === 'symlinked socket directory') {
+    await rename(directory, `${directory}-moved`);
+    await symlink(`${directory}-moved`, directory);
+  }
+}
 
 function restoreEnvironment(name: string, value: string | undefined) {
   if (value === undefined) {

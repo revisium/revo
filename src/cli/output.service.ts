@@ -24,10 +24,6 @@ export class OutputService {
   }
 }
 
-/**
- * One command's JSONL output lifetime. Slow writes stay pending for the observer to skip; only a
- * stream error ends the output, and the error listener outlives close while a write is unsettled.
- */
 export class JsonlProgressOutput {
   private broken = false;
   private errorObserved = false;
@@ -120,7 +116,6 @@ export class JsonlProgressOutput {
   }
 
   private settlePending(): void {
-    // Each settlement removes only itself, which a Set iteration tolerates.
     for (const fail of this.pending) {
       fail();
     }

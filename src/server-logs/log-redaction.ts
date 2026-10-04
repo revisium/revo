@@ -3,10 +3,8 @@ const MIN_SECRET_LENGTH = 4;
 const URL_CREDENTIALS = /\b([a-z][a-z\d+.-]*:\/\/[^\s:/?#@]*:)[^\s/?#@]+@/giu;
 const PASSWORD_ASSIGNMENT = /(password["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&;,"']+)/giu;
 
-/** Secrets known to this process; every server and Core log line passes through them. */
 const secrets = new Set<string>();
 
-/** Registers the password of a database URL so it is redacted even outside URL syntax. */
 export function protectDatabaseUrl(databaseUrl: string): void {
   let password: string;
   try {

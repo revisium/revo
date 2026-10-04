@@ -89,7 +89,6 @@ export class CoreChildRunner {
         }
         return;
       }
-      // The parent receives only a code; the cause belongs in the server log.
       logger.failure('Revo Core failed to start', error);
       this.startupFailed = true;
     }

@@ -26,7 +26,6 @@ export interface CoreHostProcessBinding {
   readonly executable: string;
 }
 
-/** Where Core output goes: the server's own stdout and stderr, which are the server log. */
 export interface CoreHostOutput {
   readonly stdout: Writable;
   readonly stderr: Writable;

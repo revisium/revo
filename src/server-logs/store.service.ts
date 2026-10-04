@@ -176,7 +176,6 @@ export function serverLifecyclePath(configuration: ServerLifecycleConfiguration)
   return join(serverLogDirectory(configuration), SERVER_LIFECYCLE_FILE);
 }
 
-/** One private directory per channel and canonical data directory holds every server log. */
 export function serverLogDirectory(configuration: ServerLifecycleConfiguration): string {
   validateConfiguration(configuration);
   const digest = createHash('sha256').update(configuration.canonicalDataDir, 'utf8').digest('hex');

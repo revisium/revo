@@ -15,9 +15,7 @@ export type ServerProgressSink = (event: ProgressEvent) => void | Promise<void>;
 export type StartupProgressWarning = (message: string) => void;
 
 export interface StartupObserverTiming {
-  /** Budget for one progress output write before that tick is skipped. */
   readonly deliveryMs: number;
-  /** Budget for the remaining journal replay after the launch attempt settles. */
   readonly drainMs: number;
   readonly pollMs: number;
 }
@@ -50,10 +48,6 @@ interface Observation {
   readonly sink: ServerProgressSink;
 }
 
-/**
- * Progress is decoration: the committed launch attempt alone decides success, and a slow or failed
- * journal read or output write becomes a skipped tick with one warning.
- */
 @Injectable()
 export class ServerStartupObserver {
   private readonly timing: StartupObserverTiming;
@@ -126,7 +120,6 @@ class Warnings {
   }
 }
 
-/** Writes progress in order; a write still in flight makes later ticks skip instead of queue. */
 class ProgressDelivery {
   private inFlight: Promise<Settlement> | undefined;
 
@@ -184,7 +177,6 @@ class JournalObservation {
     private readonly delivery: ProgressDelivery,
   ) {}
 
-  /** Polls until the attempt settles, then reads once more for events written before it did. */
   async follow(): Promise<void> {
     const finalRead = this.settled;
     await this.read();
@@ -235,7 +227,6 @@ class JournalObservation {
     }
   }
 
-  /** Replays in journal order, one delivery at a time, so output keeps its backpressure. */
   private async replay(events: readonly ProgressEvent[]): Promise<void> {
     const [event, ...later] = events;
     if (!event || this.closed) {
@@ -246,7 +237,6 @@ class JournalObservation {
     if (event.status === 'ready') {
       this.ready = event;
     } else if (event.status === 'failed') {
-      // A journal failure is shown only when the launch attempt itself fails.
       this.failure = event;
     } else {
       await this.delivery.tick(event);
@@ -254,7 +244,6 @@ class JournalObservation {
     return this.replay(later);
   }
 
-  /** Continues the observed sequence so consumers still see one ordered operation. */
   private synthesizedReady(url: string): ProgressEvent | undefined {
     return parseProgressEvent({
       schemaVersion: PROGRESS_SCHEMA_VERSION,
