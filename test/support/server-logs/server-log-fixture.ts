@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -14,7 +14,8 @@ export class ServerLogFixture {
   ) {}
 
   static async create(): Promise<ServerLogFixture> {
-    const root = await mkdtemp(join(tmpdir(), 'revo-server-log-'));
+    // Server logs refuse symlinked ancestors, such as /var on macOS.
+    const root = await mkdtemp(join(await realpath(tmpdir()), 'revo-server-log-'));
     const layout = resolveRevoLayout({
       channel: 'alpha',
       env: {},

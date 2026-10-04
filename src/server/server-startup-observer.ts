@@ -235,24 +235,23 @@ class JournalObservation {
     }
   }
 
+  /** Replays in journal order, one delivery at a time, so output keeps its backpressure. */
   private async replay(events: readonly ProgressEvent[]): Promise<void> {
-    for (const event of events) {
-      if (this.closed) {
-        return;
-      }
-      this.cursor = event.sequence;
-      this.elapsedMs = Math.max(this.elapsedMs, event.elapsedMs);
-      if (event.status === 'ready') {
-        this.ready = event;
-      } else if (event.status === 'failed') {
-        // A journal failure is shown only when the launch attempt itself fails.
-        this.failure = event;
-      } else {
-        // Preserve journal order and backpressure between domain events.
-        // oxlint-disable-next-line no-await-in-loop
-        await this.delivery.tick(event);
-      }
+    const [event, ...later] = events;
+    if (!event || this.closed) {
+      return;
     }
+    this.cursor = event.sequence;
+    this.elapsedMs = Math.max(this.elapsedMs, event.elapsedMs);
+    if (event.status === 'ready') {
+      this.ready = event;
+    } else if (event.status === 'failed') {
+      // A journal failure is shown only when the launch attempt itself fails.
+      this.failure = event;
+    } else {
+      await this.delivery.tick(event);
+    }
+    return this.replay(later);
   }
 
   /** Continues the observed sequence so consumers still see one ordered operation. */

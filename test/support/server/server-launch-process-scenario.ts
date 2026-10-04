@@ -178,8 +178,10 @@ export class ServerLaunchProcessScenario {
   }
 
   static async create(): Promise<ServerLaunchProcessScenario> {
-    const { mkdtemp } = await import('node:fs/promises');
-    return new ServerLaunchProcessScenario(await mkdtemp(join(tmpdir(), 'revo-launch-process-')));
+    const { mkdtemp, realpath } = await import('node:fs/promises');
+    return new ServerLaunchProcessScenario(
+      await mkdtemp(join(await realpath(tmpdir()), 'revo-launch-process-')),
+    );
   }
 
   async start(overrides: Partial<LaunchBinding> = {}): Promise<ServerLaunchProcessPort> {

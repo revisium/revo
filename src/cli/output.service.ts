@@ -120,7 +120,8 @@ export class JsonlProgressOutput {
   }
 
   private settlePending(): void {
-    for (const fail of [...this.pending]) {
+    // Each settlement removes only itself, which a Set iteration tolerates.
+    for (const fail of this.pending) {
       fail();
     }
   }

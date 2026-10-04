@@ -174,7 +174,7 @@ describe('revo server command line', () => {
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(
-      /Server start failed\.\nServer log: \/\S+\/server\.log\nLast \d+ log lines:\n--- Revo server start /u,
+      /Server start failed\.\nServer log: \/[^\n]+\/server\.log\nLast \d+ log lines:\n--- Revo server start /u,
     );
     expect(result.stderr).toMatch(/ERROR \[ServerOwner\] Server start failed: the database/u);
     expect(result.stderr).not.toContain('p@ss');

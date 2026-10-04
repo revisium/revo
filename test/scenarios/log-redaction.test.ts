@@ -65,7 +65,7 @@ describe('Revo console logger', () => {
 
     const text = output.text();
     expect(text).not.toContain('generated-pass-1234');
-    expect(text.includes('\u001b[')).toBe(false);
+    expect(text).not.toContain('\u001b[');
     expect(text).toMatch(
       /ERROR \[CoreHost\] Core failed for postgresql:\/\/postgres:\[REDACTED\]@/u,
     );

@@ -1,7 +1,7 @@
 // oxlint-disable-next-line import/no-unassigned-import -- decorators require this side effect first
 import 'reflect-metadata';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -60,7 +60,8 @@ export class CliScenario {
 
   /** Runs the built CLI against a private home so ambient product state is never observed. */
   static async runIsolated(args: readonly string[]): Promise<CliResult> {
-    const home = await mkdtemp(`${tmpdir()}/revo-home-`);
+    // A canonical home keeps private server logs usable where tmpdir is behind a symlink.
+    const home = await mkdtemp(`${await realpath(tmpdir())}/revo-home-`);
     try {
       return await this.run(args, {
         HOME: home,
