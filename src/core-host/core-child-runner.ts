@@ -1,5 +1,6 @@
 import type { RevoCoreRuntime } from '@revisium/revo-core/runtime';
 
+import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import {
   CORE_HOST_PROTOCOL,
   parseCoreHostMessage,
@@ -9,6 +10,8 @@ import {
 } from './core-child-protocol.js';
 import { CoreRuntimeService, CoreRuntimeStoppedError } from './core-runtime.service.js';
 import { CoreStageBridge } from './core-stage-bridge.js';
+
+const logger = new RevoConsoleLogger('RevoCore');
 
 export interface CoreChildTransport {
   send(message: CoreHostMessage): Promise<void>;
@@ -86,6 +89,8 @@ export class CoreChildRunner {
         }
         return;
       }
+      // The parent receives only a code; the cause belongs in the server log.
+      logger.failure('Revo Core failed to start', error);
       this.startupFailed = true;
     }
   }
@@ -104,7 +109,8 @@ export class CoreChildRunner {
     let cleanupFailed = false;
     try {
       await this.closeRuntime();
-    } catch {
+    } catch (error) {
+      logger.failure('Revo Core did not close cleanly', error);
       cleanupFailed = true;
     }
     const exitCode = requestedExitCode ?? (this.startupFailed || cleanupFailed ? 1 : 0);

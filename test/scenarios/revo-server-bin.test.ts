@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { RevoConsoleLogger } from '../../src/server-logs/revo-console-logger.js';
 import { SERVER_HOST_PROTOCOL } from '../../src/server/server-host-protocol.js';
 import { ServerOwnerService } from '../../src/server/server-owner.service.js';
 import { ServerModule } from '../../src/server/server.module.js';
@@ -28,7 +29,9 @@ describe('Revo server executable composition', () => {
         trustedEnvironmentNames: ['HOME', 'PATH'],
       },
     ]);
-    expect(observations.contextArguments).toEqual([[ServerModule, { logger: false }]]);
+    expect(observations.contextArguments).toEqual([
+      [ServerModule, { logger: expect.any(RevoConsoleLogger) }],
+    ]);
     expect(observations.contextGetTokens).toEqual([ServerOwnerService]);
     expect(observations.applicationCloseCalls).toBe(1);
   });
@@ -47,15 +50,18 @@ describe('Revo server executable composition', () => {
     expect(observations.exitCode).toBe(0);
   });
 
-  it('bounds generic failure delivery without disclosing the Nest boot rejection', async () => {
+  it('logs the boot failure reason but keeps it out of the bounded IPC failure', async () => {
     const observations = await executeRevoServerBin({
-      nestFailure: new Error('database password is swordfish'),
+      nestFailure: new Error('cannot reach postgresql://revo:swordfish@db.example/revo'),
     });
 
     expect(observations.sent).toEqual([
       { protocol: SERVER_HOST_PROTOCOL, type: 'failed', code: 'SERVER_HOST_FAILED' },
     ]);
     expect(JSON.stringify(observations.sent)).not.toContain('swordfish');
+    expect(observations.output).toMatch(/ERROR \[RevoServer\] Revo server failed to start/u);
+    expect(observations.output).toContain('cannot reach postgresql://revo:[REDACTED]@db.example');
+    expect(observations.output).not.toContain('swordfish');
     expect(observations.sendDeadlineRemaining[0]).toBeGreaterThan(0);
     expect(observations.sendDeadlineRemaining[0]).toBeLessThanOrEqual(250);
     expect(observations.portCloseDeadlineRemaining[0]).toBeGreaterThan(0);

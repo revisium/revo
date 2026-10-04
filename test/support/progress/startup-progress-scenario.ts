@@ -13,6 +13,7 @@ import {
   StartupProgressDiscoveryService,
 } from '../../../src/startup-progress/index.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
+import { CapturedOutput } from '../server-logs/captured-output.js';
 
 const FIRST = '11111111111111111111111111111111';
 const SECOND = '22222222222222222222222222222222';
@@ -60,7 +61,7 @@ export class StartupProgressScenario {
     return { second: second.kind, read };
   }
 
-  async readyWriteFailure() {
+  async skipsFailedJournalWrite() {
     const fixture = await this.fixture();
     const journal = new FailAfterInitializationJournal();
     const held = await new PublishedControlService(
@@ -77,15 +78,50 @@ export class StartupProgressScenario {
     if (held.kind !== 'held' || !held.progress) {
       return undefined;
     }
-    const outcomes = await Promise.allSettled([
-      held.progress.start('server-start'),
-      held.progress.ready({ url: 'http://127.0.0.1:3210' }),
-    ]);
+    const progress = held.progress;
+    const output = new CapturedOutput();
+    let outcomes: PromiseSettledResult<unknown>[];
+    try {
+      outcomes = [await settle(progress.start('server-start'))];
+      outcomes.push(await settle(progress.ready({ url: 'http://127.0.0.1:3210' })));
+    } finally {
+      output.restore();
+    }
     const read = await new StartupProgressDiscoveryService().read(fixture.dataDir, {
       operationId: FIRST,
       sequence: 0,
     });
-    return { outcomes: outcomes.map(({ status }) => status), writes: journal.writes, read };
+    return {
+      outcomes: outcomes.map(({ status }) => status),
+      writes: journal.writes,
+      read,
+      log: output.text(),
+    };
+  }
+
+  async readyAfterCoreExit() {
+    const fixture = await this.fixture();
+    const held = await this.open(fixture, FIRST);
+    if (held.kind !== 'held' || !held.progress) {
+      throw new Error('fixture did not acquire progress ownership');
+    }
+    const outcome = await settle(
+      held.progress.ready(
+        { url: 'http://127.0.0.1:3210' },
+        {
+          signal: new AbortController().signal,
+          deadline: Date.now() + 1_000,
+          assertRunning: () => {
+            throw new Error('Core exited');
+          },
+        },
+      ),
+    );
+    const read = await new StartupProgressDiscoveryService().read(fixture.dataDir, {
+      operationId: FIRST,
+      sequence: 0,
+    });
+    return { outcome: outcome.status, read };
   }
 
   async transitionLimitReservesFailure() {
@@ -333,6 +369,12 @@ class GatedJournal extends StartupProgressJournalWriter {
     return super.write(...parameters);
   }
 }
+
+const settle = (operation: Promise<unknown>): Promise<PromiseSettledResult<unknown>> =>
+  operation.then(
+    (value) => ({ status: 'fulfilled' as const, value }),
+    (reason: unknown) => ({ status: 'rejected' as const, reason }),
+  );
 
 const onceMessage = (child: ChildProcess) =>
   new Promise<void>((resolve, reject) => {

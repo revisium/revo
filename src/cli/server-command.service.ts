@@ -8,6 +8,7 @@ import type {
   ConfigurationFlags,
   ConfigurationInput,
 } from '../configuration/configuration.types.js';
+import { readServerLogTail } from '../server-logs/server-log.js';
 import {
   ServerLauncherService,
   type ServerLaunchContext,
@@ -27,9 +28,10 @@ const DIAGNOSTICS: Readonly<Record<string, string>> = {
   START_CANCELLED: 'Server start was cancelled.',
   START_FAILED: 'Server start failed.',
   START_OUTCOME_UNKNOWN: 'Server start outcome is unknown.',
-  START_PROGRESS_OUTPUT_FAILED: 'Server is running, but startup progress output failed.',
   'revo.process.cancelled': 'Server start was cancelled.',
 };
+/** Failures whose cause is in the server log rather than in the launch transport. */
+const LOGGED_FAILURES: ReadonlySet<string> = new Set(['START_FAILED', 'START_OUTCOME_UNKNOWN']);
 const CLEANUP: Readonly<Record<string, string>> = {
   retained: ' Resources may remain active.',
   unconfirmed: ' Cleanup could not be confirmed.',
@@ -78,7 +80,6 @@ export class ServerCommandService {
       if (outcome.kind !== 'started' && outcome.kind !== 'running') {
         this.presentStartOutcome(outcome);
       }
-      output.assertHealthy();
     } finally {
       output.close();
     }
@@ -92,7 +93,9 @@ export class ServerCommandService {
     flags: Readonly<ConfigurationFlags>,
   ): Promise<ServerLaunchContext> {
     const input = this.input(flags);
-    return this.withSignal((signal) => this.launcher.launchWithConfiguration({ ...input, signal }));
+    return this.withSignal(input, (signal) =>
+      this.launcher.launchWithConfiguration({ ...input, signal }),
+    );
   }
 
   private presentStartOutcome(outcome: ServerLaunchResult): void {
@@ -141,7 +144,7 @@ export class ServerCommandService {
     input: Readonly<ConfigurationInput>,
     onProgress?: ServerProgressSink,
   ): Promise<ServerLaunchResult> {
-    return this.withSignal((signal) =>
+    return this.withSignal(input, (signal) =>
       this.launcher.launch({
         ...input,
         signal,
@@ -150,7 +153,10 @@ export class ServerCommandService {
     );
   }
 
-  private async withSignal<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private async withSignal<T>(
+    input: Readonly<ConfigurationInput>,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const controller = new AbortController();
     const abort = (): void => controller.abort();
     process.on('SIGINT', abort);
@@ -158,11 +164,37 @@ export class ServerCommandService {
     try {
       return await operation(controller.signal);
     } catch (error) {
-      throw diagnose(error);
+      throw await this.withServerLog(input, diagnose(error), error);
     } finally {
       process.off('SIGINT', abort);
       process.off('SIGTERM', abort);
     }
+  }
+
+  /** Appends the failed start's own server output so the reason is readable without a code. */
+  private async withServerLog(
+    input: Readonly<ConfigurationInput>,
+    diagnosed: unknown,
+    cause: unknown,
+  ): Promise<unknown> {
+    const code = cause instanceof Error ? Reflect.get(cause, 'code') : undefined;
+    if (!(diagnosed instanceof Error) || typeof code !== 'string' || !LOGGED_FAILURES.has(code)) {
+      return diagnosed;
+    }
+    const tail = await this.configuration
+      .resolve(input)
+      .then(({ channel, layout, logDir }) =>
+        readServerLogTail({ channel, dataDir: layout.dataDir, logDir }),
+      )
+      .catch(() => undefined);
+    if (!tail) {
+      return diagnosed;
+    }
+    const lines = [diagnosed.message, `Server log: ${tail.path}`];
+    if (tail.lines.length > 0) {
+      lines.push(`Last ${String(tail.lines.length)} log lines:`, ...tail.lines);
+    }
+    return new Error(lines.join('\n'));
   }
 
   private async inspect(): Promise<{ current: ServerStatus; dataDir: string }> {

@@ -40,11 +40,7 @@ export class ServerLifecycleStore implements ServerLifecycleSink {
   private disabled = false;
 
   private constructor(private readonly configuration: ServerLifecycleConfiguration) {
-    validateConfiguration(configuration);
-    const digest = createHash('sha256')
-      .update(configuration.canonicalDataDir, 'utf8')
-      .digest('hex');
-    const directory = join(configuration.logDir, configuration.channel, digest);
+    const directory = serverLogDirectory(configuration);
     this.targetPath = join(directory, SERVER_LIFECYCLE_FILE);
     this.temporaryPath = join(directory, SERVER_LIFECYCLE_TEMP_FILE);
     this.now = configuration.now ?? Date.now;
@@ -104,10 +100,7 @@ export class ServerLifecycleStore implements ServerLifecycleSink {
   }
 
   private async initialize(): Promise<void> {
-    const directory = dirname(this.targetPath);
-    await ensurePrivateDirectory(this.configuration.logDir);
-    await ensurePrivateDirectory(join(this.configuration.logDir, this.configuration.channel));
-    await ensurePrivateDirectory(directory);
+    await ensurePrivateLogDirectory(this.configuration);
 
     const target = await readFile(this.targetPath);
     const temporary = await readFile(this.temporaryPath);
@@ -180,9 +173,24 @@ export async function openServerLifecycleStore(
 }
 
 export function serverLifecyclePath(configuration: ServerLifecycleConfiguration): string {
+  return join(serverLogDirectory(configuration), SERVER_LIFECYCLE_FILE);
+}
+
+/** One private directory per channel and canonical data directory holds every server log. */
+export function serverLogDirectory(configuration: ServerLifecycleConfiguration): string {
   validateConfiguration(configuration);
   const digest = createHash('sha256').update(configuration.canonicalDataDir, 'utf8').digest('hex');
-  return join(configuration.logDir, configuration.channel, digest, SERVER_LIFECYCLE_FILE);
+  return join(configuration.logDir, configuration.channel, digest);
+}
+
+export async function ensurePrivateLogDirectory(
+  configuration: ServerLifecycleConfiguration,
+): Promise<string> {
+  const directory = serverLogDirectory(configuration);
+  await ensurePrivateDirectory(configuration.logDir);
+  await ensurePrivateDirectory(join(configuration.logDir, configuration.channel));
+  await ensurePrivateDirectory(directory);
+  return directory;
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {

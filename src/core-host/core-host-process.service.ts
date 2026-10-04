@@ -1,7 +1,11 @@
-import { Inject, Injectable } from '@nestjs/common';
+import process from 'node:process';
+import type { Writable } from 'node:stream';
+
+import { Inject, Injectable, Optional } from '@nestjs/common';
 
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
+import { protectDatabaseUrl } from '../server-logs/log-redaction.js';
 import {
   CORE_HOST_PROTOCOL,
   parseCoreHostMessage,
@@ -9,6 +13,7 @@ import {
   type CoreHostStageMessage,
   type CoreHostStartMessage,
 } from './core-child-protocol.js';
+import { forwardRedacted } from './core-output.js';
 
 const CLEANUP_MILLISECONDS = 3_000;
 const GRACE_MILLISECONDS = 500;
@@ -20,6 +25,14 @@ export interface CoreHostProcessBinding {
   readonly env: Readonly<Record<string, string>>;
   readonly executable: string;
 }
+
+/** Where Core output goes: the server's own stdout and stderr, which are the server log. */
+export interface CoreHostOutput {
+  readonly stdout: Writable;
+  readonly stderr: Writable;
+}
+
+export const CORE_HOST_OUTPUT = Symbol('CORE_HOST_OUTPUT');
 
 export interface CoreHostStartOptions {
   readonly deadline: number;
@@ -64,10 +77,13 @@ export class CoreHostProcessService {
   constructor(
     @Inject(ManagedProcessService)
     private readonly processes = new ManagedProcessService(),
+    @Optional()
+    @Inject(CORE_HOST_OUTPUT)
+    private readonly output: CoreHostOutput = { stdout: process.stdout, stderr: process.stderr },
   ) {}
 
   open(binding: CoreHostProcessBinding): CoreHostProcessResource {
-    return new CoreHostProcessResource(binding, this.processes);
+    return new CoreHostProcessResource(binding, this.processes, this.output);
   }
 }
 
@@ -90,6 +106,7 @@ export class CoreHostProcessResource {
   constructor(
     private readonly binding: CoreHostProcessBinding,
     private readonly processes: ManagedProcessService,
+    private readonly output: CoreHostOutput,
   ) {}
 
   async start(message: CoreHostStartMessage, options: CoreHostStartOptions) {
@@ -103,6 +120,7 @@ export class CoreHostProcessResource {
       throw new CoreHostProcessError('revo.core-host.deadline');
     }
     this.phase = 'spawning';
+    protectDatabaseUrl(message.databaseUrl);
     this.spawnOperation = this.processes
       .start({
         executable: this.binding.executable,
@@ -110,7 +128,7 @@ export class CoreHostProcessResource {
         cwd: this.binding.cwd,
         env: this.binding.env,
         ipc: true,
-        stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
       })
       .then((child) => this.register(child))
       .catch((error: unknown) => {
@@ -180,6 +198,8 @@ export class CoreHostProcessResource {
 
   private register(child: OwnedProcess): OwnedProcess {
     this.child = child;
+    forwardRedacted(child.stdout, this.output.stdout);
+    forwardRedacted(child.stderr, this.output.stderr);
     void child.completion.then((completion) => {
       this.completion = completion;
       if (this.phase !== 'failed') {

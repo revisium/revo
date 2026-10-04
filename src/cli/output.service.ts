@@ -24,13 +24,16 @@ export class OutputService {
   }
 }
 
-/** One command's JSONL output lifetime; async stream mechanics stay outside the renderer. */
+/**
+ * One command's JSONL output lifetime. Slow writes stay pending for the observer to skip; only a
+ * stream error ends the output, and the error listener outlives close while a write is unsettled.
+ */
 export class JsonlProgressOutput {
-  private failed = false;
+  private broken = false;
+  private errorObserved = false;
   private closed = false;
-  private lateErrorGuard = false;
   private text = '';
-  private pending: (() => void) | undefined;
+  private readonly pending = new Set<() => void>();
   private readonly renderer = new ProgressRenderer({
     format: 'jsonl',
     isTty: false,
@@ -40,9 +43,9 @@ export class JsonlProgressOutput {
     stderr: () => undefined,
   });
   private readonly onError = (): void => {
-    this.failed = true;
-    this.pending?.();
-    this.lateErrorGuard = false;
+    this.broken = true;
+    this.errorObserved = true;
+    this.settlePending();
     this.stdout.off('error', this.onError);
   };
   private readonly onClose = (): void => {
@@ -55,7 +58,9 @@ export class JsonlProgressOutput {
   }
 
   readonly sink = async (event: ProgressEvent): Promise<void> => {
-    this.assertHealthy();
+    if (this.broken || this.closed) {
+      throw new StartProgressOutputError();
+    }
     this.text = '';
     this.renderer.render(event);
     if (this.text) {
@@ -63,17 +68,12 @@ export class JsonlProgressOutput {
     }
   };
 
-  assertHealthy(): void {
-    if (this.failed || this.closed) {
-      throw new StartProgressOutputError();
-    }
-  }
-
   close(): void {
     this.closed = true;
-    this.pending?.();
+    const lateErrorPossible = this.pending.size > 0 || (this.broken && !this.errorObserved);
+    this.settlePending();
     this.renderer.finish();
-    if (!this.lateErrorGuard) {
+    if (!lateErrorPossible) {
       this.removeStreamListeners();
     }
   }
@@ -83,30 +83,27 @@ export class JsonlProgressOutput {
       let callbackDone = false;
       let drained = false;
       let returned = false;
-      let settled = false;
       const finish = (failure = false) => {
-        if (settled || (!failure && (!returned || !callbackDone || !drained))) {
+        if (!failure && (!returned || !callbackDone || !drained)) {
           return;
         }
-        settled = true;
-        clearTimeout(timer);
+        if (!this.pending.delete(fail)) {
+          return;
+        }
         this.stdout.off('drain', onDrain);
-        this.pending = undefined;
         if (failure) {
-          this.failed = true;
-          this.lateErrorGuard = true;
+          this.broken = true;
           reject(new StartProgressOutputError());
         } else {
           resolve();
         }
       };
+      const fail = () => finish(true);
       const onDrain = () => {
         drained = true;
         finish();
       };
-      // Shorter than the observer's sink budget, so timeout also removes stream listeners.
-      const timer = setTimeout(() => finish(true), 200);
-      this.pending = () => finish(true);
+      this.pending.add(fail);
       this.stdout.on('drain', onDrain);
       try {
         drained =
@@ -120,6 +117,12 @@ export class JsonlProgressOutput {
         finish(true);
       }
     });
+  }
+
+  private settlePending(): void {
+    for (const fail of [...this.pending]) {
+      fail();
+    }
   }
 
   private removeStreamListeners(): void {

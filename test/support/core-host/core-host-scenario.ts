@@ -179,6 +179,7 @@ export class CoreChildEntryScenario {
 }
 
 export class DeferredCoreRuntimeService extends CoreRuntimeService {
+  options: RevoCoreRuntimeOptions | undefined;
   private observer: RevoCoreRuntimeOptions['onStage'];
   private resolve!: (runtime: RevoCoreRuntime) => void;
   private reject!: (error: Error) => void;
@@ -196,6 +197,7 @@ export class DeferredCoreRuntimeService extends CoreRuntimeService {
     this.reject(error);
   }
   protected override createRuntime(options: RevoCoreRuntimeOptions): Promise<RevoCoreRuntime> {
+    this.options = options;
     this.observer = options.onStage;
     return this.factory;
   }

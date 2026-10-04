@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ConfigurationError } from '../../src/configuration/configuration-error.js';
 import { ManagedProcessError } from '../../src/processes/managed-process-error.js';
@@ -18,6 +18,7 @@ import {
   serverStatus,
   type ServerCommandFixture,
 } from '../support/cli/server-command-scenario.js';
+import { ServerLogFixture } from '../support/server-logs/server-log-fixture.js';
 
 type Cmd = 'status' | 'stop';
 type Kind = ServerStatus['kind'];
@@ -162,6 +163,24 @@ describe('revo server command line', () => {
     }
   });
 
+  it('explains a real failed start with the logged reason, the log path, and its tail', async () => {
+    const password = 'p@ss/word-1234';
+    const result = await CliScenario.runIsolated([
+      'server',
+      'start',
+      '--database-url',
+      `postgresql://revo:${encodeURIComponent(password)}@127.0.0.1:9/revo`,
+    ]);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toMatch(
+      /Server start failed\.\nServer log: \/\S+\/server\.log\nLast \d+ log lines:\n--- Revo server start /u,
+    );
+    expect(result.stderr).toMatch(/ERROR \[ServerOwner\] Server start failed: the database/u);
+    expect(result.stderr).not.toContain('p@ss');
+    expect(result.stderr).not.toContain(encodeURIComponent(password));
+  });
+
   it('reports an isolated home as stopped without starting a server', async () => {
     const status = await CliScenario.runIsolated(['server', 'status']);
     const stop = await CliScenario.runIsolated(['server', 'stop']);
@@ -262,18 +281,21 @@ describe('server command requests and failures', () => {
     ).toEqual(events);
   });
 
-  it('reports progress output failure honestly with a fixed diagnostic', async () => {
+  it.each([
+    { label: 'fresh', outcome: STARTED },
+    { label: 'reused', outcome: serverStatus('running') },
+  ])('exits zero for a $label running server when JSONL output breaks', async ({ outcome }) => {
+    const operation = new ProgressOperation({ operationId: 'a'.repeat(32), now: () => 0 });
     const result = await run(['server', 'start', '--progress=jsonl'], {
-      launch: async () => {
-        throw launchError('START_PROGRESS_OUTPUT_FAILED');
+      progressOutput: 'broken',
+      launch: async (request) => {
+        const event = operation.start('server-start');
+        await Promise.resolve(event && request.onProgress?.(event)).catch(() => undefined);
+        return outcome;
       },
     });
-    expect(result).toMatchObject({
-      exitCode: 1,
-      stdout: '',
-      listeners: NO_LISTENERS,
-      stderr: 'Server is running, but startup progress output failed.\n',
-    });
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: '', listeners: NO_LISTENERS });
   });
 
   it('resolves only the selected lifecycle log configuration', async () => {
@@ -401,6 +423,80 @@ describe('server command requests and failures', () => {
   });
 });
 
+describe('readable server start failures', () => {
+  const logs: ServerLogFixture[] = [];
+  afterEach(async () => {
+    await Promise.all(logs.splice(0).map((log) => log.dispose()));
+  });
+  const fixture = async () => {
+    const log = await ServerLogFixture.create();
+    logs.push(log);
+    return log;
+  };
+  const failedStart = (log: ServerLogFixture, error: Error) =>
+    run(['server', 'start', '--log-dir', log.configuration.logDir], {
+      resolve: async () => log.configuration,
+      launch: () => Promise.reject(error),
+    });
+
+  it('prints the reason, the server log path, and the last 40 lines of the failed start', async () => {
+    const log = await fixture();
+    const lines = Array.from({ length: 60 }, (_, index) => `core output ${String(index + 1)}`);
+    await log.startAttempt([...lines.slice(0, -1), 'ERROR [CoreHost] Core migration failed']);
+
+    const result = await failedStart(log, launchError('START_FAILED', 'completed'));
+
+    expect(result.exitCode).toBe(1);
+    expect(result.resolves.map((input) => input.flags)).toEqual([
+      { logDir: log.configuration.logDir },
+    ]);
+    expect(result.stderr).toBe(
+      [
+        'Server start failed.',
+        `Server log: ${await log.path()}`,
+        'Last 40 log lines:',
+        ...lines.slice(20, 59),
+        'ERROR [CoreHost] Core migration failed',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  it('shows only the lines of the latest start attempt', async () => {
+    const log = await fixture();
+    await log.startAttempt(['previous attempt failure']);
+    await log.startAttempt(['Database start failed: connection refused']);
+
+    const result = await failedStart(log, launchError('START_OUTCOME_UNKNOWN'));
+
+    expect(result.stderr).toContain('Server start outcome is unknown.\n');
+    expect(result.stderr).toContain('Database start failed: connection refused');
+    expect(result.stderr).not.toContain('previous attempt failure');
+    expect(result.stderr).toMatch(/Last 2 log lines:\n--- Revo server start \S+ ---\n/u);
+  });
+
+  it('prints only the diagnostic when no server log exists', async () => {
+    const log = await fixture();
+
+    const result = await failedStart(log, launchError('START_FAILED'));
+
+    expect(result).toMatchObject({ exitCode: 1, stderr: FAILED, stdout: '' });
+  });
+
+  it.each(['START_BUSY', 'START_CANCELLED'])(
+    'keeps the %s diagnostic without logs',
+    async (code) => {
+      const log = await fixture();
+      await log.startAttempt(['unrelated output']);
+
+      const result = await failedStart(log, launchError(code));
+
+      expect(result.stderr).not.toContain('unrelated output');
+      expect(result.stderr).not.toContain('Server log:');
+    },
+  );
+});
+
 describe('JSONL output backpressure', () => {
   it('waits for the write callback and drain before accepting the next event', async () => {
     const scenario = new ProgressOutputScenario();
@@ -421,45 +517,57 @@ describe('JSONL output backpressure', () => {
     expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
   });
 
-  it.each(['EPIPE', 'timeout'] as const)(
-    'disables output after %s and releases listeners',
-    async (failure) => {
-      const scenario = new ProgressOutputScenario();
-      try {
-        const pending = scenario.write();
-        if (failure === 'EPIPE') {
-          scenario.fail();
-        }
-        await expect(pending).rejects.toMatchObject({ code: 'START_PROGRESS_OUTPUT_FAILED' });
-        if (failure === 'EPIPE') {
-          await new Promise((resolve) => setImmediate(resolve));
-        }
-        await expect(scenario.write()).rejects.toThrow(
-          'Server is running, but startup progress output failed.',
-        );
-        expect(scenario.lines).toHaveLength(1);
-        expect(scenario.listeners().drain).toBe(0);
-      } finally {
-        scenario.close();
-      }
-      expect(scenario.listeners()).toEqual({
-        error: failure === 'EPIPE' ? 0 : 1,
-        drain: 0,
-      });
-      await scenario.destroy();
-      expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
-    },
-  );
-
-  it('handles a late EPIPE after output timeout and close', async () => {
+  it('rejects later events after a stream error and releases its listeners', async () => {
     const scenario = new ProgressOutputScenario();
     try {
       const pending = scenario.write();
+      scenario.fail();
       await expect(pending).rejects.toMatchObject({ code: 'START_PROGRESS_OUTPUT_FAILED' });
+      await new Promise((resolve) => setImmediate(resolve));
+      await expect(scenario.write()).rejects.toMatchObject({
+        code: 'START_PROGRESS_OUTPUT_FAILED',
+      });
+      expect(scenario.lines).toHaveLength(1);
+      expect(scenario.listeners().drain).toBe(0);
+    } finally {
       scenario.close();
+    }
+    expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
+    await scenario.destroy();
+  });
+
+  it('keeps a slow write pending instead of failing it on a timer', async () => {
+    vi.useFakeTimers();
+    const scenario = new ProgressOutputScenario();
+    try {
+      let outcome = 'pending';
+      const slow = scenario.write().then(
+        () => (outcome = 'written'),
+        () => (outcome = 'failed'),
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(outcome).toBe('pending');
+      scenario.drain();
+      await slow;
+      expect(outcome).toBe('written');
+      await expect(scenario.writeDrained()).resolves.toBeUndefined();
+      expect(scenario.lines).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+      scenario.close();
+    }
+    expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
+  });
+
+  it('settles a pending write on close and guards a late EPIPE until the stream closes', async () => {
+    const scenario = new ProgressOutputScenario();
+    try {
+      const pending = scenario.write();
+      scenario.close();
+      await expect(pending).rejects.toMatchObject({ code: 'START_PROGRESS_OUTPUT_FAILED' });
+      expect(scenario.listeners()).toEqual({ error: 1, drain: 0 });
       scenario.fail();
       await new Promise((resolve) => setImmediate(resolve));
-      expect(scenario.listeners()).toEqual({ error: 0, drain: 0 });
     } finally {
       await scenario.destroy();
     }

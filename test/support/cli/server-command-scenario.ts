@@ -69,6 +69,7 @@ export const FIXTURE_DATA_DIR = FIXTURE_LAYOUT.dataDir;
 export interface ServerCommandFixture {
   readonly launch?: (request: Readonly<ServerLaunchRequest>) => Promise<ServerLaunchResult>;
   readonly platform?: NodeJS.Platform;
+  readonly progressOutput?: 'broken';
   readonly raise?: 'SIGINT' | 'SIGTERM';
   readonly resolve?: () => Promise<Readonly<RevoConfiguration>>;
   readonly status?: ServerStatus;
@@ -179,9 +180,14 @@ class CommandRecorder {
   }
 
   progress() {
+    const broken = this.fixture.progressOutput === 'broken';
     return new OutputService().progress(
       new Writable({
         write: (chunk: Buffer, _encoding, callback) => {
+          if (broken) {
+            callback(Object.assign(new Error('fixture pipe closed'), { code: 'EPIPE' }));
+            return;
+          }
           this.outputs.push(chunk.toString());
           callback();
         },

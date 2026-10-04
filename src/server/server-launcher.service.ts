@@ -88,6 +88,11 @@ export class ServerLauncherService {
         entry: SERVER_ENTRY,
         env: environment,
         executable: process.execPath,
+        log: {
+          channel: resolved.channel,
+          dataDir: resolved.layout.dataDir,
+          logDir: resolved.logDir,
+        },
       },
       { graceMs: GRACE_MILLISECONDS, killWaitMs: KILL_WAIT_MILLISECONDS, signal: request.signal },
     );

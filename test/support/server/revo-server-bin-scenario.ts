@@ -8,6 +8,7 @@ import type {
   OpenServerOwnerRequest,
   ServerOwnerOutcome,
 } from '../../../src/server/server-owner.service.js';
+import { CapturedOutput } from '../server-logs/captured-output.js';
 import { validStartMessage } from './server-host-message.js';
 
 type HeldOwner = {
@@ -109,6 +110,7 @@ export async function executeRevoServerBin(options: {
     },
   };
 
+  const output = new CapturedOutput();
   try {
     vi.doMock('../../../src/server/server-host-process-port.js', () => ({
       NodeServerHostProcessPort: function () {
@@ -150,8 +152,10 @@ export async function executeRevoServerBin(options: {
       sendDeadlineRemaining,
       portCloseDeadlineRemaining,
       exitCode: process.exitCode,
+      output: output.text(),
     };
   } finally {
+    output.restore();
     if (startDelivery) {
       clearImmediate(startDelivery);
     }

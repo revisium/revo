@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { CORE_HOST_PROTOCOL } from '../../../src/core-host/core-child-protocol.js';
@@ -95,6 +96,25 @@ class ControlledProcesses extends ManagedProcessService {
   }
 }
 
+export class CapturedStreams {
+  private readonly chunks: string[] = [];
+  readonly stdout = this.capture();
+  readonly stderr = this.capture();
+
+  text(): string {
+    return this.chunks.join('');
+  }
+
+  private capture(): Writable {
+    return new Writable({
+      write: (chunk: Buffer, _encoding, callback) => {
+        this.chunks.push(chunk.toString());
+        callback();
+      },
+    });
+  }
+}
+
 export class CoreHostProcessScenario {
   private root = '';
   private readonly resources: CoreHostProcessResource[] = [];
@@ -135,6 +155,22 @@ export class CoreHostProcessScenario {
     return resource;
   }
 
+  /** A real Core host child whose stdout and stderr are forwarded to captured server output. */
+  logged(mode: 'echo-credentials') {
+    const output = new CapturedStreams();
+    const resource = new CoreHostProcessService(new ManagedProcessService(), output).open({
+      executable: process.execPath,
+      entry: CHILD,
+      cwd: this.root,
+      env: {
+        REVO_CORE_HOST_FIXTURE_MODE: mode,
+        REVO_CORE_HOST_FIXTURE_ROOT: this.root,
+      },
+    });
+    this.resources.push(resource);
+    return { resource, output };
+  }
+
   controlled(pendingSpawn: boolean, heldSend = false, failFirstStop = false, rejectSpawn = false) {
     const processes = new ControlledProcesses(pendingSpawn, heldSend, failFirstStop, rejectSpawn);
     const resource = new CoreHostProcessService(processes).open({
@@ -153,13 +189,14 @@ export class CoreHostProcessScenario {
       readonly signal?: AbortSignal;
       readonly onStage?: Parameters<CoreHostProcessResource['start']>[1]['onStage'];
       readonly timeoutMs?: number;
+      readonly databaseUrl?: string;
     } = {},
   ) {
     return resource.start(
       {
         protocol: CORE_HOST_PROTOCOL,
         type: 'start',
-        databaseUrl: 'postgresql://explicit.invalid/revo',
+        databaseUrl: options.databaseUrl ?? 'postgresql://explicit.invalid/revo',
         temporaryWorkingDirectoryRoot: this.root,
         agentWorkspaceDirectory: this.root,
         host: '127.0.0.1',

@@ -63,10 +63,7 @@ export class StartupProgressJournalWriter {
         await file.close();
       }
       if (readyContext) {
-        if (readyContext.signal.aborted || Date.now() >= readyContext.deadline) {
-          throw new StartupProgressError('closed');
-        }
-        readyContext.assertRunning();
+        assertStillReady(readyContext);
       }
       await rename(temporaryPath, join(canonicalDataDir, STARTUP_PROGRESS_FILE));
     } catch (error) {
@@ -76,6 +73,18 @@ export class StartupProgressJournalWriter {
       }
       throw new StartupProgressError('io');
     }
+  }
+}
+
+/** Ready is published only for a live server; a failed check is a real failure, not I/O. */
+function assertStillReady(readyContext: StartupReadyContext): void {
+  if (readyContext.signal.aborted || Date.now() >= readyContext.deadline) {
+    throw new StartupProgressError('closed');
+  }
+  try {
+    readyContext.assertRunning();
+  } catch {
+    throw new StartupProgressError('closed');
   }
 }
 

@@ -62,9 +62,21 @@ export function parseControlRecord(value: unknown): ControlRecord | undefined {
     : undefined;
 }
 
+/** Usable `sun_path` bytes: macOS reserves 104 including NUL, Linux 108. */
+export function controlEndpointByteLimit(): number {
+  return process.platform === 'darwin' ? 103 : 107;
+}
+
 export function validEndpointPath(endpoint: string): boolean {
-  const limit = process.platform === 'darwin' ? 103 : 107;
-  return isAbsolute(endpoint) && !endpoint.includes('\0') && Buffer.byteLength(endpoint) <= limit;
+  return (
+    isAbsolute(endpoint) &&
+    !endpoint.includes('\0') &&
+    Buffer.byteLength(endpoint) <= controlEndpointByteLimit()
+  );
+}
+
+export function validInstanceId(value: unknown): value is string {
+  return typeof value === 'string' && HEX32.test(value);
 }
 
 export function parseControlRequest(value: unknown): ControlRequest | undefined {

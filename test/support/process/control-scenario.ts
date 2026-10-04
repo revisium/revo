@@ -1,8 +1,10 @@
-import { chmod, mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { chmod, mkdir, mkdtemp, rm, stat, symlink } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
+import { resolveRevoLayout, type LayoutInput } from '../../../src/layout.js';
 import { ControlClientService } from '../../../src/processes/control-client.service.js';
 import { ControlEndpointService } from '../../../src/processes/control-endpoint.service.js';
 import type {
@@ -16,15 +18,21 @@ const INSTANCE = '0123456789abcdef0123456789abcdef';
 const TOKEN = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const LIMITS = { timeoutMs: 150, maxFrameBytes: 512 };
 
+type UnsafeShortDirectory = 'symlink' | 'public';
+
 export class ControlScenario {
   private readonly roots = new Set<string>();
+  private readonly socketDirectories = new Set<string>();
   private readonly endpoints: HeldControlEndpoint[] = [];
   private readonly client = new ControlClientService();
+  private shortRoot: string | undefined;
 
   async starts(onStop: ListenControlEndpointRequest['onStop'] = () => undefined) {
     const runtimeDir = await this.runtimeDir();
     const process = await new ProcessIdentityService().capture(globalThis.process.pid);
-    const endpoint = await new ControlEndpointService().listen({
+    const endpoint = await (
+      await this.service()
+    ).listen({
       runtimeDir,
       instanceId: INSTANCE,
       token: TOKEN,
@@ -252,16 +260,20 @@ export class ControlScenario {
 
   async validatesPathBeforeListening() {
     const process = await new ProcessIdentityService().capture(globalThis.process.pid);
-    const service = new ControlEndpointService();
-    const request = (runtimeDir: string) =>
+    const service = await this.service();
+    const runtimeDir = await this.runtimeDir();
+    const request = (directory: string, instanceId: string) =>
       service.listen({
-        runtimeDir,
-        instanceId: INSTANCE,
+        runtimeDir: directory,
+        instanceId,
         token: TOKEN,
         identity: { version: '1', channel: 'stable', canonicalDataDir: '/data', process },
         onStop: () => undefined,
       });
-    return Promise.allSettled([request('/tmp/revo\0bad'), request(`/tmp/${'é'.repeat(60)}`)]);
+    return Promise.allSettled([
+      request('/tmp/revo\0bad', INSTANCE),
+      request(runtimeDir, '../../escaped-instance-identity'),
+    ]);
   }
 
   async acceptsNativePathBoundaryAndPrivateDirectory() {
@@ -274,7 +286,9 @@ export class ControlScenario {
       'r'.repeat(limit - suffixBytes - Buffer.byteLength(ownedRoot) - 1),
     );
     await mkdir(runtimeDir, { mode: 0o700 });
-    const endpoint = await new ControlEndpointService().listen({
+    const endpoint = await (
+      await this.serviceWithUnsafeShortDirectory('public')
+    ).listen({
       runtimeDir,
       instanceId: INSTANCE,
       token: TOKEN,
@@ -292,7 +306,9 @@ export class ControlScenario {
     const process = await new ProcessIdentityService().capture(globalThis.process.pid);
     const root = await this.runtimeDir();
     const runtimeDir = join(root, 'Library', 'Application Support', 'Revo', 'state', 'run');
-    const endpoint = await new ControlEndpointService().listen({
+    const endpoint = await (
+      await this.serviceWithUnsafeShortDirectory('public')
+    ).listen({
       runtimeDir,
       instanceId: INSTANCE,
       token: TOKEN,
@@ -307,13 +323,90 @@ export class ControlScenario {
     const runtimeDir = await this.runtimeDir();
     await chmod(runtimeDir, 0o755);
     const process = await new ProcessIdentityService().capture(globalThis.process.pid);
-    return new ControlEndpointService().listen({
+    return (await this.serviceWithUnsafeShortDirectory('public')).listen({
       runtimeDir,
       instanceId: INSTANCE,
       token: TOKEN,
       onStop: () => undefined,
       identity: { version: '1', channel: 'stable', canonicalDataDir: '/data', process },
     });
+  }
+
+  async servesLayout(
+    input: Pick<LayoutInput, 'channel' | 'homeDir' | 'platform'>,
+    ambient: { readonly tmpdir?: string } = {},
+  ) {
+    const layout = resolveRevoLayout({ ...input, env: {} });
+    const previousTmpdir = process.env.TMPDIR;
+    if (ambient.tmpdir !== undefined) {
+      process.env.TMPDIR = ambient.tmpdir;
+    }
+    try {
+      const { endpoint, record } = await this.listen(new ControlEndpointService(), {
+        runtimeDir: layout.runtimeDir,
+        channel: input.channel,
+        canonicalDataDir: layout.dataDir,
+      });
+      this.socketDirectories.add(dirname(endpoint.endpoint));
+      return {
+        runtimeBytes: Buffer.byteLength(join(layout.runtimeDir, `c-${record.instanceId}.sock`)),
+        endpointBytes: Buffer.byteLength(endpoint.endpoint),
+        mode: (await stat(dirname(endpoint.endpoint))).mode & 0o777,
+        runtimeUsed: endpoint.endpoint.startsWith(layout.runtimeDir),
+        probe: await this.client.probe(record, LIMITS),
+      };
+    } finally {
+      restoreEnvironment('TMPDIR', previousTmpdir);
+    }
+  }
+
+  async isolatesChannelsAndDataDirectories() {
+    const service = await this.service();
+    const runtimeDir = await this.runtimeDir();
+    const scopes = [
+      { channel: 'stable', canonicalDataDir: '/data/a' },
+      { channel: 'alpha', canonicalDataDir: '/data/a' },
+      { channel: 'stable', canonicalDataDir: '/data/b' },
+      { channel: 'stable', canonicalDataDir: '/data/a' },
+    ];
+    const listening = await Promise.all(
+      scopes.map((scope) => this.listen(service, { runtimeDir, ...scope })),
+    );
+    const directories = listening.map(({ endpoint }) => dirname(endpoint.endpoint));
+    const parents = new Set(directories.map((directory) => dirname(directory)));
+    const [parent] = parents;
+    return {
+      distinctDirectories: new Set(directories).size,
+      sharedParent:
+        parents.size === 1 && parent === join(await this.ensureShortRoot(), userDirectory()),
+      modes: await Promise.all(
+        [parent ?? '', ...new Set(directories)].map(
+          async (path) => (await stat(path)).mode & 0o777,
+        ),
+      ),
+    };
+  }
+
+  async fallsBackFromUnsafeShortDirectory(unsafe: UnsafeShortDirectory) {
+    const runtimeDir = await this.runtimeDir();
+    const { endpoint, record } = await this.listen(
+      await this.serviceWithUnsafeShortDirectory(unsafe),
+      { runtimeDir, channel: 'stable', canonicalDataDir: '/data/revo' },
+    );
+    return {
+      runtimeUsed: dirname(endpoint.endpoint) === runtimeDir,
+      probe: await this.client.probe(record, LIMITS),
+    };
+  }
+
+  async refusesWhenNoDirectoryIsUsable() {
+    const ownedRoot = await this.runtimeDir();
+    const runtimeDir = join(ownedRoot, 'r'.repeat(120));
+    const service = await this.serviceWithUnsafeShortDirectory('public');
+    return this.listen(service, { runtimeDir, channel: 'stable', canonicalDataDir: '/data' }).then(
+      () => new Error('listen unexpectedly succeeded'),
+      (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+    );
   }
 
   async disconnectsAfterAcceptedStop() {
@@ -388,12 +481,86 @@ export class ControlScenario {
 
   async cleanup() {
     await Promise.allSettled(this.endpoints.map((endpoint) => endpoint.close()));
-    await Promise.all([...this.roots].map((root) => rm(root, { recursive: true, force: true })));
+    await Promise.all(
+      [...this.socketDirectories, ...this.roots].map((root) =>
+        rm(root, { recursive: true, force: true }),
+      ),
+    );
   }
+
+  private async listen(
+    service: ControlEndpointService,
+    scope: {
+      readonly runtimeDir: string;
+      readonly channel: string;
+      readonly canonicalDataDir: string;
+    },
+  ) {
+    const process = await new ProcessIdentityService().capture(globalThis.process.pid);
+    const instanceId = randomBytes(16).toString('hex');
+    const endpoint = await service.listen({
+      runtimeDir: scope.runtimeDir,
+      instanceId,
+      token: TOKEN,
+      limits: LIMITS,
+      onStop: () => undefined,
+      identity: {
+        version: '1.2.3',
+        channel: scope.channel,
+        canonicalDataDir: scope.canonicalDataDir,
+        process,
+      },
+    });
+    this.endpoints.push(endpoint);
+    const record: ControlRecord = {
+      schemaVersion: 1,
+      instanceId,
+      token: TOKEN,
+      endpoint: endpoint.endpoint,
+      version: '1.2.3',
+      channel: scope.channel,
+      canonicalDataDir: scope.canonicalDataDir,
+      process,
+    };
+    return { endpoint, record };
+  }
+
+  private async service() {
+    return new ControlEndpointService(await this.ensureShortRoot());
+  }
+
+  private async serviceWithUnsafeShortDirectory(unsafe: UnsafeShortDirectory) {
+    const root = await this.runtimeDir();
+    const directory = join(root, userDirectory());
+    if (unsafe === 'symlink') {
+      const target = await this.runtimeDir();
+      await symlink(target, directory);
+    } else {
+      await mkdir(directory, { mode: 0o700 });
+      await chmod(directory, 0o755);
+    }
+    return new ControlEndpointService(root);
+  }
+
+  private async ensureShortRoot() {
+    this.shortRoot ??= await this.runtimeDir();
+    return this.shortRoot;
+  }
+
   private async runtimeDir() {
     const root = await mkdtemp(process.platform === 'darwin' ? '/tmp/r4-' : join(tmpdir(), 'r4-'));
     this.roots.add(root);
     return root;
+  }
+}
+
+const userDirectory = () => `revo-${String(process.getuid?.())}`;
+
+function restoreEnvironment(name: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
   }
 }
 

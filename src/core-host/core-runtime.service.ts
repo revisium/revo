@@ -5,6 +5,8 @@ import {
 } from '@revisium/revo-core/runtime';
 
 import { configureAdminSpa } from '../admin/admin-spa.js';
+import { protectDatabaseUrl } from '../server-logs/log-redaction.js';
+import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import type { CoreHostStartMessage } from './core-child-protocol.js';
 
 export interface StartedCoreRuntime {
@@ -18,11 +20,12 @@ export class CoreRuntimeService {
     signal: AbortSignal,
     onStage: NonNullable<RevoCoreRuntimeOptions['onStage']>,
   ): Promise<StartedCoreRuntime> {
+    protectDatabaseUrl(request.databaseUrl);
     const runtime = await this.createRuntime({
       databaseUrl: request.databaseUrl,
       temporaryWorkingDirectoryRoot: request.temporaryWorkingDirectoryRoot,
       agentWorkspaceDirectory: request.agentWorkspaceDirectory,
-      logger: false,
+      logger: new RevoConsoleLogger(),
       onStage,
     });
     if (signal.aborted) {

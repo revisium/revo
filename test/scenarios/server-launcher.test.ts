@@ -343,6 +343,7 @@ describe('server launcher composition', () => {
           entry: SERVER_ENTRY,
           env: SAFE_ENVIRONMENT,
           executable: process.execPath,
+          log: { channel: 'stable', dataDir: resolved.layout.dataDir, logDir: resolved.logDir },
         },
         { graceMs: 500, killWaitMs: 2_500, signal: input.signal },
       ],

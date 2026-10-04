@@ -2,10 +2,13 @@ import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { NestFactory } from '@nestjs/core';
 
 import { CoreHostProcessService } from '../../../src/core-host/core-host-process.service.js';
+import { resolveRevoLayout } from '../../../src/layout.js';
+import { readEmbeddedPostgresCredential } from '../../../src/postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresError, ExternalPostgresError } from '../../../src/postgres/index.js';
 import { ControlClientService } from '../../../src/processes/control-client.service.js';
 import {
@@ -40,15 +43,18 @@ import {
   StartupProgressDiscoveryService,
   StartupProgressJournalWriter,
 } from '../../../src/startup-progress/startup-progress-journal.service.js';
+import { CapturedOutput } from '../server-logs/captured-output.js';
 import { ServerLifecycleProbe } from './server-lifecycle-probe.js';
 
 const STARTUP_MILLISECONDS = 120_000;
+const CREDENTIAL_ECHO_CORE = fileURLToPath(
+  new URL('../core-host/credential-echo-core.mjs', import.meta.url),
+);
 
 export class ServerOwnerScenario {
   private root = '';
   private dataDir = '';
   private runtimeDir = '';
-  private separateRuntimeRoot: string | undefined;
   private readonly owners: ServerOwnerResource[] = [];
   private readonly servers: Server[] = [];
   private readonly journals: OwnerJournal[] = [];
@@ -57,10 +63,13 @@ export class ServerOwnerScenario {
   async setup(options: { readonly dataDir?: string } = {}) {
     this.root = await mkdtemp(join(await realpath(tmpdir()), 'revo-server-owner-'));
     this.dataDir = options.dataDir ?? join(this.root, 'data');
-    if (process.platform === 'darwin') {
-      this.separateRuntimeRoot = await mkdtemp('/tmp/so-');
-    }
-    this.runtimeDir = this.separateRuntimeRoot ?? join(this.root, 'run');
+    // A 32-character macOS user under Revo Alpha: longer than any native socket path limit.
+    this.runtimeDir = resolveRevoLayout({
+      channel: 'alpha',
+      env: {},
+      homeDir: join(this.root, 'Users', 'u'.repeat(32)),
+      platform: 'darwin',
+    }).runtimeDir;
     await Promise.all([
       mkdir(this.dataDir, { recursive: true, mode: 0o700 }),
       mkdir(join(this.root, 'home'), { mode: 0o700 }),
@@ -215,6 +224,25 @@ export class ServerOwnerScenario {
         error.ownership === 'unconfirmed' &&
         error.cleanupFailures.includes('ownership')
       );
+    }
+  }
+
+  async failsWithCredentialEchoingCore() {
+    const output = new CapturedOutput();
+    try {
+      const owner = await this.open(this.nextOperation(), CREDENTIAL_ECHO_CORE);
+      const start = await owner.start(new AbortController().signal).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await owner.outcome();
+      return {
+        start,
+        password: await readEmbeddedPostgresCredential(this.dataDir),
+        log: output.text(),
+      };
+    } finally {
+      output.restore();
     }
   }
 
@@ -688,19 +716,17 @@ export class ServerOwnerScenario {
       result.status === 'rejected' ? [result.reason] : [],
     );
     if (failures.length === 0) {
-      await Promise.all([
-        rm(this.root, { recursive: true, force: true }),
-        ...(this.separateRuntimeRoot
-          ? [rm(this.separateRuntimeRoot, { recursive: true, force: true })]
-          : []),
-      ]);
+      await rm(this.root, { recursive: true, force: true });
     }
     if (failures.length > 0) {
       throw new AggregateError(failures, 'Server owner cleanup failed');
     }
   }
 
-  private async open(operationId: string) {
+  private async open(
+    operationId: string,
+    coreEntry = join(process.cwd(), 'dist/bin/revo-core-host.js'),
+  ) {
     const result = await new ServerOwnerService().open({
       configuration: {
         channel: 'stable',
@@ -714,7 +740,7 @@ export class ServerOwnerScenario {
         version: '0.0.0',
       },
       environment: this.environment(),
-      coreEntry: join(process.cwd(), 'dist/bin/revo-core-host.js'),
+      coreEntry,
       operationId,
     });
     if (result.kind === 'busy') {

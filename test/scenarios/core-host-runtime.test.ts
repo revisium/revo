@@ -12,12 +12,14 @@ import {
 import { CoreChildRunner } from '../../src/core-host/core-child-runner.js';
 import { ManagedProcessService } from '../../src/processes/managed-process.service.js';
 import type { ManagedProcessRequest } from '../../src/processes/managed-process.types.js';
+import { RevoConsoleLogger } from '../../src/server-logs/revo-console-logger.js';
 import {
   CoreChildEntryScenario,
   CoreChildScenario,
   DeferredCoreRuntimeService,
 } from '../support/core-host/core-host-scenario.js';
 import { ClusterFixture } from '../support/postgres/postgres-readiness-scenario.js';
+import { CapturedOutput } from '../support/server-logs/captured-output.js';
 
 const start = {
   protocol: CORE_HOST_PROTOCOL,
@@ -188,6 +190,30 @@ describe('Core child runtime', () => {
       expect(JSON.stringify(scenario.sent)).not.toContain('SECRET');
     },
   );
+
+  it('logs a readable Core startup failure while the IPC failure stays code-only', async () => {
+    const output = new CapturedOutput();
+    try {
+      const service = new DeferredCoreRuntimeService();
+      const scenario = new CoreChildScenario();
+      new CoreChildRunner(scenario, service).receive(start);
+      service.resolveFactory({ prepareRejects: true });
+      await scenario.settledWithin();
+
+      expect(output.text()).toMatch(/ERROR \[RevoCore\] Revo Core failed to start/u);
+      expect(output.text()).toContain('SECRET prepare failure');
+      expect(JSON.stringify(scenario.sent)).not.toContain('SECRET');
+    } finally {
+      output.restore();
+    }
+  });
+
+  it('runs Core with the plain redacting console logger', () => {
+    const service = new DeferredCoreRuntimeService();
+    new CoreChildRunner(new CoreChildScenario(), service).receive(start);
+
+    expect(service.options?.logger).toBeInstanceOf(RevoConsoleLogger);
+  });
 
   it('closes once and finishes nonzero when ordered stage delivery fails', async () => {
     const service = new DeferredCoreRuntimeService();

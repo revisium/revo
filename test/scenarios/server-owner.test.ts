@@ -90,6 +90,22 @@ describe('Server owner composition', () => {
   });
 
   it(
+    'never logs the generated database password and logs a readable Core failure',
+    async () => {
+      const result = await scenario.failsWithCredentialEchoingCore();
+
+      expect(result.start).toMatchObject({ code: 'revo.server-owner.core' });
+      expect(result.password.length).toBeGreaterThan(16);
+      expect(result.log).toContain('Core echoed postgresql://postgres:[REDACTED]@127.0.0.1:');
+      expect(result.log).toContain('Core password [REDACTED] decoded [REDACTED]');
+      expect(result.log).toMatch(/ERROR \[ServerOwner\] Server start failed: Revo Core/u);
+      expect(result.log).not.toContain(result.password);
+      expect(result.log).not.toContain(encodeURIComponent(result.password));
+    },
+    REAL_OWNER_START_TIMEOUT_MS,
+  );
+
+  it(
     'starts real embedded PostgreSQL and Core before publishing readiness',
     async () => {
       const result = await scenario.startsEmbedded();
