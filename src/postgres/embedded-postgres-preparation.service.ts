@@ -1,5 +1,15 @@
 import { randomBytes } from 'node:crypto';
-import { constants, type FileHandle, lstat, mkdir, open } from 'node:fs/promises';
+import {
+  constants,
+  type FileHandle,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rm,
+  rmdir,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
@@ -8,7 +18,9 @@ import { ManagedProcessService } from '../processes/managed-process.service.js';
 import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
 import { loadEmbeddedPostgresBinaries } from './embedded-postgres-binaries.js';
+import type { EmbeddedPostgresLog } from './embedded-postgres-log.js';
 import {
+  type EmbeddedPostgresBinaries,
   EmbeddedPostgresError,
   type PrepareEmbeddedPostgresRequest,
   type PreparedEmbeddedPostgres,
@@ -19,6 +31,7 @@ const FILE_MODE = 0o600;
 const MAX_SMALL_FILE = 4096;
 const CANCEL_GRACE_MS = 1000;
 const CANCEL_KILL_WAIT_MS = 5000;
+const CREDENTIAL_FORMAT = /^[A-Za-z0-9_-]{32}$/u;
 
 @Injectable()
 export class EmbeddedPostgresPreparationService {
@@ -27,8 +40,8 @@ export class EmbeddedPostgresPreparationService {
     private readonly processes: ManagedProcessService = new ManagedProcessService(),
   ) {}
 
-  bind(canonicalDataDir: string, progress: StartupProgressFacade) {
-    return new OwnedEmbeddedPostgresPreparation(this.processes, canonicalDataDir, progress);
+  bind(canonicalDataDir: string, progress: StartupProgressFacade, log: EmbeddedPostgresLog) {
+    return new OwnedEmbeddedPostgresPreparation(this.processes, canonicalDataDir, progress, log);
   }
 }
 
@@ -43,6 +56,7 @@ export class OwnedEmbeddedPostgresPreparation {
     private readonly processes: ManagedProcessService,
     private readonly canonicalDataDir: string,
     private readonly progress: StartupProgressFacade,
+    private readonly log: EmbeddedPostgresLog,
   ) {}
 
   prepare(request: PrepareEmbeddedPostgresRequest): Promise<PreparedEmbeddedPostgres> {
@@ -104,73 +118,82 @@ export class OwnedEmbeddedPostgresPreparation {
   private async prepareCluster(signal: AbortSignal): Promise<PreparedEmbeddedPostgres> {
     const binaries = await loadEmbeddedPostgresBinaries();
     rejectCancellation(signal);
-    const clusterDir = join(this.canonicalDataDir, 'postgres');
-    const passwordPath = join(this.canonicalDataDir, 'postgres-password');
-    const state = await inspectState(clusterDir, passwordPath);
+    const layout = clusterLayout(this.canonicalDataDir);
+    const state = await inspectState(layout);
     rejectCancellation(signal);
-    if (state === 'ready') {
-      return prepared(clusterDir, binaries.postgres, false);
+    if (state.kind === 'ready') {
+      return prepared(layout, binaries, false);
     }
-    if (state === 'invalid') {
-      throw new EmbeddedPostgresError('invalid');
+    if (state.kind === 'invalid') {
+      throw new EmbeddedPostgresError('invalid', false, undefined, { detail: state.detail });
     }
 
     let phase = 'postgres-binary-prepare';
     try {
       await this.progress.start(phase);
       rejectCancellation(signal);
-      await mkdir(clusterDir, { mode: DIRECTORY_MODE });
+      await discardUncommittedCluster(layout, state.cluster);
+      if (state.credential !== 'valid') {
+        await commitCredential(layout);
+      }
       rejectCancellation(signal);
-      await createPassword(passwordPath);
-      rejectCancellation(signal);
+      await mkdir(layout.stagedCluster, { mode: DIRECTORY_MODE });
       await this.progress.complete(phase);
       phase = 'postgres-initialization';
       await this.progress.start(phase);
       rejectCancellation(signal);
-      const child = await this.processes.start({
-        executable: binaries.initdb,
+      await this.initializeStagedCluster(binaries.initdb, layout, signal);
+      if ((await inspectCluster(layout.stagedCluster)) !== 'ready') {
+        throw new EmbeddedPostgresError('invalid');
+      }
+      rejectCancellation(signal);
+      await commitCluster(layout);
+      await this.progress.complete(phase);
+      rejectCancellation(signal);
+      return prepared(layout, binaries, true);
+    } catch (error) {
+      const primary = (
+        error instanceof EmbeddedPostgresError ? error : new EmbeddedPostgresError('process')
+      ).withLog(this.log.path);
+      try {
+        await this.progress.fail(phase, {
+          code: `POSTGRES_${primary.reason.toUpperCase()}`,
+          logPath: this.log.path,
+        });
+      } catch {
+        throw primary.withProgressFailure();
+      }
+      throw primary;
+    }
+  }
+
+  private async initializeStagedCluster(
+    initdb: string,
+    layout: ClusterLayout,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const child = await this.log.append(({ descriptor }) =>
+      this.processes.start({
+        executable: initdb,
         args: [
-          `--pgdata=${clusterDir}`,
-          `--pwfile=${passwordPath}`,
+          `--pgdata=${layout.stagedCluster}`,
+          `--pwfile=${layout.credential}`,
           '--encoding=UTF8',
           '--locale=C',
           '--auth=scram-sha-256',
           '--username=postgres',
-          '--no-clean',
           '--no-instructions',
         ],
         cwd: this.canonicalDataDir,
         env: { LC_ALL: 'C' },
-        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+        stdio: { stdin: 'ignore', stdout: descriptor, stderr: descriptor },
         cancellation: { signal, graceMs: CANCEL_GRACE_MS, killWaitMs: CANCEL_KILL_WAIT_MS },
-      });
-      child.stdout?.resume();
-      child.stderr?.resume();
-      this.observeChild(child);
-      const completion = await this.awaitCompletion(child);
-      if (completion.exitCode !== 0 || completion.signal !== null) {
-        throw new EmbeddedPostgresError(
-          signal.aborted ? 'cancelled' : 'process',
-          false,
-          completion,
-        );
-      }
-      if ((await inspectState(clusterDir, passwordPath)) !== 'ready') {
-        throw new EmbeddedPostgresError('invalid');
-      }
-      rejectCancellation(signal);
-      await this.progress.complete(phase);
-      rejectCancellation(signal);
-      return prepared(clusterDir, binaries.postgres, true);
-    } catch (error) {
-      const primary =
-        error instanceof EmbeddedPostgresError ? error : new EmbeddedPostgresError('process');
-      try {
-        await this.progress.fail(phase, { code: `POSTGRES_${primary.reason.toUpperCase()}` });
-      } catch {
-        throw new EmbeddedPostgresError(primary.reason, true, primary.observedCompletion);
-      }
-      throw primary;
+      }),
+    );
+    this.observeChild(child);
+    const completion = await this.awaitCompletion(child);
+    if (completion.exitCode !== 0 || completion.signal !== null) {
+      throw new EmbeddedPostgresError(signal.aborted ? 'cancelled' : 'process', false, completion);
     }
   }
 
@@ -199,6 +222,33 @@ export class OwnedEmbeddedPostgresPreparation {
   }
 }
 
+interface ClusterLayout {
+  readonly dataDir: string;
+  readonly cluster: string;
+  readonly stagedCluster: string;
+  readonly credential: string;
+  readonly stagedCredential: string;
+}
+
+type CredentialState = 'missing' | 'valid' | 'malformed' | 'unsafe';
+type ClusterState = 'missing' | 'empty' | 'ready' | 'unusable';
+type PreparationState =
+  | { readonly kind: 'ready' }
+  | { readonly kind: 'invalid'; readonly detail: string }
+  | {
+      readonly kind: 'new';
+      readonly credential: Exclude<CredentialState, 'unsafe'>;
+      readonly cluster: Extract<ClusterState, 'missing' | 'empty'>;
+    };
+
+const clusterLayout = (dataDir: string): ClusterLayout => ({
+  dataDir,
+  cluster: join(dataDir, 'postgres'),
+  stagedCluster: join(dataDir, '.postgres-initdb'),
+  credential: join(dataDir, 'postgres-password'),
+  stagedCredential: join(dataDir, '.postgres-password.tmp'),
+});
+
 function validateRequest(request: PrepareEmbeddedPostgresRequest) {
   if (
     request.signal.aborted ||
@@ -210,40 +260,116 @@ function validateRequest(request: PrepareEmbeddedPostgresRequest) {
   }
 }
 
-async function inspectState(clusterDir: string, passwordPath: string) {
-  const [cluster, credential] = await Promise.all([pathKind(clusterDir), pathKind(passwordPath)]);
-  if (cluster === 'missing' && credential === 'missing') {
-    return 'new' as const;
+async function inspectState(layout: ClusterLayout): Promise<PreparationState> {
+  const [credential, cluster] = await Promise.all([
+    inspectCredential(layout.credential),
+    inspectCluster(layout.cluster),
+  ]);
+  if (credential === 'unsafe') {
+    return invalid(`the credential ${layout.credential} is not a private regular file`);
   }
-  if (cluster !== 'directory' || credential !== 'file') {
-    return 'invalid' as const;
+  if (cluster === 'ready') {
+    return credential === 'valid'
+      ? { kind: 'ready' }
+      : invalid(`the credential ${layout.credential} of the existing cluster is unusable`);
+  }
+  if (cluster === 'unusable') {
+    return invalid(`the existing cluster ${layout.cluster} is incomplete and was left untouched`);
+  }
+  return { kind: 'new', credential, cluster };
+}
+
+const invalid = (detail: string) => ({ kind: 'invalid' as const, detail });
+
+async function inspectCredential(path: string): Promise<CredentialState> {
+  const kind = await pathKind(path);
+  if (kind === 'missing') {
+    return 'missing';
+  }
+  if (kind !== 'file') {
+    return 'unsafe';
   }
   try {
-    await validateDirectory(clusterDir);
-    const password = await readPrivateFile(passwordPath);
-    if (!/^[A-Za-z0-9_-]{32}$/u.test(password)) {
-      return 'invalid' as const;
+    return CREDENTIAL_FORMAT.test(await readPrivateFile(path)) ? 'valid' : 'malformed';
+  } catch {
+    return 'unsafe';
+  }
+}
+
+async function inspectCluster(path: string): Promise<ClusterState> {
+  const kind = await pathKind(path);
+  if (kind === 'missing') {
+    return 'missing';
+  }
+  if (kind !== 'directory') {
+    return 'unusable';
+  }
+  try {
+    await validateDirectory(path);
+    if ((await readdir(path)).length === 0) {
+      return 'empty';
     }
-    const version = (await readPrivateFile(join(clusterDir, 'PG_VERSION'))).trim();
+    const version = (await readPrivateFile(join(path, 'PG_VERSION'))).trim();
     const artifacts = await Promise.all(
-      ['base', 'global', 'postgresql.conf'].map((name) => pathKind(join(clusterDir, name))),
+      ['base', 'global', join('global', 'pg_control'), 'postgresql.conf'].map((name) =>
+        pathKind(join(path, name)),
+      ),
     );
     const structurallyReady =
       version === '17' &&
       artifacts[0] === 'directory' &&
       artifacts[1] === 'directory' &&
-      artifacts[2] === 'file';
+      artifacts[2] === 'file' &&
+      artifacts[3] === 'file';
     if (!structurallyReady) {
-      return 'invalid' as const;
+      return 'unusable';
     }
     await Promise.all([
-      validateDirectory(join(clusterDir, 'base')),
-      validateDirectory(join(clusterDir, 'global')),
-      validatePrivateFile(join(clusterDir, 'postgresql.conf')),
+      validateDirectory(join(path, 'base')),
+      validateDirectory(join(path, 'global')),
+      validatePrivateFile(join(path, 'global', 'pg_control')),
+      validatePrivateFile(join(path, 'postgresql.conf')),
     ]);
-    return 'ready' as const;
+    return 'ready';
   } catch {
-    return 'invalid' as const;
+    return 'unusable';
+  }
+}
+
+async function discardUncommittedCluster(
+  layout: ClusterLayout,
+  cluster: Extract<ClusterState, 'missing' | 'empty'>,
+) {
+  if (cluster === 'empty') {
+    await rmdir(layout.cluster);
+  }
+  await rm(layout.stagedCluster, { recursive: true, force: true });
+}
+
+async function commitCredential(layout: ClusterLayout) {
+  await rm(layout.stagedCredential, { force: true });
+  const file = await open(layout.stagedCredential, 'wx', FILE_MODE);
+  try {
+    await file.writeFile(randomBytes(24).toString('base64url'), 'utf8');
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  await rename(layout.stagedCredential, layout.credential);
+  await syncDirectory(layout.dataDir);
+}
+
+async function commitCluster(layout: ClusterLayout) {
+  await rename(layout.stagedCluster, layout.cluster);
+  await syncDirectory(layout.dataDir);
+}
+
+async function syncDirectory(path: string) {
+  const directory = await open(path, constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
   }
 }
 
@@ -297,7 +423,7 @@ async function readPrivateFile(path: string) {
 }
 
 export const readEmbeddedPostgresCredential = (canonicalDataDir: string) =>
-  readPrivateFile(join(canonicalDataDir, 'postgres-password'));
+  readPrivateFile(clusterLayout(canonicalDataDir).credential);
 
 async function validatePrivateFile(path: string) {
   let file: FileHandle | undefined;
@@ -312,17 +438,14 @@ async function validatePrivateFile(path: string) {
   }
 }
 
-async function createPassword(path: string) {
-  const file = await open(path, 'wx', FILE_MODE);
-  try {
-    await file.writeFile(randomBytes(24).toString('base64url'), 'utf8');
-  } finally {
-    await file.close();
-  }
-}
-
-const prepared = (clusterDir: string, postgres: string, created: boolean) =>
-  Object.freeze({ clusterDir, postgres, created, majorVersion: 17 as const });
+const prepared = (layout: ClusterLayout, binaries: EmbeddedPostgresBinaries, created: boolean) =>
+  Object.freeze({
+    clusterDir: layout.cluster,
+    postgres: binaries.postgres,
+    pgCtl: binaries.pgCtl,
+    created,
+    majorVersion: 17 as const,
+  });
 
 function rejectCancellation(signal: AbortSignal) {
   if (signal.aborted) {

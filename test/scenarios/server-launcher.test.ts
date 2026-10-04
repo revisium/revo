@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { Inject, Injectable, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ConfigurationResolver } from '../../src/configuration/configuration-resolver.js';
 import {
@@ -31,9 +31,10 @@ import {
   ServerStartupObserver,
   type ServerProgressSink,
 } from '../../src/server/server-startup-observer.js';
-import type { ServerStatus, ServerStatusService } from '../../src/server/server-status.service.js';
+import { ServerStatusService, type ServerStatus } from '../../src/server/server-status.service.js';
 import { ServerModule } from '../../src/server/server.module.js';
 import type { StartupProgressDiscoveryService } from '../../src/startup-progress/index.js';
+import { AbandonedServerFixture } from '../support/server/abandoned-server-fixture.js';
 
 const attempt = vi.hoisted(() => ({
   ports: [] as ServerLaunchProcessPort[],
@@ -407,6 +408,54 @@ describe('server launcher composition', () => {
 
     await expect(service.launch(request())).rejects.toBe(failure);
     expect(port.stop).not.toHaveBeenCalled();
+  });
+
+  describe('over a control record left by a killed server', () => {
+    let abandoned: AbandonedServerFixture;
+
+    beforeEach(async () => {
+      abandoned = await AbandonedServerFixture.create();
+    });
+
+    afterEach(async () => {
+      await abandoned.dispose();
+    });
+
+    it('launches once no server owns the data directory', async () => {
+      const resolved = configuration({
+        layout: { ...configuration().layout, dataDir: abandoned.dataDir },
+      });
+      const started: StartedServer = { kind: 'started', url: resolved.publicUrl };
+      attempt.start.mockResolvedValue(started);
+      const processes = processesFor(fakePort());
+      const service = new ServerLauncherService(
+        resolverFor(resolved),
+        new ServerStatusService(),
+        processes,
+      );
+
+      await expect(service.launch(request())).resolves.toBe(started);
+      expect(processes.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports an unreachable owner of the data directory and keeps its record', async () => {
+      await abandoned.holdOwnership();
+      const record = await abandoned.controlRecord();
+      const resolved = configuration({
+        layout: { ...configuration().layout, dataDir: abandoned.dataDir },
+      });
+      const processes = processesFor(fakePort());
+      const service = new ServerLauncherService(
+        resolverFor(resolved),
+        new ServerStatusService(),
+        processes,
+      );
+
+      await expect(service.launch(request())).resolves.toEqual({ kind: 'unknown' });
+      expect(processes.start).not.toHaveBeenCalled();
+      await expect(abandoned.controlRecord()).resolves.toBe(record);
+      expect(record).toBeDefined();
+    });
   });
 
   it('exports the launcher from ServerModule to an importing consumer module', async () => {

@@ -129,6 +129,21 @@ describe('managed child process', () => {
     await expect(handle.completion).resolves.toEqual({ exitCode: null, signal: 'SIGKILL' });
   });
 
+  it('stops with the requested graceful signal and escalates with the requested signal', async () => {
+    const handle = await scenario.start(scenario.request(['quit-only'], { ipc: true }));
+    await scenario.begin(handle);
+    const interruptReceived = scenario.waitForMessage(handle);
+
+    await new ManagedProcessService().stop(handle, {
+      graceMs: 100,
+      killWaitMs: 1_000,
+      signals: { graceful: 'SIGINT', escalation: 'SIGQUIT' },
+    });
+
+    await expect(interruptReceived).resolves.toEqual({ state: 'int-received' });
+    await expect(handle.completion).resolves.toEqual({ exitCode: 0, signal: null });
+  });
+
   it('reports a bounded stop timeout without claiming the child exited', async () => {
     const handle = await scenario.startWithoutExitObservation(
       scenario.request(['resist'], { ipc: true }),

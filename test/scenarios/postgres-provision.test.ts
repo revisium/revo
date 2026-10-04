@@ -24,12 +24,15 @@ describe('embedded PostgreSQL provision', () => {
   it.each([
     'fifo',
     'malformed-credential',
-    'partial',
+    'missing-control-file',
     'public-credential',
     'symlink',
     'wrong-major',
   ] as const)('rejects an existing %s cluster without replacing it', async (kind) => {
-    await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toBe('rejected');
+    await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toEqual({
+      outcome: 'rejected',
+      clusterKept: true,
+    });
   });
 
   it('cancels and drains owned initialization before releasing ownership', async () => {
@@ -52,7 +55,8 @@ describe('embedded PostgreSQL provision', () => {
       replacement: 'held',
       oldClose: 'resolved',
       successorStillHeld: 'busy',
-      retained: [true, true],
+      clusterPublished: false,
+      credentialKept: true,
       secretByPathOnly: true,
       environment: { LC_ALL: 'C' },
     });

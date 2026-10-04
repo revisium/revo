@@ -1,5 +1,15 @@
 import { execFile } from 'node:child_process';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -64,14 +74,18 @@ export class PostgresScenario {
     kind:
       | 'fifo'
       | 'malformed-credential'
-      | 'partial'
+      | 'missing-control-file'
       | 'public-credential'
       | 'symlink'
       | 'wrong-major',
   ) {
     const fixture = await this.fixture();
     const credentialPath = join(fixture.dataDir, 'postgres-password');
-    if (['malformed-credential', 'public-credential', 'wrong-major'].includes(kind)) {
+    if (
+      ['malformed-credential', 'missing-control-file', 'public-credential', 'wrong-major'].includes(
+        kind,
+      )
+    ) {
       const seeded = await this.open(fixture);
       if (seeded.kind !== 'held' || !seeded.prepareEmbeddedPostgres) {
         throw new Error('owner missing');
@@ -86,8 +100,8 @@ export class PostgresScenario {
     }
     if (kind === 'fifo') {
       await promisify(execFile)('mkfifo', [join(fixture.dataDir, 'postgres-password')]);
-    } else if (kind === 'partial') {
-      await writeFile(credentialPath, 'existing', { mode: 0o600 });
+    } else if (kind === 'missing-control-file') {
+      await unlink(join(fixture.dataDir, 'postgres', 'global', 'pg_control'));
     } else if (kind === 'symlink') {
       await symlink(join(fixture.dataDir, 'target'), join(fixture.dataDir, 'postgres-password'));
     } else {
@@ -112,7 +126,11 @@ export class PostgresScenario {
         () => 'rejected',
       );
     await held.close();
-    return outcome;
+    const clusterKept = await lstat(join(fixture.dataDir, 'postgres')).then(
+      () => true,
+      () => false,
+    );
+    return { outcome, clusterKept };
   }
 
   async closeCancelsOwnedInitialization() {
@@ -168,7 +186,7 @@ export class PostgresScenario {
       }
       const oldClose = await held.close().then(() => 'resolved' as const);
       const successorStillHeld = await this.open(fixture);
-      const retained = await Promise.all([
+      const [clusterPublished, credentialKept] = await Promise.all([
         lstat(join(fixture.dataDir, 'postgres')).then(
           () => true,
           () => false,
@@ -190,7 +208,8 @@ export class PostgresScenario {
         replacement: replacement.kind,
         oldClose,
         successorStillHeld: successorStillHeld.kind,
-        retained,
+        clusterPublished,
+        credentialKept,
         secretByPathOnly: process.request?.args.some((value) => value.includes('--pwfile=')),
         environment: process.request?.env,
       };

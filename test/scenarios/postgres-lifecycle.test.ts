@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { PostgresLifecycleScenario } from '../support/postgres/postgres-lifecycle-scenario.js';
+import { PostgresRecoveryScenario } from '../support/postgres/postgres-recovery-scenario.js';
 
 describe('embedded PostgreSQL owned lifecycle', () => {
   let scenario = new PostgresLifecycleScenario();
@@ -16,6 +17,27 @@ describe('embedded PostgreSQL owned lifecycle', () => {
     expect(result.second).toMatchObject({ kind: 'embedded', database: 'revo' });
     expect(result.rows).toEqual([{ value: 'survives restart' }]);
     expect(result.passwordLength).toBe(32);
+  });
+
+  it('stops an open transaction with a confirmed fast shutdown logged privately', async () => {
+    await expect(scenario.stopsAnOpenTransactionWithAFastShutdown()).resolves.toEqual({
+      closed: 'confirmed',
+      completion: { exitCode: 0, signal: null },
+      fastShutdownLogged: true,
+      logMode: 0o600,
+    });
+  });
+
+  it('names the PostgreSQL log when the server cannot start', async () => {
+    const result = await scenario.namesThePostgresLogWhenTheServerCannotStart();
+
+    expect(result).toEqual({
+      outcome: { kind: 'rejected', message: expect.any(String) },
+      failure: { phase: 'postgres-start', logPath: result.logPath },
+      errorNamesLog: true,
+      logPath: expect.stringMatching(/\/postgres\.log$/u),
+      causeLogged: true,
+    });
   });
 
   it('does not prepare or spawn for an already-cancelled request', async () => {
@@ -87,7 +109,7 @@ describe('embedded PostgreSQL owned lifecycle', () => {
         progressFailure: false,
         observedCompletion: undefined,
       },
-      completion: { exitCode: null, signal: 'SIGTERM' },
+      completion: { exitCode: null, signal: 'SIGINT' },
     });
   });
 
@@ -136,6 +158,125 @@ describe('embedded PostgreSQL owned lifecycle', () => {
       repeated: 'rejected',
       startsBeforeExit: 1,
       busy: 'busy',
+    });
+  });
+});
+
+describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () => {
+  let scenario: PostgresRecoveryScenario;
+
+  beforeEach(async () => {
+    scenario = await new PostgresRecoveryScenario().setup();
+  });
+
+  afterEach(async () => {
+    await scenario.cleanup();
+  });
+
+  it('starts after its supervisor is killed and keeps committed data', async () => {
+    const supervisor = await scenario.runningSupervisor();
+    await scenario.commit('committed before the crash', supervisor.port);
+
+    await supervisor.kill();
+    const orphanSurvived = await scenario.isRunning(supervisor.postmasterPid);
+    const restart = await scenario.start();
+
+    expect(orphanSurvived).toBe(true);
+    expect(restart).toMatchObject({ kind: 'started' });
+    await expect(scenario.committedValues()).resolves.toEqual(['committed before the crash']);
+    await expect(scenario.isRunning(supervisor.postmasterPid)).resolves.toBe(false);
+  });
+
+  describe('an interrupted first initialization', () => {
+    it.each(['before-initdb', 'inside-initdb', 'after-initdb'] as const)(
+      'completes on the next start when interrupted %s',
+      async (point) => {
+        await scenario.interruptFirstInitialization(point);
+
+        const restart = await scenario.start();
+
+        expect(restart).toMatchObject({ kind: 'started' });
+        await scenario.commit('usable after recovery');
+        await expect(scenario.committedValues()).resolves.toEqual(['usable after recovery']);
+      },
+    );
+
+    it.each([
+      ['an empty cluster directory', undefined],
+      ['an empty cluster directory and a partly written credential', 'partial'],
+    ])('completes on the next start from %s left by an earlier version', async (_, credential) => {
+      await scenario.legacyEmptyClusterDirectory(credential);
+
+      await expect(scenario.start()).resolves.toMatchObject({ kind: 'started' });
+    });
+  });
+
+  describe('a lock file left by an earlier server', () => {
+    beforeEach(async () => {
+      await scenario.preparedCluster();
+    });
+
+    it('replaces a lock file naming an exited process', async () => {
+      await scenario.lockFileNaming(await scenario.exitedProcess(), 'an hour earlier');
+
+      await expect(scenario.start()).resolves.toMatchObject({ kind: 'started' });
+    });
+
+    it('replaces a lock file whose PID now belongs to a live process without signalling it', async () => {
+      const bystander = await scenario.bystander();
+      await scenario.lockFileNaming(bystander.pid, 'an hour earlier');
+
+      const restart = await scenario.start();
+
+      expect(restart).toMatchObject({ kind: 'started' });
+      await expect(scenario.isRunning(bystander.pid)).resolves.toBe(true);
+      await expect(bystander.receivedSignals()).resolves.toEqual([]);
+    });
+
+    it('replaces a lock file written before the current boot without signalling its process', async () => {
+      const bystander = await scenario.bystander();
+      await scenario.lockFileNaming(bystander.pid, 'an hour later');
+      await scenario.lockFileWrittenBeforeBoot();
+
+      const restart = await scenario.start();
+
+      expect(restart).toMatchObject({ kind: 'started' });
+      await expect(bystander.receivedSignals()).resolves.toEqual([]);
+    });
+
+    it('refuses an incomplete lock file and leaves it in place', async () => {
+      await scenario.incompleteLockFile();
+
+      const restart = await scenario.start();
+
+      expect(restart).toMatchObject({ kind: 'rejected', reason: 'locked' });
+      await expect(scenario.lockFile()).resolves.toBe('');
+    });
+
+    it('refuses without a signal when the named process started before the recorded server', async () => {
+      const bystander = await scenario.bystander();
+      await scenario.lockFileNaming(bystander.pid, 'an hour later');
+      const lockFile = await scenario.lockFile();
+
+      const restart = await scenario.start();
+
+      expect(restart).toMatchObject({
+        kind: 'rejected',
+        reason: 'locked',
+        message: expect.stringContaining('postmaster.pid'),
+      });
+      await expect(bystander.receivedSignals()).resolves.toEqual([]);
+      await expect(scenario.lockFile()).resolves.toBe(lockFile);
+    });
+
+    it('refuses without a signal when the lock file names a server of another data directory', async () => {
+      const foreign = await scenario.foreignServer();
+      await scenario.lockFileCopiedFrom(foreign);
+
+      const restart = await scenario.start();
+
+      expect(restart).toMatchObject({ kind: 'rejected', reason: 'locked' });
+      await expect(foreign.isAlive()).resolves.toBe(true);
     });
   });
 });

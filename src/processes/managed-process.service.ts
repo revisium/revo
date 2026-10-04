@@ -13,10 +13,12 @@ import type {
   ProcessMessage,
   ProcessStdio,
   StopProcessRequest,
+  StopSignals,
 } from './managed-process.types.js';
 import { ProcessExitWaiter } from './process-exit-waiter.js';
 
 const MAX_TIMER_MILLISECONDS = 2_147_483_647;
+const TERMINATE_THEN_KILL: StopSignals = { graceful: 'SIGTERM', escalation: 'SIGKILL' };
 
 @Injectable()
 export class ManagedProcessService {
@@ -281,15 +283,16 @@ class ManagedOwnedProcess implements OwnedProcess {
     if (this.exited || this.released) {
       return;
     }
-    this.signal('SIGTERM');
+    const signals = request.signals ?? TERMINATE_THEN_KILL;
+    this.signal(signals.graceful);
     if (await this.exitWaiter.wait(this.completion, request.graceMs)) {
       return;
     }
-    this.signal('SIGKILL');
+    this.signal(signals.escalation);
     if (!(await this.exitWaiter.wait(this.completion, request.killWaitMs))) {
       throw new ManagedProcessError(
         'revo.process.stop-timeout',
-        'Managed process did not exit after KILL.',
+        'Managed process did not exit after escalation.',
       );
     }
   }

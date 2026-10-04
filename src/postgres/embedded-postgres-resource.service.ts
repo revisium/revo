@@ -3,8 +3,14 @@ import { randomBytes } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
 
 import { ManagedProcessService } from '../processes/managed-process.service.js';
-import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
+import type {
+  OwnedProcess,
+  ProcessCompletion,
+  StopProcessRequest,
+} from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
+import { EmbeddedPostgresLockRecovery } from './embedded-postgres-lock.js';
+import { EmbeddedPostgresLog } from './embedded-postgres-log.js';
 import {
   EmbeddedPostgresPreparationService,
   type OwnedEmbeddedPostgresPreparation,
@@ -25,10 +31,12 @@ import { LoopbackPortAllocator } from './loopback-port-allocator.js';
 
 const HOST = '127.0.0.1' as const;
 const DATABASE = 'revo' as const;
-const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
-const STOP_GRACE_MS = 1000;
-const STOP_KILL_WAIT_MS = 5000;
 const ATTEMPTS = 3;
+const SHUTDOWN: StopProcessRequest = {
+  graceMs: 15_000,
+  killWaitMs: 10_000,
+  signals: { graceful: 'SIGINT', escalation: 'SIGQUIT' },
+};
 const LOOPBACK_BIND_CONFLICT = 'could not bind IPv4 address "127.0.0.1": Address already in use';
 
 @Injectable()
@@ -40,15 +48,20 @@ export class EmbeddedPostgresResourceService {
     private readonly processes = new ManagedProcessService(),
     @Inject(LoopbackPortAllocator)
     private readonly ports = new LoopbackPortAllocator(),
+    @Inject(EmbeddedPostgresLockRecovery)
+    private readonly lockRecovery = new EmbeddedPostgresLockRecovery(undefined, processes),
   ) {}
 
-  bind(canonicalDataDir: string, progress: StartupProgressFacade) {
+  bind(canonicalDataDir: string, progress: StartupProgressFacade, logPath: string) {
+    const log = new EmbeddedPostgresLog(logPath);
     return new OwnedEmbeddedPostgresResource(
-      this.preparation.bind(canonicalDataDir, progress),
+      this.preparation.bind(canonicalDataDir, progress, log),
       this.processes,
       this.ports,
+      this.lockRecovery,
       canonicalDataDir,
       progress,
+      log,
     );
   }
 }
@@ -68,8 +81,10 @@ export class OwnedEmbeddedPostgresResource {
     private readonly preparation: OwnedEmbeddedPostgresPreparation,
     private readonly processes: ManagedProcessService,
     private readonly ports: LoopbackPortAllocator,
+    private readonly lockRecovery: EmbeddedPostgresLockRecovery,
     private readonly canonicalDataDir: string,
     private readonly progress: StartupProgressFacade,
+    private readonly log: EmbeddedPostgresLog,
   ) {}
 
   prepareEmbeddedPostgres(
@@ -131,6 +146,13 @@ export class OwnedEmbeddedPostgresResource {
       });
       const password = await readEmbeddedPostgresCredential(this.canonicalDataDir);
       await this.progress.start('postgres-start');
+      await this.lockRecovery.releaseAbandonedLock({
+        clusterDir: prepared.clusterDir,
+        pgCtl: prepared.pgCtl,
+        log: this.log,
+        signal: controller.signal,
+        deadline,
+      });
       const ready = await this.startAttempts(
         prepared.postgres,
         prepared.clusterDir,
@@ -158,13 +180,14 @@ export class OwnedEmbeddedPostgresResource {
       });
       return this.started;
     } catch (error) {
-      const failure = safeError(error, controller.signal);
+      const failure = safeError(error, controller.signal).withLog(this.log.path);
       try {
         await this.progress.fail('postgres-start', {
           code: `POSTGRES_${failure.reason.toUpperCase()}`,
+          logPath: this.log.path,
         });
       } catch {
-        throw new EmbeddedPostgresError(failure.reason, true, failure.observedCompletion);
+        throw failure.withProgressFailure();
       }
       throw failure;
     } finally {
@@ -262,40 +285,36 @@ export class OwnedEmbeddedPostgresResource {
     const spawnController = new AbortController();
     const abortSpawn = () => spawnController.abort();
     signal.addEventListener('abort', abortSpawn, { once: true });
-    let child: OwnedProcess;
+    let spawned: { readonly child: OwnedProcess; readonly logOffset: number };
     try {
-      child = await this.processes.start({
-        executable,
-        args: [
-          '-D',
-          clusterDir,
-          '-h',
-          HOST,
-          '-p',
-          String(port),
-          '-c',
-          'unix_socket_directories=',
-          '-c',
-          `cluster_name=${startupNonce}`,
-        ],
-        cwd: this.canonicalDataDir,
-        env: { LC_ALL: 'C' },
-        stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' },
-        cancellation: {
-          signal: spawnController.signal,
-          graceMs: STOP_GRACE_MS,
-          killWaitMs: STOP_KILL_WAIT_MS,
-        },
-      });
+      spawned = await this.log.append(async ({ descriptor, offset }) => ({
+        logOffset: offset,
+        child: await this.processes.start({
+          executable,
+          args: [
+            '-D',
+            clusterDir,
+            '-h',
+            HOST,
+            '-p',
+            String(port),
+            '-c',
+            'unix_socket_directories=',
+            '-c',
+            `cluster_name=${startupNonce}`,
+          ],
+          cwd: this.canonicalDataDir,
+          env: { LC_ALL: 'C' },
+          stdio: { stdin: 'ignore', stdout: 'ignore', stderr: descriptor },
+          cancellation: { signal: spawnController.signal, ...SHUTDOWN },
+        }),
+      }));
     } finally {
       signal.removeEventListener('abort', abortSpawn);
     }
+    const { child } = spawned;
     this.server = child;
-    const attempt: TrackedAttempt = {
-      child,
-      diagnostic: captureDiagnostic(child.stderr),
-      exited: undefined,
-    };
+    const attempt: TrackedAttempt = { child, logOffset: spawned.logOffset, exited: undefined };
     const serverCompletion = child.completion.then((completion) => {
       attempt.exited = completion;
       if (this.server === child) {
@@ -341,7 +360,7 @@ export class OwnedEmbeddedPostgresResource {
     if (
       retryableBindFailure &&
       !signal.aborted &&
-      isBindConflict(await attempt.diagnostic, attempt.exited)
+      isBindConflict(await this.log.readFrom(attempt.logOffset).catch(() => ''), attempt.exited)
     ) {
       return { kind: 'bind-conflict' };
     }
@@ -391,7 +410,7 @@ export class OwnedEmbeddedPostgresResource {
       return;
     }
     try {
-      await this.processes.stop(server, { graceMs: STOP_GRACE_MS, killWaitMs: STOP_KILL_WAIT_MS });
+      await this.processes.stop(server, SHUTDOWN);
       await server.completion;
     } catch {
       this.stopFailure = true;
@@ -429,7 +448,7 @@ interface ReadyAttempt {
 
 interface TrackedAttempt {
   readonly child: OwnedProcess;
-  readonly diagnostic: Promise<string>;
+  readonly logOffset: number;
   exited: ProcessCompletion | undefined;
 }
 
@@ -465,37 +484,6 @@ const isBindConflict = (
   completion.exitCode !== 0 &&
   completion.signal === null &&
   diagnostic.includes(LOOPBACK_BIND_CONFLICT);
-
-const captureDiagnostic = (stderr: NodeJS.ReadableStream | undefined) => {
-  if (!stderr) {
-    return Promise.resolve('');
-  }
-  const chunks: Buffer[] = [];
-  let bytes = 0;
-  return new Promise<string>((resolve) => {
-    const capture = (chunk: Buffer | string) => {
-      const available = MAX_DIAGNOSTIC_BYTES - bytes;
-      if (available <= 0) {
-        return;
-      }
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      const bounded = buffer.subarray(0, available);
-      chunks.push(bounded);
-      bytes += bounded.length;
-    };
-    const finish = () => {
-      stderr.removeListener('data', capture);
-      stderr.removeListener('end', finish);
-      stderr.removeListener('close', finish);
-      stderr.removeListener('error', finish);
-      resolve(Buffer.concat(chunks, bytes).toString('utf8'));
-    };
-    stderr.on('data', capture);
-    stderr.once('end', finish);
-    stderr.once('close', finish);
-    stderr.once('error', finish);
-  });
-};
 
 const waitForRetry = (signal: AbortSignal, deadline: number) =>
   raceCancellation(

@@ -1,13 +1,18 @@
+import { uptime } from 'node:os';
+
 import { Inject, Injectable } from '@nestjs/common';
 
 import { DarwinProcessIdentityAdapter } from './adapters/darwin-process-identity.adapter.js';
 import { LinuxProcessIdentityAdapter } from './adapters/linux-process-identity.adapter.js';
 import { parseIdentity, validPid } from './process-identity.parser.js';
 import type {
+  IdentityObservation,
   ProcessIdentity,
   ProcessIdentityAdapter,
   ProcessIdentityInspection,
 } from './process-identity.types.js';
+
+const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 
 export const PROCESS_IDENTITY_PLATFORM = Symbol('PROCESS_IDENTITY_PLATFORM');
 export type IdentityPlatform = 'linux' | 'darwin' | 'unsupported';
@@ -34,14 +39,29 @@ export class ProcessIdentityService {
   ) {}
 
   async capture(pid: number): Promise<ProcessIdentity> {
-    if (!validPid(pid)) {
-      throw new ProcessIdentityError();
-    }
-    const observation = await this.adapter()?.capture(pid);
-    if (observation?.kind !== 'captured') {
+    const observation = await this.observe(pid);
+    if (observation.kind !== 'captured') {
       throw new ProcessIdentityError();
     }
     return observation.identity;
+  }
+
+  async observe(pid: number): Promise<IdentityObservation> {
+    if (!validPid(pid)) {
+      return { kind: 'unknown', reason: 'invalid-record' };
+    }
+    return (await this.adapter()?.capture(pid)) ?? { kind: 'unknown', reason: 'unavailable' };
+  }
+
+  bootedAt(): number {
+    return Date.now() / 1000 - uptime();
+  }
+
+  startedAt(identity: ProcessIdentity): number {
+    if (identity.platform === 'darwin') {
+      return Number(identity.birth.seconds) + Number(identity.birth.microseconds) / 1_000_000;
+    }
+    return this.bootedAt() + Number(identity.birth.startTicks) / LINUX_CLOCK_TICKS_PER_SECOND;
   }
 
   async inspect(expectedRecord: unknown): Promise<ProcessIdentityInspection> {

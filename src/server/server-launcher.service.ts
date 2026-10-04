@@ -12,6 +12,7 @@ import type {
 } from '../configuration/configuration.types.js';
 import { buildCoreChildEnvironment } from '../core-host/core-child-environment.js';
 import type { ActivationBinding } from '../installation/activation-record.js';
+import { ServerOwnershipService } from '../processes/server-ownership.service.js';
 import { SERVER_HOST_PROTOCOL, type ServerHostStartMessage } from './server-host-protocol.js';
 import { ServerLaunchAttempt, type StartedServer } from './server-launch-attempt.js';
 import { ServerLaunchProcessService } from './server-launch-process.service.js';
@@ -51,6 +52,11 @@ export class ServerLauncherService {
     > = new ServerLaunchProcessService(),
     @Inject(ServerStartupObserver)
     private readonly observer = new ServerStartupObserver(),
+    @Inject(ServerOwnershipService)
+    private readonly ownership: Pick<
+      ServerOwnershipService,
+      'inspect'
+    > = new ServerOwnershipService(),
   ) {}
 
   async launch(request: Readonly<ServerLaunchRequest>): Promise<ServerLaunchResult> {
@@ -62,7 +68,7 @@ export class ServerLauncherService {
   ): Promise<ServerLaunchContext> {
     const resolved = await this.configuration.resolve(request);
     const current = await this.status.read(resolved.layout.dataDir);
-    if (current.kind !== 'stopped') {
+    if (current.kind !== 'stopped' && !(await this.isAbandoned(current, resolved.layout.dataDir))) {
       if (current.kind === 'running' && request.onProgress) {
         await this.observer.reused(
           current.status.publicUrl,
@@ -98,6 +104,10 @@ export class ServerLauncherService {
         })
       : attempt);
     return { configuration: resolved, outcome };
+  }
+
+  private async isAbandoned(current: ServerStatus, dataDir: string): Promise<boolean> {
+    return current.kind === 'unknown' && (await this.ownership.inspect(dataDir)).kind === 'free';
   }
 
   private startMessage(

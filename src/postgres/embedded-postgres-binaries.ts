@@ -1,7 +1,6 @@
 import { isAbsolute } from 'node:path';
 
-import type { EmbeddedPostgresBinaries } from './embedded-postgres.types.js';
-import { EmbeddedPostgresError } from './embedded-postgres.types.js';
+import { EmbeddedPostgresError, type EmbeddedPostgresBinaries } from './embedded-postgres.types.js';
 
 const packages = {
   'darwin-arm64': '@embedded-postgres/darwin-arm64',
@@ -21,7 +20,11 @@ export async function loadEmbeddedPostgresBinaries(): Promise<EmbeddedPostgresBi
     if (!isBinaries(candidate)) {
       throw new EmbeddedPostgresError('invalid');
     }
-    return Object.freeze({ initdb: candidate.initdb, postgres: candidate.postgres });
+    return Object.freeze({
+      initdb: candidate.initdb,
+      pgCtl: candidate.pg_ctl,
+      postgres: candidate.postgres,
+    });
   } catch (error) {
     if (error instanceof EmbeddedPostgresError) {
       throw error;
@@ -30,12 +33,17 @@ export async function loadEmbeddedPostgresBinaries(): Promise<EmbeddedPostgresBi
   }
 }
 
-const isBinaries = (value: unknown): value is EmbeddedPostgresBinaries =>
+const isBinaries = (
+  value: unknown,
+): value is { readonly initdb: string; readonly pg_ctl: string; readonly postgres: string } =>
   typeof value === 'object' &&
   value !== null &&
   'initdb' in value &&
-  typeof value.initdb === 'string' &&
-  isAbsolute(value.initdb) &&
+  absolutePath(value.initdb) &&
+  'pg_ctl' in value &&
+  absolutePath(value.pg_ctl) &&
   'postgres' in value &&
-  typeof value.postgres === 'string' &&
-  isAbsolute(value.postgres);
+  absolutePath(value.postgres);
+
+const absolutePath = (value: unknown): value is string =>
+  typeof value === 'string' && isAbsolute(value);
