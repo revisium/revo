@@ -1064,6 +1064,7 @@ jobs:
 
       - name: Verify remaining process services
         run: |
+          pnpm exec vitest run test/scenarios/install-script.test.ts test/scenarios/install-script-release.test.ts
           pnpm exec vitest run test/installer-posix-attempts.test.ts
           pnpm exec vitest run test/installer-node-publication.test.ts test/installer-pnpm-bootstrap.test.ts
           pnpm exec vitest run test/scenarios/package-install.test.ts
@@ -1071,6 +1072,50 @@ jobs:
           pnpm exec vitest run test/scenarios/ownership.test.ts test/scenarios/managed-process.test.ts test/scenarios/process-identity.test.ts test/scenarios/control-endpoint.test.ts test/scenarios/control-discovery.test.ts test/scenarios/startup-progress.test.ts test/scenarios/postgres-provision.test.ts test/scenarios/activation-ownership.test.ts test/scenarios/installation-activation.test.ts test/scenarios/managed-activation-admission.test.ts
           pnpm exec vitest run test/scenarios/postgres-readiness.test.ts test/scenarios/postgres-lifecycle.test.ts test/scenarios/external-postgres-client-config.test.ts test/scenarios/external-postgres-lifecycle.test.ts
           pnpm exec vitest run test/scenarios/core-host.test.ts test/scenarios/core-host-runtime.test.ts test/scenarios/core-host-process.test.ts test/scenarios/server-owner.test.ts test/scenarios/server-status-stop.test.ts test/scenarios/core-database-handoff.test.ts test/scenarios/admin-spa.test.ts test/scenarios/server-startup-observer.test.ts test/scenarios/server-launch-attempt.test.ts test/scenarios/server-launcher.test.ts test/scenarios/server-command.test.ts
+
+  install-e2e:
+    name: Install end to end (local bundle)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Version the checkout as an alpha prerelease
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const manifest = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            manifest.version += "-alpha.ci";
+            fs.writeFileSync("package.json", JSON.stringify(manifest, null, 2) + "\n");
+          '
+
+      - name: Build the alpha bundle for a local origin
+        run: >-
+          node scripts/build-release-bundle.mjs --channel alpha
+          --release-url https://127.0.0.1:8443 --output "$RUNNER_TEMP/bundle"
+
+      - name: Install the bundle and smoke-test Revo
+        run: sh scripts/smoke-install.sh --bundle "$RUNNER_TEMP/bundle"
 
   verify:
     runs-on: ubuntu-latest
@@ -1098,6 +1143,9 @@ jobs:
 
       - name: Verify
         run: pnpm verify
+
+      - name: Check shell scripts
+        run: shellcheck installer/install.sh scripts/smoke-install.sh
 
       - name: Require Sonar provider access
         env:
