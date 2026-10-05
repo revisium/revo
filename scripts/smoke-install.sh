@@ -150,6 +150,17 @@ check_fresh_install() {
   check_private_tools 'by the installer'
   [ "$(revo --version)" = "$version" ] || fail "$command_name --version does not report $version"
   say "installed $command_name $version"
+  check_install_contents
+}
+
+# The bundled ACP bridges run the user's own claude and codex CLIs, so their native agent binaries
+# (ignoredOptionalDependencies in pnpm-workspace.yaml) must stay out of the installation.
+check_install_contents() {
+  agent_binaries=$(find "$home/.local/share/revo-install" -type d \
+    \( -name '*claude-agent-sdk-*' -o -name '*openai+codex@*-darwin-*' -o -name '*openai+codex@*-linux-*' \
+    -o -name '*openai+codex@*-win32-*' \) -prune -print)
+  [ -z "$agent_binaries" ] || fail "native agent binaries were installed: $agent_binaries"
+  say "install size: $(du -sk "$home/.local/share/revo-install" | cut -f1) KiB"
 }
 
 start_server() {

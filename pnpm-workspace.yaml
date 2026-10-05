@@ -15,3 +15,9 @@ allowBuilds:
 
 minimumReleaseAgeExclude:
   - '@revisium/*'
+
+# Revo runs the user's own claude and codex CLIs and passes them to the bundled ACP bridges
+# (CLAUDE_CODE_EXECUTABLE, CODEX_PATH), so the bridges' optional native agent binaries are never used.
+ignoredOptionalDependencies:
+  - '@anthropic-ai/claude-agent-sdk-*'
+  - '@openai/codex-*'
