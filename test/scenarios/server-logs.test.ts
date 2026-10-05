@@ -143,6 +143,28 @@ describe('server lifecycle log reader', () => {
     expect(waits).toBe(2);
   });
 
+  it('rejects the follow when a read or a snapshot delivery fails', async () => {
+    const readFailure = new Error('read failed');
+    await expect(
+      follow({
+        read: () => Promise.reject(readFailure),
+        wait: () => Promise.resolve(),
+        signal: new AbortController().signal,
+        onSnapshot: () => undefined,
+      }),
+    ).rejects.toBe(readFailure);
+
+    const deliveryFailure = new Error('delivery failed');
+    await expect(
+      follow({
+        read: () => Promise.resolve({ cursor: 1 }),
+        wait: () => Promise.resolve(),
+        signal: new AbortController().signal,
+        onSnapshot: () => Promise.reject(deliveryFailure),
+      }),
+    ).rejects.toBe(deliveryFailure);
+  });
+
   it.each([
     ['SIGINT', 130],
     ['SIGTERM', 143],

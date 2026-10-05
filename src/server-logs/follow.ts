@@ -5,19 +5,26 @@ export interface FollowOptions<T extends { readonly cursor: number }> {
   readonly onSnapshot: (snapshot: T) => void | Promise<void>;
 }
 
-export async function follow<T extends { readonly cursor: number }>(
+export function follow<T extends { readonly cursor: number }>(
   options: FollowOptions<T>,
 ): Promise<void> {
-  let cursor = 0;
-  while (!options.signal.aborted) {
-    // oxlint-disable-next-line no-await-in-loop -- follow reads are ordered
-    const snapshot = await options.read(cursor);
-    // oxlint-disable-next-line no-await-in-loop -- snapshots are delivered in order
-    await options.onSnapshot(snapshot);
-    cursor = snapshot.cursor;
-    // oxlint-disable-next-line no-await-in-loop -- wait between ordered reads
-    await options.wait(options.signal);
-  }
+  return new Promise<void>((resolve, reject) => {
+    const cycle = async (cursor: number): Promise<void> => {
+      if (options.signal.aborted) {
+        resolve();
+        return;
+      }
+      try {
+        const snapshot = await options.read(cursor);
+        await options.onSnapshot(snapshot);
+        await options.wait(options.signal);
+        void cycle(snapshot.cursor);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    void cycle(0);
+  });
 }
 
 export function waitForFollowPoll(signal: AbortSignal): Promise<void> {
