@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
 import {
+  chmod,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,7 +13,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { runInNewContext } from 'node:vm';
 
 import { beforeAll, describe, expect, it, vi } from 'vitest';
@@ -20,6 +22,7 @@ import { readActivation, type ActivationReadResult } from '../src/installation/a
 import { ServerOwnershipService } from '../src/processes/server-ownership.service.js';
 import { parseLifecycleDocument } from '../src/server-logs/document.js';
 import { ServerLifecycleStore, serverLifecyclePath } from '../src/server-logs/store.service.js';
+import { activationScenario } from './support/installation/activation-scenario.js';
 import {
   captureIntelSnapshot as captureIntelSnapshotUnsafe,
   cleanupPortableToolchain,
@@ -657,54 +660,204 @@ function formatInstallerOutcome(
 it.each(['extra-key', 'oversized', 'symlink'] as const)(
   'real helper rejects an unsafe %s request without changing current state',
   async (kind) => {
-    const subject = await portableToolchain('stable', undefined, false, true);
-    const requestRoot = await mkdtemp(join(subject.root, 'request-'));
+    const subject = await activationScenario();
     try {
-      expect(await subject.startInstaller().finish).toBe(0);
-      const before = validActivation(await readActivation(join(subject.root, 'state', 'stable')));
+      await chmod(subject.channelRoot, 0o700);
       const helper = join(
-        subject.root,
-        'state',
-        'stable',
-        before.record.packageRef,
-        'dist/bin/revo-install-activate.js',
+        subject.first.packageDirectory,
+        'dist',
+        'bin',
+        'revo-install-activate.js',
       );
+      const compiledDirectory = join(subject.first.packageDirectory, 'dist');
+      await cp(new URL('../dist/', import.meta.url), compiledDirectory, {
+        recursive: true,
+      });
+      await writeFile(join(compiledDirectory, 'package.json'), '{"type":"module"}\n', {
+        mode: 0o644,
+      });
+      await symlink(join(process.cwd(), 'node_modules'), join(compiledDirectory, 'node_modules'));
+      expect(await realpath(resolvePath(dirname(helper), '../../../../..'))).toBe(
+        await realpath(subject.channelRoot),
+      );
+      expect((await subject.activate()).status).toBe('activated');
+      const before = validActivation(await readActivation(subject.channelRoot));
+      const home = join(subject.root, 'helper-home');
+      const directories = {
+        HOME: join(home, 'home'),
+        XDG_CONFIG_HOME: join(home, 'config'),
+        XDG_DATA_HOME: join(home, 'data'),
+        XDG_STATE_HOME: join(home, 'state'),
+        XDG_CACHE_HOME: join(home, 'cache'),
+        XDG_RUNTIME_DIR: join(home, 'runtime'),
+      };
+      await Promise.all(
+        Object.values(directories).map((directory) =>
+          mkdir(directory, { recursive: true, mode: 0o700 }),
+        ),
+      );
+      const environment = {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        ...directories,
+        REVO_CHANNEL: 'stable',
+        REVO_DATA_DIR: directories.XDG_DATA_HOME,
+        REVO_INSTALL_ROOT: subject.channelRoot,
+      };
+      const requestRoot = join(
+        subject.channelRoot,
+        '.attempt.HelperTest123',
+        'runtime',
+        'scratch',
+        '.activation-request-InvalidTest456',
+      );
+      await mkdir(requestRoot, { recursive: true, mode: 0o700 });
+      const requestDirectories = [
+        join(subject.channelRoot, '.attempt.HelperTest123'),
+        join(subject.channelRoot, '.attempt.HelperTest123', 'runtime'),
+        join(subject.channelRoot, '.attempt.HelperTest123', 'runtime', 'scratch'),
+        requestRoot,
+      ];
+      const directoryModes = await Promise.all(
+        requestDirectories.map(async (directory) => (await lstat(directory)).mode & 0o777),
+      );
+      expect((await lstat(subject.channelRoot)).mode & 0o777).toBe(0o700);
+      expect(directoryModes).toEqual([0o700, 0o700, 0o700, 0o700]);
       const valid = {
         schemaVersion: 'revo-install-activate/v1',
-        channelRoot: join(subject.root, 'state'),
-        packagePlan: subject.plan,
-        nodeArchiveSha256: subject.nodeArchiveSha256,
-        pnpmArchiveSha256: subject.pnpmArchiveSha256,
+        channelRoot: subject.channelRoot,
+        packagePlan: subject.first.plan,
+        nodeArchiveSha256: subject.first.nodeArchiveSha256,
+        pnpmArchiveSha256: subject.first.pnpmArchiveSha256,
       };
       const requestPath = join(requestRoot, 'request.json');
+      const runHelper = (path: string) =>
+        new Promise<{
+          readonly code: number | null;
+          readonly signal: NodeJS.Signals | null;
+          readonly stdout: string;
+          readonly stderr: string;
+          readonly timedOut: boolean;
+          readonly outputExceeded: boolean;
+          readonly spawnFailed: boolean;
+        }>((resolve) => {
+          const child = spawn(process.execPath, [helper, path], {
+            env: environment,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          let stdout = '';
+          let stderr = '';
+          let timedOut = false;
+          let outputExceeded = false;
+          let spawnFailed = false;
+          let terminationStarted = false;
+          let killTimer: ReturnType<typeof setTimeout> | undefined;
+          const terminate = () => {
+            if (terminationStarted) {
+              return;
+            }
+            terminationStarted = true;
+            child.kill('SIGTERM');
+            killTimer = setTimeout(() => child.kill('SIGKILL'), 1_000);
+          };
+          const appendBounded = (current: string, chunk: string): string => {
+            if (Buffer.byteLength(current) + Buffer.byteLength(chunk) > 8 * 1024) {
+              outputExceeded = true;
+              terminate();
+              return current;
+            }
+            return current + chunk;
+          };
+          child.stdout.setEncoding('utf8');
+          child.stderr.setEncoding('utf8');
+          child.stdout.on('data', (chunk: string) => {
+            stdout = appendBounded(stdout, chunk);
+          });
+          child.stderr.on('data', (chunk: string) => {
+            stderr = appendBounded(stderr, chunk);
+          });
+          const deadline = setTimeout(() => {
+            timedOut = true;
+            terminate();
+          }, 5_000);
+          child.once('error', () => {
+            spawnFailed = true;
+          });
+          child.once('close', (code, signal) => {
+            clearTimeout(deadline);
+            if (killTimer !== undefined) {
+              clearTimeout(killTimer);
+            }
+            resolve({ code, signal, stdout, stderr, timedOut, outputExceeded, spawnFailed });
+          });
+        });
+
+      const initialRequest = `${JSON.stringify(valid)}\n`;
+      const targetPath = join(requestRoot, 'target.json');
+      await writeFile(targetPath, initialRequest, { mode: 0o600 });
+      await writeFile(requestPath, initialRequest, { mode: 0o600 });
+      const positive = await runHelper(requestPath);
+      expect(positive).toMatchObject({
+        code: 0,
+        signal: null,
+        timedOut: false,
+        outputExceeded: false,
+        spawnFailed: false,
+        stderr: '',
+      });
+      expect(JSON.parse(positive.stdout)).toMatchObject({
+        schemaVersion: 'revo-install-activate/v1',
+        status: 'unchanged',
+        generationId: before.record.generationId,
+      });
+      expect(await readActivation(subject.channelRoot)).toEqual(before);
+
       if (kind === 'extra-key') {
         await writeFile(requestPath, `${JSON.stringify({ ...valid, extra: true })}\n`, {
           mode: 0o600,
         });
       } else if (kind === 'oversized') {
-        await writeFile(requestPath, `${'x'.repeat(64 * 1024 + 1)}\n`, { mode: 0o600 });
+        const prefix = JSON.stringify(valid);
+        await writeFile(requestPath, `${prefix}${' '.repeat(65_537 - Buffer.byteLength(prefix))}`, {
+          mode: 0o600,
+        });
       } else {
-        const targetPath = join(requestRoot, 'target.json');
-        await writeFile(targetPath, `${JSON.stringify(valid)}\n`, { mode: 0o600 });
+        await rm(requestPath);
         await symlink(targetPath, requestPath);
       }
-      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-        const child = spawn(process.execPath, [helper, requestPath], {
-          stdio: ['ignore', 'ignore', 'pipe'],
-        });
-        let stderr = '';
-        child.stderr.setEncoding('utf8');
-        child.stderr.on('data', (chunk: string) => (stderr += chunk));
-        child.once('close', (code) => resolve({ code, stderr }));
+      const requestStat = await lstat(requestPath);
+      const requestContents = await readFile(requestPath, 'utf8');
+      const targetContents = await readFile(targetPath, 'utf8');
+      const extraKeyRequest = `${JSON.stringify({ ...valid, extra: true })}\n`;
+      const fixtureValid =
+        kind === 'extra-key'
+          ? requestStat.isFile() &&
+            (requestStat.mode & 0o777) === 0o600 &&
+            requestContents === extraKeyRequest
+          : kind === 'oversized'
+            ? requestStat.isFile() &&
+              (requestStat.mode & 0o777) === 0o600 &&
+              requestStat.size === 65_537 &&
+              requestContents.trimEnd() === JSON.stringify(valid)
+            : requestStat.isSymbolicLink() && requestContents === initialRequest;
+      expect(fixtureValid).toBe(true);
+      expect(targetContents).toBe(initialRequest);
+      const result = await runHelper(requestPath);
+      expect(result).toMatchObject({
+        code: 1,
+        signal: null,
+        stdout: '',
+        stderr: 'activation helper failed\n',
+        timedOut: false,
+        outputExceeded: false,
+        spawnFailed: false,
       });
-      expect(result.code).not.toBe(0);
-      expect(result.stderr).toBe('activation helper failed\n');
-      expect(await readActivation(join(subject.root, 'state', 'stable'))).toEqual(before);
+      expect(await readActivation(subject.channelRoot)).toEqual(before);
+      expect(await readFile(targetPath, 'utf8')).toBe(initialRequest);
     } finally {
-      await cleanupPortableToolchain(subject.root);
+      await subject.cleanup();
     }
   },
-  180_000,
+  60_000,
 );
 
 it('real activation refuses during startup and succeeds after the owner closes', async () => {

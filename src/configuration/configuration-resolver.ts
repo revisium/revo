@@ -34,13 +34,15 @@ const ENV_FIELDS = {
 
 type ValueField = keyof typeof ENV_FIELDS;
 type ConfigurationValue = string | number | undefined;
+type PathApi = Pick<typeof path.posix, 'isAbsolute' | 'join' | 'normalize'>;
 
 export class ConfigurationResolver {
   constructor(private readonly fileLoader = new ConfigFileLoader()) {}
 
   async resolve(input: Readonly<ConfigurationInput>): Promise<Readonly<RevoConfiguration>> {
     const channel = this.channel(input);
-    this.layoutPaths(input);
+    const pathApi = input.platform === 'win32' ? path.win32 : path.posix;
+    this.layoutPaths(input, pathApi);
     const baseLayout = resolveRevoLayout({
       channel,
       env: input.env,
@@ -48,8 +50,15 @@ export class ConfigurationResolver {
       platform: input.platform,
     });
     const explicitPath = input.flags.config ?? input.env.REVO_CONFIG;
-    const configPath = explicitPath ?? path.join(baseLayout.configDir, 'config.json');
-    this.absolutePath(configPath, 'config', this.configPathSource(input));
+    const requestedConfigPath = explicitPath ?? pathApi.join(baseLayout.configDir, 'config.json');
+    const normalizedConfigPath = this.absolutePath(
+      requestedConfigPath,
+      'config',
+      this.configPathSource(input),
+      pathApi,
+      input.platform,
+    );
+    const configPath = input.platform === 'win32' ? normalizedConfigPath : requestedConfigPath;
     const file = this.configurationFile(
       await this.fileLoader.read(configPath, explicitPath !== undefined),
     );
@@ -73,13 +82,17 @@ export class ConfigurationResolver {
       this.value('dataDir', input.flags, input.env, file),
       'dataDir',
       this.source('dataDir', input.flags, input.env, file),
+      pathApi,
+      input.platform,
     );
     const logDir =
       this.optionalPath(
         this.value('logDir', input.flags, input.env, file),
         'logDir',
         this.source('logDir', input.flags, input.env, file),
-      ) ?? path.join(baseLayout.stateDir, 'logs');
+        pathApi,
+        input.platform,
+      ) ?? pathApi.join(baseLayout.stateDir, 'logs');
     const databaseUrl = this.databaseUrl(
       this.value('databaseUrl', input.flags, input.env, file),
       this.source('databaseUrl', input.flags, input.env, file),
@@ -96,7 +109,15 @@ export class ConfigurationResolver {
       configPath,
       ...(databaseUrl === undefined ? {} : { databaseUrl }),
       host,
-      installDir: path.join(input.homeDir, '.local', 'share', 'revo-install', channel),
+      installDir:
+        input.platform === 'win32'
+          ? pathApi.join(
+              input.env.LOCALAPPDATA || pathApi.join(input.homeDir, 'AppData', 'Local'),
+              'Revisium',
+              'revo-install',
+              channel,
+            )
+          : pathApi.join(input.homeDir, '.local', 'share', 'revo-install', channel),
       layout,
       logDir,
       port,
@@ -291,6 +312,8 @@ export class ConfigurationResolver {
     value: string | number | undefined,
     field: string,
     source: string,
+    pathApi: PathApi,
+    platform: ConfigurationInput['platform'],
   ): string | undefined {
     if (value === undefined) {
       return undefined;
@@ -298,22 +321,57 @@ export class ConfigurationResolver {
     if (typeof value !== 'string') {
       invalidConfiguration(field, source, 'must be an absolute path');
     }
-    return this.absolutePath(value, field, source);
+    return this.absolutePath(value, field, source, pathApi, platform);
   }
 
-  private absolutePath(value: string, field: string, source: string): string {
-    if (!path.posix.isAbsolute(value) || value.includes('\0')) {
+  private absolutePath(
+    value: string,
+    field: string,
+    source: string,
+    pathApi: PathApi,
+    platform: ConfigurationInput['platform'],
+  ): string {
+    if (value.includes('\0')) {
       invalidConfiguration(field, source, 'must be an absolute path');
     }
-    return path.posix.normalize(value);
+    if (platform !== 'win32') {
+      if (!pathApi.isAbsolute(value)) {
+        invalidConfiguration(field, source, 'must be an absolute path');
+      }
+      return pathApi.normalize(value);
+    }
+
+    const windowsPath = value.replaceAll('/', '\\');
+    const isDeviceNamespace = /^\\\\[?.]\\/u.test(windowsPath);
+    const isDriveQualified = /^[A-Za-z]:\\/u.test(windowsPath);
+    const uncRoot = /^\\\\([^\\]+)\\([^\\]+)(?:\\|$)/u.exec(windowsPath);
+    const isUncPath =
+      uncRoot !== null &&
+      uncRoot[1] !== '.' &&
+      uncRoot[1] !== '..' &&
+      uncRoot[2] !== '.' &&
+      uncRoot[2] !== '..';
+    if (isDeviceNamespace || (!isDriveQualified && !isUncPath) || !pathApi.isAbsolute(value)) {
+      invalidConfiguration(field, source, 'must be an absolute path');
+    }
+    return pathApi.normalize(value);
   }
 
   private isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
   }
 
-  private layoutPaths(input: Readonly<ConfigurationInput>): void {
-    this.absolutePath(input.homeDir, 'homeDir', 'input');
+  private layoutPaths(input: Readonly<ConfigurationInput>, pathApi: PathApi): void {
+    this.absolutePath(input.homeDir, 'homeDir', 'input', pathApi, input.platform);
+    if (input.platform === 'win32') {
+      for (const field of ['APPDATA', 'LOCALAPPDATA'] as const) {
+        const value = input.env[field];
+        if (value !== undefined && value !== '') {
+          this.absolutePath(value, field, 'environment', pathApi, input.platform);
+        }
+      }
+      return;
+    }
     if (input.platform !== 'linux') {
       return;
     }
@@ -326,7 +384,7 @@ export class ConfigurationResolver {
     ] as const) {
       const value = input.env[field];
       if (value !== undefined && value !== '') {
-        this.absolutePath(value, field, 'environment');
+        this.absolutePath(value, field, 'environment', pathApi, input.platform);
       }
     }
   }
