@@ -129,33 +129,40 @@ describe('install.sh', { timeout: 60_000 }, () => {
     expect(await machine.installerLeftovers('alpha')).toEqual([]);
   });
 
-  it.each(['empty', 'missing'] as const)(
-    'takes over an old install lock whose owner pid file is %s',
-    async (pidFile) => {
-      const machine = await cleanMachine();
-      const release = await machine.publish('alpha', '0.1.0-alpha.1');
-      await machine.leaveOwnerlessLock('alpha', { pidFile, minutesAgo: 10 });
-
-      expect(await machine.install(release)).toMatchObject({ exitCode: 0, stderr: '' });
-      expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
-      expect(await machine.installerLeftovers('alpha')).toEqual([]);
-    },
-  );
-
-  it('refuses while a new install lock has not recorded its owner yet', async () => {
+  it('refuses an install lock without an owner and explains how to clear it', async () => {
     const machine = await cleanMachine();
     const release = await machine.publish('alpha', '0.1.0-alpha.1');
-    await machine.leaveOwnerlessLock('alpha', { pidFile: 'missing', minutesAgo: 0 });
+    await machine.leaveOwnerlessLock('alpha');
 
     const result = await machine.install(release);
 
     expect(result).toMatchObject({
       exitCode: 1,
-      stderr:
-        'revo-alpha install: another installation of Revo alpha is starting; if it is not, run the installer again in a few minutes.\n',
+      stderr: `revo-alpha install: another installation of Revo alpha is running; if it is not, remove ${machine.installLock('alpha')} and run the installer again.\n`,
     });
     expect(await machine.activeVersion('alpha')).toBeUndefined();
     expect(machine.downloads()).toEqual([]);
+  });
+
+  it('lets only one of two installers that start at the same moment install', async () => {
+    const machine = await cleanMachine();
+    const release = await machine.publish('alpha', '0.1.0-alpha.1');
+    const pnpm = await machine.holdDependencyInstallation();
+
+    const installs = await machine.startTwoInstallsAtOnce(release);
+    const refused = await installs.firstToFinish;
+
+    expect(refused).toMatchObject({
+      exitCode: 1,
+      stderr: expect.stringMatching(
+        /^revo-alpha install: another installation of Revo alpha is running\b.*\n$/u,
+      ),
+    });
+    await pnpm.started;
+    pnpm.release();
+    expect(await installs.lastToFinish).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+    expect(await machine.installerLeftovers('alpha')).toEqual([]);
   });
 
   it('lets only one of two installers take over the lock of a killed installer', async () => {
@@ -318,6 +325,19 @@ describe('install.sh', { timeout: 60_000 }, () => {
     async (source) => {
       const machine = await cleanMachine();
       await machine.skipBuildScriptsInUserPnpmSettings(source);
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.runCommand('revo-alpha', ['--version'])).toBe('0.1.0-alpha.1');
+    },
+  );
+
+  it.each(['configuration file', 'environment'] as const)(
+    'installs even when the user pnpm %s rejects dependencies made for another Node.js',
+    async (source) => {
+      const machine = await cleanMachine();
+      await machine.enforceDependencyEnginesInUserPnpmSettings(source);
 
       const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
 

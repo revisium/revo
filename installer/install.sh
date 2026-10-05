@@ -106,45 +106,46 @@ check_command_link() {
   fi
 }
 
-# Stale: the owner is gone, or it never recorded its pid and the lock is over five minutes old.
-lock_is_stale() {
-  if [ -n "$owner" ]; then
-    ! kill -0 "$owner" 2>/dev/null
-  else
-    [ -n "$(find "$lock" -prune -mmin +5 2>/dev/null)" ]
-  fi
+# Creates the file with this installer's pid only if it does not exist. The noclobber redirection is
+# an O_EXCL open by the shell itself; mkdir is not exclusive in every coreutils (uutils 0.8).
+create_with_pid() {
+  set -C
+  { printf '%s\n' "$$" >"$1"; } 2>/dev/null
+  created=$?
+  set +C
+  return "$created"
 }
 
 take_over_stale_lock() {
-  owner=$(cat "$lock/pid" 2>/dev/null) || owner=
-  if ! lock_is_stale; then
-    [ -z "$owner" ] || fail "another installation of $product is running (pid $owner)."
-    fail "another installation of $product is starting; if it is not, run the installer again in a few minutes."
+  owner=$(cat "$lock" 2>/dev/null) || owner=
+  if [ -n "$owner" ]; then
+    ! kill -0 "$owner" 2>/dev/null || fail "another installation of $product is running (pid $owner)."
+  elif [ -e "$lock" ]; then
+    fail "another installation of $product is running; if it is not, remove $lock and run the installer again."
   fi
-  mkdir "$takeover" 2>/dev/null ||
+  create_with_pid "$takeover" ||
     fail "another installation of $product may be running; if it is not, remove $takeover and run the installer again."
   takeover_held=1
-  if [ "$(cat "$lock/pid" 2>/dev/null)" = "$owner" ] && lock_is_stale; then
-    rm -rf "$lock"
+  if [ -n "$owner" ] && [ "$(cat "$lock" 2>/dev/null)" = "$owner" ]; then
+    rm -f "$lock"
   fi
-  mkdir "$lock" 2>/dev/null
+  create_with_pid "$lock"
   taken=$?
-  rmdir "$takeover"
+  rm -f "$takeover"
   takeover_held=0
   [ "$taken" -eq 0 ] || fail "another installation of $product started at the same time."
 }
 
 acquire_lock() {
   mkdir -p "$channel_root" || fail "cannot create $channel_root."
-  mkdir "$lock" 2>/dev/null || take_over_stale_lock
+  create_with_pid "$lock" || take_over_stale_lock
   lock_held=1
-  printf '%s\n' "$$" >"$lock/pid" || fail "cannot write $lock/pid."
   rm -rf "$staging" || fail "cannot remove $staging."
   mkdir "$staging" || fail "cannot create $staging."
 }
 
 cleanup() {
-  [ "$takeover_held" = 0 ] || rmdir "$takeover"
+  [ "$takeover_held" = 0 ] || rm -f "$takeover"
   [ "$lock_held" = 0 ] || rm -rf "$staging" "$lock"
 }
 
@@ -235,17 +236,18 @@ EOF
   chmod 755 "$1/bin/$command_name"
 }
 
-# The release decides which packages are installed, how they are linked and which build scripts run;
-# these flags override user pnpm settings that would change that. Registry, proxy and auth still apply.
+# The release decides which packages are installed for its private Node.js, how they are linked and
+# which build scripts run; these flags override user pnpm settings that would change that. Registry,
+# proxy and auth still apply.
 install_dependencies() {
   pnpm_data=$channel_root/pnpm-data
   (cd "$revo" && PATH="$node_home/bin:$PATH" PNPM_HOME="$pnpm_data/home" "$pnpm_home/pnpm" install \
     --prod --frozen-lockfile --trust-lockfile --ignore-pnpmfile --os=current --cpu=current --libc=current \
     --store-dir "$pnpm_data/store" --state-dir "$pnpm_data/state" --config.cache-dir="$pnpm_data/cache" \
     --config.offline=false --config.lockfile-dir=. --config.optional=true --config.ignore-scripts=false \
-    --config.dangerously-allow-all-builds=false --config.node-linker=isolated --config.symlink=true \
-    --config.modules-dir=node_modules --config.enable-modules-dir=true --config.virtual-store-only=false \
-    --config.virtual-store-dir=node_modules/.pnpm --config.virtual-store-type=project)
+    --config.engine-strict=false --config.dangerously-allow-all-builds=false --config.node-linker=isolated \
+    --config.symlink=true --config.modules-dir=node_modules --config.enable-modules-dir=true \
+    --config.virtual-store-only=false --config.virtual-store-dir=node_modules/.pnpm --config.virtual-store-type=project)
 }
 
 install_revo() {

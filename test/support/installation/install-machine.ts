@@ -2,6 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   access,
+  appendFile,
   chmod,
   mkdir,
   mkdtemp,
@@ -9,7 +10,6 @@ import {
   readFile,
   readlink,
   rm,
-  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -36,6 +36,18 @@ const SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const FOREIGN_COMMAND = '#!/bin/sh\necho "not Revo"\n';
 const CHANNELS: readonly ReleaseChannel[] = ['stable', 'alpha'];
 const USER_PNPM_CONFIG_DIRS = [join('.config', 'pnpm'), join('Library', 'Preferences', 'pnpm')];
+const IGNORE_SCRIPTS: FixturePnpmSetting = {
+  variable: 'ignore_scripts',
+  configKey: 'ignoreScripts',
+  environment: 'pnpm_config_ignore_scripts',
+  flag: 'ignore-scripts',
+};
+const ENGINE_STRICT: FixturePnpmSetting = {
+  variable: 'engine_strict',
+  configKey: 'engineStrict',
+  environment: 'PNPM_CONFIG_ENGINE_STRICT',
+  flag: 'engine-strict',
+};
 
 export type ReleaseAsset = 'package' | 'lockfile' | 'workspace';
 
@@ -59,6 +71,11 @@ export interface RunningInstall {
   kill(): void;
 }
 
+export interface InstallRace {
+  readonly firstToFinish: Promise<InstallResult>;
+  readonly lastToFinish: Promise<InstallResult>;
+}
+
 export interface HeldDependencyInstallation {
   readonly started: Promise<void>;
   release(): void;
@@ -71,16 +88,18 @@ export interface MachineOptions {
 
 export type UserPnpmSettingSource = 'configuration file' | 'environment';
 
-export interface OwnerlessLock {
-  readonly pidFile: 'empty' | 'missing';
-  readonly minutesAgo: number;
-}
-
 export interface ReportedPlatform {
   readonly system: string;
   readonly machine: string;
   readonly glibc?: string;
   readonly macos?: string;
+}
+
+interface FixturePnpmSetting {
+  readonly variable: string;
+  readonly configKey: string;
+  readonly environment: string;
+  readonly flag: string;
 }
 
 interface Toolchains {
@@ -218,6 +237,26 @@ export class InstallMachine {
     await install.finished;
   }
 
+  async startTwoInstallsAtOnce(release: FixtureRelease): Promise<InstallRace> {
+    await executable(
+      join(this.root, 'platform-bin', 'mkdir'),
+      lockAttemptRendezvous(
+        quote(this.channelRoot(release.channel)),
+        quote(this.control('together')),
+      ),
+    );
+    const one = this.startInstall(release).finished;
+    const other = this.startInstall(release).finished;
+    const first = Promise.race([
+      one.then((result) => ({ result, last: other })),
+      other.then((result) => ({ result, last: one })),
+    ]);
+    return {
+      firstToFinish: first.then(({ result }) => result),
+      lastToFinish: first.then(({ last }) => last),
+    };
+  }
+
   async raceTwoInstallersForTheStaleLock(): Promise<void> {
     await executable(
       join(this.root, 'platform-bin', 'cat'),
@@ -245,26 +284,16 @@ export class InstallMachine {
   }
 
   async skipBuildScriptsInUserPnpmSettings(source: UserPnpmSettingSource): Promise<void> {
-    if (source === 'environment') {
-      this.userPnpmEnvironment.pnpm_config_ignore_scripts = 'true';
-      return;
-    }
-    await Promise.all(
-      USER_PNPM_CONFIG_DIRS.map(async (directory) => {
-        await mkdir(join(this.home, directory), { recursive: true });
-        await writeFile(join(this.home, directory, 'config.yaml'), 'ignoreScripts: true\n');
-      }),
-    );
+    await this.enableUserPnpmSetting(IGNORE_SCRIPTS, source);
   }
 
-  async leaveOwnerlessLock(channel: ReleaseChannel, lock: OwnerlessLock): Promise<void> {
-    const directory = join(this.channelRoot(channel), '.lock');
-    await mkdir(directory, { recursive: true });
-    if (lock.pidFile === 'empty') {
-      await writeFile(join(directory, 'pid'), '');
-    }
-    const time = new Date(Date.now() - lock.minutesAgo * 60_000);
-    await utimes(directory, time, time);
+  async enforceDependencyEnginesInUserPnpmSettings(source: UserPnpmSettingSource): Promise<void> {
+    await this.enableUserPnpmSetting(ENGINE_STRICT, source);
+  }
+
+  async leaveOwnerlessLock(channel: ReleaseChannel): Promise<void> {
+    await mkdir(this.channelRoot(channel), { recursive: true });
+    await writeFile(this.installLock(channel), '');
   }
 
   async reportPlatform(platform: ReportedPlatform): Promise<void> {
@@ -297,6 +326,10 @@ export class InstallMachine {
 
   channelRoot(channel: ReleaseChannel): string {
     return join(this.installRoot(), channel);
+  }
+
+  installLock(channel: ReleaseChannel): string {
+    return join(this.channelRoot(channel), '.lock');
   }
 
   privateNode(channel: ReleaseChannel): string {
@@ -401,6 +434,22 @@ export class InstallMachine {
     return environment;
   }
 
+  private async enableUserPnpmSetting(
+    setting: FixturePnpmSetting,
+    source: UserPnpmSettingSource,
+  ): Promise<void> {
+    if (source === 'environment') {
+      this.userPnpmEnvironment[setting.environment] = 'true';
+      return;
+    }
+    await Promise.all(
+      USER_PNPM_CONFIG_DIRS.map(async (directory) => {
+        await mkdir(join(this.home, directory), { recursive: true });
+        await appendFile(join(this.home, directory, 'config.yaml'), `${setting.configKey}: true\n`);
+      }),
+    );
+  }
+
   private installRoot(): string {
     if (this.options.installRoot === undefined) {
       return join(this.home, '.local', 'share', 'revo-install');
@@ -485,7 +534,12 @@ export class InstallMachine {
         `if [ "\${1:-}" = --version ]; then echo ${PNPM_VERSION}; exit 0; fi`,
         `printf '%s|%s\\n' "$(command -v node)" "$*" >> ${quote(this.control('pnpm-installs.log'))}`,
         '[ -f package.json ] && [ -f pnpm-lock.yaml ] && [ -f pnpm-workspace.yaml ] || exit 3',
-        ...ignoreScriptsSetting(),
+        ...fixturePnpmSetting(IGNORE_SCRIPTS),
+        ...fixturePnpmSetting(ENGINE_STRICT),
+        'if [ "$engine_strict" = true ]; then',
+        "  echo 'ERR_PNPM_UNSUPPORTED_ENGINE: a release dependency declares an engine range the private Node.js does not satisfy' >&2",
+        '  exit 1',
+        'fi',
         `if mv ${quote(this.control('pnpm-gate'))} ${quote(this.control('pnpm-held'))} 2>/dev/null; then`,
         `  : > ${quote(this.control('pnpm-started'))}`,
         `  { read -r _ < ${quote(this.control('pnpm-held'))}; } 2>/dev/null`,
@@ -551,24 +605,45 @@ async function executable(path: string, body: string): Promise<void> {
   await chmod(path, 0o755);
 }
 
-// The fixture pnpm reads ignoreScripts like pnpm: the command line wins over the environment, which
-// wins over the user's configuration file.
-function ignoreScriptsSetting(): readonly string[] {
+// The fixture pnpm reads a boolean setting like pnpm: the command line wins over the environment,
+// which wins over the user's configuration file.
+function fixturePnpmSetting(setting: FixturePnpmSetting): readonly string[] {
+  const { variable } = setting;
   return [
-    'ignore_scripts=false',
+    `${variable}=false`,
     ...USER_PNPM_CONFIG_DIRS.map(
       (directory) =>
-        `! grep -qx 'ignoreScripts: true' "$HOME"/${quote(directory)}/config.yaml 2>/dev/null || ignore_scripts=true`,
+        `! grep -qx '${setting.configKey}: true' "$HOME"/${quote(directory)}/config.yaml 2>/dev/null || ${variable}=true`,
     ),
-    'ignore_scripts=${pnpm_config_ignore_scripts:-$ignore_scripts}',
-    'for arg; do case "$arg" in --config.ignore-scripts=*) ignore_scripts=${arg#*=} ;; esac; done',
+    `${variable}=\${${setting.environment}:-$${variable}}`,
+    `for arg; do case "$arg" in --config.${setting.flag}=*) ${variable}=\${arg#*=} ;; esac; done`,
   ];
+}
+
+// Barrier markers are claimed with an exclusive create: mkdir is not exclusive in every coreutils.
+const CLAIM_MARKER = ['claim() {', '  (set -C; : >"$1") 2>/dev/null', '}'];
+
+// Both installers wait just before taking the lock, so they try to take it at the same moment.
+function lockAttemptRendezvous(channelRoot: string, barrier: string): string {
+  return [
+    `[ "$#" -eq 2 ] && [ "$1" = -p ] && [ "$2" = ${channelRoot} ] || exec /bin/mkdir "$@"`,
+    '/bin/mkdir "$@" || exit',
+    ...CLAIM_MARKER,
+    `claim ${barrier}-1 || claim ${barrier}-2`,
+    'tries=0',
+    `until [ -e ${barrier}-1 ] && [ -e ${barrier}-2 ]; do`,
+    '  tries=$((tries + 1))',
+    '  [ "$tries" -lt 500000 ] || break',
+    'done',
+    '',
+  ].join('\n');
 }
 
 // The second installer reads the stale owner before the first takes the lock over, and acts after.
 function staleLockReadBarrier(barrier: string): string {
   return [
-    'case "${1:-}" in */.lock/pid) ;; *) exec /bin/cat "$@" ;; esac',
+    'case "${1:-}" in */.lock) ;; *) exec /bin/cat "$@" ;; esac',
+    ...CLAIM_MARKER,
     'wait_for() {',
     '  tries=0',
     '  until "$@"; do',
@@ -577,17 +652,18 @@ function staleLockReadBarrier(barrier: string): string {
     '    sleep 0.01',
     '  done',
     '}',
-    'owner_changed() {',
-    '  current=$(/bin/cat "$1" 2>/dev/null) && [ -n "$current" ] && [ "$current" != "$stale" ]',
+    'taken_over() {',
+    '  current=$(/bin/cat "$1" 2>/dev/null) && [ -n "$current" ] && [ "$current" != "$stale" ] &&',
+    '    [ ! -e "$1.takeover" ]',
     '}',
-    `if mkdir ${barrier}-first 2>/dev/null; then`,
-    `  wait_for test -d ${barrier}-second-read`,
+    `if claim ${barrier}-first; then`,
+    `  wait_for test -e ${barrier}-second-read`,
     '  exec /bin/cat "$1"',
     'fi',
-    `if mkdir ${barrier}-second 2>/dev/null; then`,
+    `if claim ${barrier}-second; then`,
     '  stale=$(/bin/cat "$1") || exit 1',
-    `  mkdir ${barrier}-second-read`,
-    '  wait_for owner_changed "$1"',
+    `  : >${barrier}-second-read`,
+    '  wait_for taken_over "$1"',
     `  printf '%s\\n' "$stale"`,
     '  exit 0',
     'fi',

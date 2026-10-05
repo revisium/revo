@@ -107,7 +107,7 @@ prepare_home() {
   for config in .config/pnpm Library/Preferences/pnpm; do
     mkdir -p "$home/$config"
     printf '%s\n' 'ignoreScripts: true' 'optional: false' 'enableGlobalVirtualStore: true' \
-      'minimumReleaseAge: 5256000' 'trustPolicy: no-downgrade' >"$home/$config/config.yaml"
+      'minimumReleaseAge: 5256000' 'trustPolicy: no-downgrade' 'engineStrict: true' >"$home/$config/config.yaml"
   done
   user_pnpm_files=$(shared_pnpm_files)
 }
@@ -136,7 +136,7 @@ select_command() {
 
 install_revo() {
   (cd "$project" && clean_env curl --fail --silent --show-error --location --proto =https "$script_url" |
-    clean_env pnpm_config_ignore_scripts=true PNPM_CONFIG_OFFLINE=true sh)
+    clean_env pnpm_config_ignore_scripts=true PNPM_CONFIG_OFFLINE=true PNPM_CONFIG_ENGINE_STRICT=true sh)
 }
 
 check_fresh_install() {
