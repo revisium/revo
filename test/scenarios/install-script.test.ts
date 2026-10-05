@@ -577,6 +577,7 @@ describe('install.sh', { timeout: 60_000 }, () => {
 
     it('neither asks nor uses sudo when the library is present', async () => {
       const machine = await cleanMachine();
+      await machine.reportPlatform({ system: 'Linux', machine: 'x86_64', glibc: 'glibc 2.35' });
       await machine.havePackageManager('apt-get');
       await machine.haveSudo();
       await machine.answerPrompt('n');

@@ -28,6 +28,13 @@ useradd --create-home --shell /bin/sh revo
 printf 'revo ALL=(ALL) NOPASSWD:ALL\n' >/etc/sudoers.d/revo
 chmod 440 /etc/sudoers.d/revo
 
+# The mounts can be unreadable for the new user, so it works on copies it owns.
+install -d -o revo -g revo /work
+cp -R "$bundle" /work/bundle
+cp "$repo/scripts/smoke-install.sh" /work/smoke-install.sh
+chown -R revo:revo /work
+bundle=/work/bundle
+
 script=$(ls "$bundle"/install*.sh)
 if output=$(su -s /bin/sh revo -c "sh '$script' </dev/null" 2>&1); then
   fail 'the installer succeeded without libatomic.so.1'
@@ -43,6 +50,6 @@ fi
 [ ! -e /home/revo/.local ] || fail 'the installer changed the home directory without being allowed to'
 printf 'container smoke: the missing library was reported and nothing changed\n'
 
-su -s /bin/sh revo -c "REVO_INSTALL_SYSTEM_DEPS=1 sh '$repo/scripts/smoke-install.sh' --bundle '$bundle'"
+su -s /bin/sh revo -c "REVO_INSTALL_SYSTEM_DEPS=1 sh /work/smoke-install.sh --bundle '$bundle'"
 dpkg -s libatomic1 >/dev/null 2>&1 || fail 'the installer did not install libatomic1'
 printf 'container smoke: passed\n'

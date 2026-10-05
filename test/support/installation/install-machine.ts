@@ -48,6 +48,11 @@ const SYSTEM_DEPENDENCY_TOOLS = [
 ];
 const LIBRARY_LOADER_ERROR =
   'error while loading shared libraries: libatomic.so.1: cannot open shared object file: No such file or directory';
+const MINIMAL_LINUX: ReportedPlatform = {
+  system: 'Linux',
+  machine: 'x86_64',
+  glibc: 'glibc 2.35',
+};
 const FOREIGN_COMMAND = '#!/bin/sh\necho "not Revo"\n';
 const CHANNELS: readonly ReleaseChannel[] = ['stable', 'alpha'];
 const USER_PNPM_CONFIG_DIRS = [join('.config', 'pnpm'), join('Library', 'Preferences', 'pnpm')];
@@ -345,8 +350,9 @@ export class InstallMachine {
     return (await readFile(this.commandPath(command), 'utf8')) === FOREIGN_COMMAND;
   }
 
-  /** Hides the host's package managers, sudo and root identity; the machine then defines them. */
+  /** A Linux machine without libatomic, and without the host's package managers, sudo and root. */
   async lackSystemLibrary(): Promise<void> {
+    await this.reportPlatform(MINIMAL_LINUX);
     await this.isolateSystemTools();
     await writeFile(this.control('library-missing'), '');
   }
