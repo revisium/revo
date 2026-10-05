@@ -213,7 +213,7 @@ describe('revo server command line', () => {
       expect(result.stderr).toContain(
         `the database did not start (embedded PostgreSQL invalid failure: the existing cluster ${dataDir}/postgres is incomplete and was left untouched; PostgreSQL log: `,
       );
-      expect(result.stderr).toMatch(/; PostgreSQL log: \/\S+\/postgres\.log\)\./u);
+      expect(result.stderr).toMatch(/; PostgreSQL log: \/[^\n]+\/postgres\.log\)\./u);
     } finally {
       await rm(dataDir, { recursive: true, force: true });
     }
