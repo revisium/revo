@@ -17,8 +17,9 @@ it. The pnpm version is the `packageManager` pin and the Node.js version is `.nv
 
 ## Build
 
-The checked-out `package.json` version is the release version: alpha requires a prerelease such as
-`0.1.0-alpha.2`, stable requires a plain `X.Y.Z`. The command never publishes anything.
+The `package.json` version is the release version: alpha requires a prerelease such as
+`0.1.0-alpha.2`, stable requires a plain `X.Y.Z`. `master` keeps `0.0.0`; the release workflow sets
+the version from the tag before it builds. The command never publishes anything.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -54,7 +55,7 @@ scripts/smoke-install.sh --bundle /tmp/revo-bundle
 
 ## Release workflow
 
-Pushing a `v<version>` tag that matches `package.json` runs `.github/workflows/release.yml`:
+Pushing a `v<version>` tag runs `.github/workflows/release.yml`:
 
 1. build and verify the bundle for the channel implied by the version, and the same candidate for
    `https://127.0.0.1:8443`, whose package, lockfile and workspace bytes must be identical;
