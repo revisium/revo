@@ -189,13 +189,7 @@ export class ServerHostEntry {
     if (this.state === 'closing' || this.state === 'finished') {
       return;
     }
-    const code = activationFailureCode(error);
-    if (code === undefined) {
-      this.fail('SERVER_HOST_FAILED', 1);
-      return;
-    }
-    void this.sendFailure(code, isUnconfirmed(error) ? 'unconfirmed' : 'completed');
-    this.beginClose(1);
+    this.fail('SERVER_HOST_FAILED', 1);
   }
 
   private commit(): void {
@@ -348,32 +342,4 @@ export class ServerHostEntry {
     }
     this.deadlineTimer = undefined;
   }
-}
-
-function activationFailureCode(error: unknown): 'REVO_ACTIVATION_STATE_INCOMPATIBLE' | undefined {
-  let current: unknown = error;
-  for (let depth = 0; depth < 3; depth += 1) {
-    if (
-      typeof current === 'object' &&
-      current !== null &&
-      'code' in current &&
-      current.code === 'REVO_ACTIVATION_STATE_INCOMPATIBLE'
-    ) {
-      return current.code;
-    }
-    current =
-      typeof current === 'object' && current !== null && 'cause' in current
-        ? current.cause
-        : undefined;
-  }
-  return undefined;
-}
-
-function isUnconfirmed(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'ownership' in error &&
-    error.ownership === 'unconfirmed'
-  );
 }

@@ -11,7 +11,6 @@ import type {
   RevoConfiguration,
 } from '../configuration/configuration.types.js';
 import { buildCoreChildEnvironment } from '../core-host/core-child-environment.js';
-import type { ActivationBinding } from '../installation/activation-record.js';
 import { ServerOwnershipService } from '../processes/server-ownership.service.js';
 import { SERVER_HOST_PROTOCOL, type ServerHostStartMessage } from './server-host-protocol.js';
 import { ServerLaunchAttempt, type StartedServer } from './server-launch-attempt.js';
@@ -86,7 +85,6 @@ export class ServerLauncherService {
     const environment = buildCoreChildEnvironment(request.env).env;
     const operationId = randomBytes(16).toString('hex');
     const deadline = Date.now() + resolved.startupTimeout;
-    process.stderr.write(`server launcher spawning ${SERVER_ENTRY}\n`);
     const launched = await this.processes.start(
       {
         cwd: dirname(SERVER_ENTRY),
@@ -156,28 +154,8 @@ export class ServerLauncherService {
         runtimeDir: resolved.layout.runtimeDir,
         startupTimeout: resolved.startupTimeout,
         version: request.packageVersion,
-        ...activationFromEnvironment(request.env),
       },
       environment,
     };
   }
-}
-
-function activationFromEnvironment(
-  env: Readonly<Record<string, string | undefined>>,
-): { readonly activation: ActivationBinding } | Record<string, never> {
-  const channelRoot = env.REVO_ACTIVATION_CHANNEL_ROOT;
-  const generationId = env.REVO_ACTIVATION_GENERATION_ID;
-  if (channelRoot === undefined && generationId === undefined) {
-    return {};
-  }
-  if (
-    channelRoot === undefined ||
-    generationId === undefined ||
-    !channelRoot.startsWith('/') ||
-    !/^[a-f0-9]{64}$/u.test(generationId)
-  ) {
-    throw new Error('activation binding is invalid');
-  }
-  return { activation: { channelRoot, generationId } };
 }

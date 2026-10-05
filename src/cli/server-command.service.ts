@@ -23,8 +23,6 @@ import { PackageMetadataService } from './package-metadata.service.js';
 import { startNotPerformed } from './server-public-origin.js';
 
 const DIAGNOSTICS: Readonly<Record<string, string>> = {
-  REVO_ACTIVATION_STATE_INCOMPATIBLE:
-    'Installation activation format is incompatible. Keep your data and reinstall into a new installation directory.',
   START_BUSY: 'Server start is busy.',
   START_CANCELLED: 'Server start was cancelled.',
   START_FAILED: 'Server start failed.',

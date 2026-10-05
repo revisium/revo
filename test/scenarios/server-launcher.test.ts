@@ -202,33 +202,6 @@ describe('server launcher composition', () => {
     });
   });
 
-  it.each([
-    ['channel root only', { REVO_ACTIVATION_CHANNEL_ROOT: '/private/channel' }],
-    ['generation only', { REVO_ACTIVATION_GENERATION_ID: 'a'.repeat(64) }],
-    [
-      'bad generation',
-      {
-        REVO_ACTIVATION_CHANNEL_ROOT: '/private/channel',
-        REVO_ACTIVATION_GENERATION_ID: 'not-a-generation',
-      },
-    ],
-    [
-      'relative channel root',
-      {
-        REVO_ACTIVATION_CHANNEL_ROOT: 'private/channel',
-        REVO_ACTIVATION_GENERATION_ID: 'a'.repeat(64),
-      },
-    ],
-  ] as const)('rejects $0 activation binding before starting the server', async (_label, env) => {
-    const service = new ServerLauncherService(
-      resolverFor(configuration()),
-      statusFor({ kind: 'stopped' }),
-      processesFor(fakePort()),
-    );
-    await expect(service.launch(request({ env }))).rejects.toThrow('activation binding is invalid');
-    expect(attempt.start).not.toHaveBeenCalled();
-  });
-
   it('propagates a resolver rejection beyond the maximum startup timeout without any launch work', async () => {
     const status = statusFor({ kind: 'stopped' });
     const processes = processesFor(fakePort());
