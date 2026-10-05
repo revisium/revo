@@ -20,6 +20,7 @@ import {
   type InstallPlatform,
   type ReleaseChannel,
 } from '../../../installer/render-install-script.mjs';
+import { resolveRevoLayout } from '../../../src/layout.js';
 import {
   createFixtureCertificate,
   FixtureOrigin,
@@ -32,6 +33,7 @@ const NODE_VERSION = process.versions.node;
 const PNPM_VERSION = '12.8.2';
 const SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const FOREIGN_COMMAND = '#!/bin/sh\necho "not Revo"\n';
+const CHANNELS: readonly ReleaseChannel[] = ['stable', 'alpha'];
 
 export type ReleaseAsset = 'package' | 'lockfile' | 'workspace';
 
@@ -75,12 +77,16 @@ interface Toolchains {
 export class InstallMachine {
   private toolchains: Toolchains | undefined;
 
+  private workingDirectory: string;
+
   private constructor(
     private readonly root: string,
     private readonly certificate: FixtureCertificate,
     private readonly origin: FixtureOrigin,
     private readonly binDirOnPath: boolean,
-  ) {}
+  ) {
+    this.workingDirectory = this.home;
+  }
 
   static async create(options: { readonly binDirOnPath?: boolean } = {}): Promise<InstallMachine> {
     const root = await mkdtemp(join(tmpdir(), 'revo-install-machine-'));
@@ -145,7 +151,7 @@ export class InstallMachine {
 
   startInstall(release: FixtureRelease): RunningInstall {
     const child = spawn('/bin/sh', [], {
-      cwd: this.home,
+      cwd: this.workingDirectory,
       detached: true,
       env: this.installEnvironment(),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -188,6 +194,30 @@ export class InstallMachine {
     this.origin.restore(release.assetPath(asset));
   }
 
+  async killInstallDuringDependencyInstallation(release: FixtureRelease): Promise<void> {
+    const pnpm = await this.holdDependencyInstallation();
+    const install = this.startInstall(release);
+    await pnpm.started;
+    install.kill();
+    await install.finished;
+  }
+
+  async raceTwoInstallersForTheStaleLock(): Promise<void> {
+    await executable(
+      join(this.root, 'platform-bin', 'cat'),
+      staleLockReadBarrier(quote(this.control('stale-lock'))),
+    );
+  }
+
+  async workInProjectPinning(packageManager: string): Promise<void> {
+    this.workingDirectory = join(this.home, 'project');
+    await mkdir(this.workingDirectory, { recursive: true });
+    await writeFile(
+      join(this.workingDirectory, 'package.json'),
+      `${JSON.stringify({ name: 'user-project', packageManager })}\n`,
+    );
+  }
+
   async holdDependencyInstallation(): Promise<HeldDependencyInstallation> {
     await run('mkfifo', [this.control('pnpm-gate')]);
     return {
@@ -227,7 +257,7 @@ export class InstallMachine {
   }
 
   channelRoot(channel: ReleaseChannel): string {
-    return join(this.home, '.local', 'share', 'revo', channel);
+    return join(this.home, '.local', 'share', 'revo-install', channel);
   }
 
   privateNode(channel: ReleaseChannel): string {
@@ -267,6 +297,18 @@ export class InstallMachine {
 
   async homeEntries(): Promise<readonly string[]> {
     return sortedEntries(this.home);
+  }
+
+  async existingUserDirectories(): Promise<readonly string[]> {
+    const platform = process.platform === 'darwin' ? 'darwin' : 'linux';
+    const directories = CHANNELS.flatMap((channel) => {
+      const layout = resolveRevoLayout({ channel, env: {}, homeDir: this.home, platform });
+      return [layout.dataDir, layout.configDir, layout.stateDir, layout.cacheDir];
+    });
+    const existing = await Promise.all(
+      directories.map(async (directory) => ((await exists(directory)) ? [directory] : [])),
+    );
+    return existing.flat();
   }
 
   async commandLink(command: string): Promise<string | undefined> {
@@ -385,12 +427,16 @@ export class InstallMachine {
   private async pnpmArchive(): Promise<Buffer> {
     return this.archive('pnpm', '.', {
       pnpm: [
+        `if grep -q '"packageManager"' package.json 2>/dev/null && ! grep -q '"pnpm@${PNPM_VERSION}"' package.json; then`,
+        "  echo 'ERR_PNPM_OTHER_PM_EXPECTED: this project is configured to use another package manager' >&2",
+        '  exit 1',
+        'fi',
         `if [ "\${1:-}" = --version ]; then echo ${PNPM_VERSION}; exit 0; fi`,
         `printf '%s|%s\\n' "$(command -v node)" "$*" >> ${quote(this.control('pnpm-installs.log'))}`,
         '[ -f package.json ] && [ -f pnpm-lock.yaml ] && [ -f pnpm-workspace.yaml ] || exit 3',
         `if mv ${quote(this.control('pnpm-gate'))} ${quote(this.control('pnpm-held'))} 2>/dev/null; then`,
         `  : > ${quote(this.control('pnpm-started'))}`,
-        `  read -r _ < ${quote(this.control('pnpm-held'))}`,
+        `  { read -r _ < ${quote(this.control('pnpm-held'))}; } 2>/dev/null`,
         'fi',
         'mkdir -p node_modules && : > node_modules/.fixture-installed',
         '',
@@ -446,6 +492,44 @@ function quote(value: string): string {
 async function executable(path: string, body: string): Promise<void> {
   await writeFile(path, `#!/bin/sh\n${body}`);
   await chmod(path, 0o755);
+}
+
+// The second installer reads the stale owner before the first takes the lock over, and acts after.
+function staleLockReadBarrier(barrier: string): string {
+  return [
+    'case "${1:-}" in */.lock/pid) ;; *) exec /bin/cat "$@" ;; esac',
+    'wait_for() {',
+    '  tries=0',
+    '  until "$@"; do',
+    '    tries=$((tries + 1))',
+    '    [ "$tries" -lt 3000 ] || return 0',
+    '    sleep 0.01',
+    '  done',
+    '}',
+    'owner_changed() {',
+    '  current=$(/bin/cat "$1" 2>/dev/null) && [ -n "$current" ] && [ "$current" != "$stale" ]',
+    '}',
+    `if mkdir ${barrier}-first 2>/dev/null; then`,
+    `  wait_for test -d ${barrier}-second-read`,
+    '  exec /bin/cat "$1"',
+    'fi',
+    `if mkdir ${barrier}-second 2>/dev/null; then`,
+    '  stale=$(/bin/cat "$1") || exit 1',
+    `  mkdir ${barrier}-second-read`,
+    '  wait_for owner_changed "$1"',
+    `  printf '%s\\n' "$stale"`,
+    '  exit 0',
+    'fi',
+    'exec /bin/cat "$1"',
+    '',
+  ].join('\n');
+}
+
+async function exists(path: string): Promise<boolean> {
+  return access(path).then(
+    () => true,
+    () => false,
+  );
 }
 
 async function sortedEntries(directory: string): Promise<readonly string[]> {

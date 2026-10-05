@@ -4,6 +4,9 @@ import { InstallMachine } from '../support/installation/install-machine.js';
 
 const machines: InstallMachine[] = [];
 
+const INTERRUPTED_BEFORE_SWITCH =
+  'revo-alpha install: interrupted; the active version is unchanged, run the installer again.\n';
+
 afterEach(async () => {
   await Promise.all(machines.splice(0).map((machine) => machine.dispose()));
 });
@@ -84,7 +87,7 @@ describe('install.sh', { timeout: 60_000 }, () => {
     install.interrupt();
     const interrupted = await install.finished;
 
-    expect(interrupted.exitCode).toBe(130);
+    expect(interrupted).toMatchObject({ exitCode: 130, stderr: INTERRUPTED_BEFORE_SWITCH });
     expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
     expect(await machine.runCommand('revo-alpha', ['--version'])).toBe('0.1.0-alpha.1');
     expect(await machine.installerLeftovers('alpha')).toEqual([]);
@@ -105,7 +108,7 @@ describe('install.sh', { timeout: 60_000 }, () => {
     install.interrupt();
     const interrupted = await install.finished;
 
-    expect(interrupted.exitCode).toBe(130);
+    expect(interrupted).toMatchObject({ exitCode: 130, stderr: INTERRUPTED_BEFORE_SWITCH });
     expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
     expect(await machine.installedVersions('alpha')).toEqual(['0.1.0-alpha.1']);
     expect(await machine.installerLeftovers('alpha')).toEqual([]);
@@ -118,15 +121,32 @@ describe('install.sh', { timeout: 60_000 }, () => {
   it('takes over the lock of a killed installer and cleans its partial work', async () => {
     const machine = await cleanMachine();
     const release = await machine.publish('alpha', '0.1.0-alpha.1');
-    const pnpm = await machine.holdDependencyInstallation();
-    const install = machine.startInstall(release);
-    await pnpm.started;
-
-    install.kill();
-    await install.finished;
+    await machine.killInstallDuringDependencyInstallation(release);
     expect(await machine.installerLeftovers('alpha')).toEqual(['.lock', '.staging']);
 
     expect(await machine.install(release)).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+    expect(await machine.installerLeftovers('alpha')).toEqual([]);
+  });
+
+  it('lets only one of two installers take over the lock of a killed installer', async () => {
+    const machine = await cleanMachine();
+    const release = await machine.publish('alpha', '0.1.0-alpha.1');
+    await machine.killInstallDuringDependencyInstallation(release);
+    await machine.raceTwoInstallersForTheStaleLock();
+
+    const results = await Promise.all([machine.install(release), machine.install(release)]);
+
+    expect(results.map(({ exitCode, stderr }) => ({ exitCode, stderr }))).toEqual(
+      expect.arrayContaining([
+        { exitCode: 0, stderr: '' },
+        {
+          exitCode: 1,
+          stderr:
+            'revo-alpha install: another installation of Revo alpha started at the same time.\n',
+        },
+      ]),
+    );
     expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
     expect(await machine.installerLeftovers('alpha')).toEqual([]);
   });
@@ -251,6 +271,27 @@ describe('install.sh', { timeout: 60_000 }, () => {
     expect(await machine.commandLink('revo-alpha')).toBe(
       machine.commandTarget('alpha', 'revo-alpha'),
     );
+  });
+
+  it('keeps the program out of every channel data, configuration, state and cache directory', async () => {
+    const machine = await cleanMachine();
+
+    await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+    await machine.install(await machine.publish('stable', '1.0.0'));
+
+    expect(await machine.runCommand('revo-alpha', ['--version'])).toBe('0.1.0-alpha.1');
+    expect(await machine.runCommand('revo', ['--version'])).toBe('1.0.0');
+    expect(await machine.existingUserDirectories()).toEqual([]);
+  });
+
+  it('installs from a project directory that pins another package manager', async () => {
+    const machine = await cleanMachine();
+    await machine.workInProjectPinning('npm@10.9.0');
+
+    const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
   });
 
   it('refuses to replace a command it did not create', async () => {

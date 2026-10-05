@@ -83,7 +83,7 @@ require_tools() {
 
 locate_installation() {
   [ -n "${HOME:-}" ] || fail 'HOME is not set.'
-  install_root=${REVO_INSTALL_ROOT:-$HOME/.local/share/revo}
+  install_root=${REVO_INSTALL_ROOT:-$HOME/.local/share/revo-install}
   case "$install_root" in /*) ;; *) fail 'REVO_INSTALL_ROOT must be an absolute path.' ;; esac
   channel_root=$install_root/$channel
   node_home=$channel_root/node/$node_version
@@ -91,6 +91,7 @@ locate_installation() {
   version_home=$channel_root/versions/$version
   staging=$channel_root/.staging
   lock=$channel_root/.lock
+  takeover=$lock.takeover
   bin_dir=$HOME/.local/bin
   command_link=$bin_dir/$command_name
   command_target=$channel_root/current/bin/$command_name
@@ -105,19 +106,27 @@ check_command_link() {
   fi
 }
 
+take_over_stale_lock() {
+  owner=$(cat "$lock/pid" 2>/dev/null) || owner=
+  [ -n "$owner" ] ||
+    fail "another installation of $product may be running; if it is not, remove $lock and run the installer again."
+  ! kill -0 "$owner" 2>/dev/null || fail "another installation of $product is running (pid $owner)."
+  mkdir "$takeover" 2>/dev/null ||
+    fail "another installation of $product may be running; if it is not, remove $takeover and run the installer again."
+  takeover_held=1
+  if [ "$(cat "$lock/pid" 2>/dev/null)" = "$owner" ]; then
+    rm -rf "$lock"
+  fi
+  mkdir "$lock" 2>/dev/null
+  taken=$?
+  rmdir "$takeover"
+  takeover_held=0
+  [ "$taken" -eq 0 ] || fail "another installation of $product started at the same time."
+}
+
 acquire_lock() {
   mkdir -p "$channel_root" || fail "cannot create $channel_root."
-  if ! mkdir "$lock" 2>/dev/null; then
-    owner=$(cat "$lock/pid" 2>/dev/null) || owner=
-    if [ -z "$owner" ]; then
-      fail "another installation of $product may be running; if it is not, remove $lock and run the installer again."
-    fi
-    if kill -0 "$owner" 2>/dev/null; then
-      fail "another installation of $product is running (pid $owner)."
-    fi
-    rm -rf "$lock"
-    mkdir "$lock" 2>/dev/null || fail "another installation of $product started at the same time."
-  fi
+  mkdir "$lock" 2>/dev/null || take_over_stale_lock
   lock_held=1
   printf '%s\n' "$$" >"$lock/pid" || fail "cannot write $lock/pid."
   rm -rf "$staging" || fail "cannot remove $staging."
@@ -125,9 +134,15 @@ acquire_lock() {
 }
 
 cleanup() {
-  if [ "$lock_held" = 1 ]; then
-    rm -rf "$staging" "$lock"
-  fi
+  [ "$takeover_held" = 0 ] || rmdir "$takeover"
+  [ "$lock_held" = 0 ] || rm -rf "$staging" "$lock"
+}
+
+interrupted() {
+  outcome='the active version is unchanged'
+  [ "$activated" = 0 ] || outcome="$product $version is active"
+  printf '%s install: interrupted; %s, run the installer again.\n' "$command_name" "$outcome" >&2
+  exit "$1"
 }
 
 read_active_version() {
@@ -191,7 +206,7 @@ install_toolchain() {
   fi
   if [ -f "$staging/pnpm.tar.gz" ]; then
     unpack "$staging/pnpm.tar.gz" "$staging/pnpm"
-    [ "$("$staging/pnpm/pnpm" --version 2>/dev/null)" = "$pnpm_version" ] ||
+    [ "$(cd / && "$staging/pnpm/pnpm" --version 2>/dev/null)" = "$pnpm_version" ] ||
       fail "pnpm $pnpm_version does not run on this machine."
     publish "$staging/pnpm" "$pnpm_home"
   fi
@@ -227,6 +242,7 @@ activate_version() {
   ln -s "versions/$version" "$staging/current" || fail "cannot link $product $version."
   "$node_home/bin/node" -e 'require("fs").renameSync(process.argv[1], process.argv[2])' \
     "$staging/current" "$channel_root/current" || fail "cannot switch to $product $version."
+  activated=1
 }
 
 link_command() {
@@ -255,12 +271,12 @@ print_next_step() {
 }
 
 main() {
-  lock_held=0
+  lock_held=0 takeover_held=0 activated=0
   define_release
   trap cleanup EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'interrupted 129' HUP
+  trap 'interrupted 130' INT
+  trap 'interrupted 143' TERM
   detect_platform
   require_tools
   locate_installation

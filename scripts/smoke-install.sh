@@ -1,5 +1,6 @@
 #!/bin/sh
-# Smoke test of a Revo installation in a throwaway HOME without host Node.js or pnpm.
+# Smoke test of a Revo installation in a throwaway HOME without host Node.js or pnpm, run from a
+# project directory that pins another package manager.
 # Usage:
 #   scripts/smoke-install.sh <install script URL>
 #   scripts/smoke-install.sh --bundle <directory>
@@ -95,7 +96,8 @@ PY
 }
 
 prepare_home() {
-  mkdir -p "$home" "$host_bin"
+  mkdir -p "$home" "$host_bin" "$project"
+  printf '{ "packageManager": "npm@10.9.0" }\n' >"$project/package.json"
   for tool in node pnpm npm npx corepack; do
     printf '#!/bin/sh\necho %s >>"%s/host-tools.log"\nexit 97\n' "$tool" "$work" >"$host_bin/$tool"
     chmod 755 "$host_bin/$tool"
@@ -111,7 +113,7 @@ select_command() {
 }
 
 install_revo() {
-  clean_env curl --fail --silent --show-error --location --proto =https "$script_url" | clean_env sh
+  (cd "$project" && clean_env curl --fail --silent --show-error --location --proto =https "$script_url" | clean_env sh)
 }
 
 check_fresh_install() {
@@ -223,6 +225,7 @@ main() {
   work=$(mktemp -d /tmp/revo-smoke.XXXXXX)
   home=$work/home
   host_bin=$work/host-bin
+  project=$work/project
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM

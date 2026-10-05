@@ -45,9 +45,9 @@ keeps the previous version until you restart it with `revo-alpha server stop` an
 
 ### Where Revo lives
 
-The program lives in `~/.local/share/revo/alpha` (`$REVO_INSTALL_ROOT/alpha` when that variable is
-set): private Node.js and pnpm, one directory per installed version, and the `current` link to the
-active version. User data is stored separately and the installer never touches it:
+The program lives in `~/.local/share/revo-install/alpha` (`$REVO_INSTALL_ROOT/alpha` when that
+variable is set): private Node.js and pnpm, one directory per installed version, and the `current`
+link to the active version. User data is stored separately and the installer never touches it:
 
 | Platform | Data, configuration, state, and logs                                                                    |
 | -------- | ------------------------------------------------------------------------------------------------------- |
@@ -63,7 +63,7 @@ Stop the server, then remove the program and the command:
 
 ```sh
 revo-alpha server stop
-rm -rf ~/.local/share/revo/alpha ~/.local/bin/revo-alpha
+rm -rf ~/.local/share/revo-install/alpha ~/.local/bin/revo-alpha
 ```
 
 Your data stays in place. To remove it as well, which cannot be undone, delete the data directories
