@@ -74,11 +74,12 @@ export class CoreChildEntry {
       }
       this.runner = runner;
       this.pending.splice(0).forEach((message) => runner.receive(message));
-    } catch {
+    } catch (error) {
       if (this.disconnected) {
         this.finish(0);
         return;
       }
+      await logLoadFailure(error);
       await this.fail();
     }
   }
@@ -112,5 +113,14 @@ export class CoreChildEntry {
     if (this.processPort.connected()) {
       this.processPort.disconnect();
     }
+  }
+}
+
+async function logLoadFailure(error: unknown): Promise<void> {
+  try {
+    const { RevoConsoleLogger } = await import('../server-logs/revo-console-logger.js');
+    new RevoConsoleLogger('RevoCore').failure('Revo Core host failed to load', error);
+  } catch {
+    // The failure itself is still reported to the server below.
   }
 }

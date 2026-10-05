@@ -27,6 +27,13 @@ export class ProgressOutputScenario {
     return this.output.sink(event);
   }
 
+  async writeDrained() {
+    const pending = this.write();
+    await Promise.resolve();
+    this.drain();
+    return pending;
+  }
+
   drain() {
     this.callback?.();
   }

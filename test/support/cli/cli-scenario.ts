@@ -1,7 +1,7 @@
 // oxlint-disable-next-line import/no-unassigned-import -- decorators require this side effect first
 import 'reflect-metadata';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +24,19 @@ export interface CliResult {
 }
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const BUILT_CLI = resolve(REPOSITORY_ROOT, 'dist/bin/revo.js');
+export const BUILT_CLI = resolve(REPOSITORY_ROOT, 'dist/bin/revo.js');
+
+/** A private home keeps ambient product state out of a built CLI run. */
+export function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
+  return {
+    HOME: home,
+    PATH: process.env.PATH ?? '',
+    XDG_CACHE_HOME: `${home}/cache`,
+    XDG_CONFIG_HOME: `${home}/config`,
+    XDG_DATA_HOME: `${home}/data`,
+    XDG_STATE_HOME: `${home}/state`,
+  };
+}
 
 export class CliScenario {
   private constructor() {}
@@ -60,16 +72,10 @@ export class CliScenario {
 
   /** Runs the built CLI against a private home so ambient product state is never observed. */
   static async runIsolated(args: readonly string[]): Promise<CliResult> {
-    const home = await mkdtemp(`${tmpdir()}/revo-home-`);
+    // A canonical home keeps private server logs usable where tmpdir is behind a symlink.
+    const home = await mkdtemp(`${await realpath(tmpdir())}/revo-home-`);
     try {
-      return await this.run(args, {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
-        XDG_CACHE_HOME: `${home}/cache`,
-        XDG_CONFIG_HOME: `${home}/config`,
-        XDG_DATA_HOME: `${home}/data`,
-        XDG_STATE_HOME: `${home}/state`,
-      });
+      return await this.run(args, isolatedEnvironment(home));
     } finally {
       await rm(home, { recursive: true, force: true });
     }

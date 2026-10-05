@@ -22,6 +22,38 @@ describe('server launch process adapter', () => {
     expect(subject.managedProcessRequests()).toEqual([subject.expectedManagedProcessRequest()]);
   });
 
+  it('appends the detached server output to its private server log', async () => {
+    const subject = await ServerLaunchProcessScenario.create();
+    await subject.startLogged();
+    await subject.booted();
+
+    const log = await subject.serverLog();
+
+    expect(log.mode).toBe(0o600);
+    expect(log.text).toMatch(/^--- Revo server start \S+ ---\n/u);
+    expect(log.text).toContain('server stdout line\n');
+    expect(log.text).toContain('server stderr line\n');
+    expect(subject.warnings).toEqual([]);
+  });
+
+  it('starts with discarded output and one warning when the server log is a symlink', async () => {
+    const subject = await ServerLaunchProcessScenario.create();
+    await subject.plantSymlinkedLog();
+    await subject.startLogged();
+    await subject.booted();
+
+    expect(subject.managedProcessRequests()[0]?.stdio).toEqual({
+      stderr: 'ignore',
+      stdin: 'ignore',
+      stdout: 'ignore',
+    });
+    expect(subject.warnings).toEqual([
+      expect.stringMatching(
+        /^Warning: server output is not logged; .*server\.log is unavailable\.$/u,
+      ),
+    ]);
+  });
+
   it('stops and reaps the managed process when adapter construction is missing a capability', async () => {
     const outcome = await launchWithMissingCapability();
 

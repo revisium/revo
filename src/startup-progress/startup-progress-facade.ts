@@ -4,6 +4,7 @@ import {
   type ProgressCounters,
   type ProgressEvent,
 } from '../progress/index.js';
+import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import { StartupProgressJournalWriter } from './startup-progress-journal.service.js';
 import {
   TERMINAL_PROGRESS_RESERVE_BYTES,
@@ -12,6 +13,8 @@ import {
   type StartupProgressOptions,
   type StartupReadyContext,
 } from './startup-progress.types.js';
+
+const logger = new RevoConsoleLogger('StartupProgress');
 
 export class OwnedStartupProgress implements StartupProgressFacade {
   private readonly operation: ProgressOperation;
@@ -98,6 +101,10 @@ export class OwnedStartupProgress implements StartupProgressFacade {
         this.lastPersistedSequence = event.sequence;
         return event;
       } catch (error) {
+        if (skippable(error, event)) {
+          logger.warn('Skipped a startup progress journal write; the next write retries it.');
+          return event;
+        }
         this.disabled = true;
         if (
           error instanceof StartupProgressError &&
@@ -168,4 +175,9 @@ export class OwnedStartupProgress implements StartupProgressFacade {
       context,
     );
   }
+}
+
+function skippable(error: unknown, event: ProgressEvent): boolean {
+  const reason = error instanceof StartupProgressError ? error.reason : 'io';
+  return reason === 'io' && event.status !== 'failed';
 }

@@ -44,6 +44,15 @@ const handleMessage = async (message) => {
     if (mode === 'exit-before-listening') {
       process.exit(8);
     }
+    if (mode === 'echo-credentials') {
+      const password = new URL(message.databaseUrl).password;
+      process.stdout.write(`Core echoed ${message.databaseUrl}\n`);
+      process.stderr.write(`Core password ${password.slice(0, 3)}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      process.stderr.write(`${password.slice(3)} decoded ${decodeURIComponent(password)}\n`);
+      process.send?.({ protocol: 'revo-core-host/v1', type: 'failed', code: 'CORE_HOST_FAILED' });
+      return;
+    }
     if (mode === 'failed-then-listening') {
       process.send?.({ protocol: 'revo-core-host/v1', type: 'failed', code: 'CORE_HOST_FAILED' });
     }

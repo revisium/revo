@@ -6,6 +6,7 @@ import { ProgressOperation, type ProgressEvent } from '../../../src/progress/ind
 import {
   ServerStartupObserver,
   type ServerProgressSink,
+  type StartupObserverTiming,
 } from '../../../src/server/server-startup-observer.js';
 import {
   StartupProgressDiscoveryService,
@@ -17,9 +18,18 @@ import {
   ServerLaunchAttemptScenario,
 } from './server-launch-attempt-scenario.js';
 
+export const FAST: StartupObserverTiming = { deliveryMs: 50, drainMs: 200, pollMs: 5 };
+export const JOURNAL_WARNING =
+  'Warning: skipped startup progress because the progress journal could not be read in time.';
+export const OUTPUT_WARNING =
+  'Warning: skipped startup progress because progress output could not be written in time.';
+
+type JournalRead = 'fail' | 'hang';
+
 export class ServerStartupObserverScenario {
   readonly attempt = new ServerLaunchAttemptScenario();
   readonly events: ProgressEvent[] = [];
+  readonly warnings: string[] = [];
   readonly operation = new ProgressOperation({ operationId: OPERATION_ID, now: () => 0 });
   reads = 0;
   observedReady = false;
@@ -34,22 +44,60 @@ export class ServerStartupObserverScenario {
     return this;
   }
 
+  static async reuse(
+    url: string | undefined,
+    sink?: ServerProgressSink,
+  ): Promise<{ outcome: string; events: ProgressEvent[]; warnings: string[] }> {
+    const events: ProgressEvent[] = [];
+    const warnings: string[] = [];
+    const observer = new ServerStartupObserver(
+      new StartupProgressDiscoveryService(),
+      (message) => warnings.push(message),
+      FAST,
+    );
+    const outcome = await observer
+      .reused(
+        url,
+        sink ??
+          ((event) => {
+            events.push(event);
+          }),
+        'f'.repeat(32),
+      )
+      .then(
+        () => 'resolved',
+        () => 'rejected',
+      );
+    return { outcome, events, warnings };
+  }
+
   start(
     sink: ServerProgressSink = (event) => {
       this.events.push(event);
     },
+    options: { readonly read?: JournalRead; readonly timing?: StartupObserverTiming } = {},
   ) {
     const pending = this.attempt.start();
     const discovery = new StartupProgressDiscoveryService();
-    const observer = new ServerStartupObserver({
-      read: async (dataDir, cursor) => {
-        const snapshot = await discovery.read(dataDir, cursor);
-        this.reads += 1;
-        this.observedReady ||=
-          snapshot.kind === 'events' && snapshot.events.some((event) => event.status === 'ready');
-        return snapshot;
+    const observer = new ServerStartupObserver(
+      {
+        read: async (dataDir, cursor) => {
+          if (options.read === 'fail') {
+            throw new Error('private journal failure');
+          }
+          if (options.read === 'hang') {
+            return new Promise<never>(() => undefined);
+          }
+          const snapshot = await discovery.read(dataDir, cursor);
+          this.reads += 1;
+          this.observedReady ||=
+            snapshot.kind === 'events' && snapshot.events.some((event) => event.status === 'ready');
+          return snapshot;
+        },
       },
-    });
+      (message) => this.warnings.push(message),
+      options.timing,
+    );
     return observer.observe(pending, {
       dataDir: this.dataDir,
       operationId: OPERATION_ID,
@@ -75,6 +123,10 @@ export class ServerStartupObserverScenario {
   async ready() {
     this.operation.ready({ url: PUBLIC_URL });
     await this.publish();
+    await this.readyOverIpcOnly();
+  }
+
+  async readyOverIpcOnly() {
     this.attempt.booted();
     this.attempt.deliver('start');
     await Promise.resolve();

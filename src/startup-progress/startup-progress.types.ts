@@ -50,8 +50,11 @@ export interface StartupProgressFacade {
 
 export class StartupProgressError extends Error {
   readonly code = 'STARTUP_PROGRESS_ERROR';
-  constructor(readonly reason: 'closed' | 'invalid' | 'limit' | 'io') {
-    super('Startup progress journal failed');
+  constructor(
+    readonly reason: 'closed' | 'invalid' | 'limit' | 'io',
+    options?: ErrorOptions,
+  ) {
+    super('Startup progress journal failed', options);
     this.name = 'StartupProgressError';
   }
 }

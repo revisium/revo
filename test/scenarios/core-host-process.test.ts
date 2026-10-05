@@ -43,6 +43,25 @@ describe('Core host process resource', () => {
     expect(() => resource.assertRunning()).not.toThrow();
   });
 
+  it('forwards Core output to the server log with database credentials redacted', async () => {
+    const password = 's3cr3t/pass@word';
+    const { resource, output } = scenario.logged('echo-credentials');
+
+    await expect(
+      scenario.start(resource, {
+        databaseUrl: `postgresql://postgres:${encodeURIComponent(password)}@127.0.0.1:5432/revo`,
+      }),
+    ).rejects.toMatchObject({ code: 'revo.core-host.failed' });
+    await resource.settled();
+
+    await until(() => output.text().includes('decoded'));
+    expect(output.text()).toContain(
+      'Core echoed postgresql://postgres:[REDACTED]@127.0.0.1:5432/revo\n',
+    );
+    expect(output.text()).toContain('Core password [REDACTED] decoded [REDACTED]\n');
+    expect(output.text()).not.toContain('s3cr3t');
+  });
+
   it('aborts after spawn but before boot and confirms the owned child exit', async () => {
     const resource = scenario.resource('delayed-boot');
     const controller = new AbortController();

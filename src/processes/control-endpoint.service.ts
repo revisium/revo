@@ -1,10 +1,14 @@
 import { timingSafeEqual } from 'node:crypto';
-import { lstat, mkdir } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute } from 'node:path';
 
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 
+import {
+  CONTROL_SOCKET_ROOT,
+  DEFAULT_CONTROL_SOCKET_ROOT,
+  prepareControlEndpoint,
+} from './control-endpoint.directory.js';
 import {
   DEFAULT_CONTROL_LIMITS,
   type ControlLimits,
@@ -20,7 +24,7 @@ import {
   ControlTransportError,
   parseControlRequest,
   parseControlRecord,
-  validEndpointPath,
+  validInstanceId,
   validateLimits,
 } from './control-protocol.js';
 
@@ -35,11 +39,23 @@ interface ServeOptions {
 
 @Injectable()
 export class ControlEndpointService {
+  constructor(
+    @Optional()
+    @Inject(CONTROL_SOCKET_ROOT)
+    private readonly socketRoot: string = DEFAULT_CONTROL_SOCKET_ROOT,
+  ) {}
+
   async listen(request: ListenControlEndpointRequest): Promise<HeldControlEndpoint> {
     const limits = request.limits ?? DEFAULT_CONTROL_LIMITS;
     validateLimits(limits);
-    const record = this.record(request);
-    await ensurePrivateDirectory(request.runtimeDir);
+    validateLocation(request);
+    const endpoint = await prepareControlEndpoint(this.socketRoot, {
+      runtimeDir: request.runtimeDir,
+      instanceId: request.instanceId,
+      channel: request.identity.channel,
+      canonicalDataDir: request.identity.canonicalDataDir,
+    });
+    const record = this.record(request, endpoint);
     const server = createServer();
     const sockets = new Set<Socket>();
     const stop = stopOutcome();
@@ -140,9 +156,7 @@ export class ControlEndpointService {
     };
   }
 
-  private record(request: ListenControlEndpointRequest): ControlRecord {
-    const endpoint = join(request.runtimeDir, `c-${request.instanceId}.sock`);
-    validateEndpointPath(endpoint);
+  private record(request: ListenControlEndpointRequest, endpoint: string): ControlRecord {
     const record = {
       schemaVersion: 1 as const,
       instanceId: request.instanceId,
@@ -253,26 +267,12 @@ function authorized(instanceId: string, token: string, record: ControlRecord): b
   );
 }
 
-async function ensurePrivateDirectory(directory: string): Promise<void> {
-  if (!isAbsolute(directory) || directory.includes('\0')) {
+function validateLocation(request: ListenControlEndpointRequest): void {
+  if (!isAbsolute(request.runtimeDir) || request.runtimeDir.includes('\0')) {
     throw new ControlTransportError('Invalid runtime directory');
   }
-  try {
-    await mkdir(directory, { mode: 0o700, recursive: true });
-  } catch (error) {
-    if (errorCode(error) !== 'EEXIST') {
-      throw new ControlTransportError();
-    }
-  }
-  const state = await lstat(directory).catch(() => undefined);
-  if (!state?.isDirectory() || state.uid !== process.getuid?.() || (state.mode & 0o077) !== 0) {
-    throw new ControlTransportError('Runtime directory is not private');
-  }
-}
-
-function validateEndpointPath(endpoint: string): void {
-  if (!validEndpointPath(endpoint)) {
-    throw new ControlTransportError('Invalid control endpoint path');
+  if (!validInstanceId(request.instanceId)) {
+    throw new ControlTransportError('Invalid control record');
   }
 }
 
@@ -404,5 +404,3 @@ function deferred<T>() {
   const promise = new Promise<T>((settle) => (resolve = settle));
   return { promise, resolve };
 }
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

@@ -2,8 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ProgressOperation } from '../../src/progress/index.js';
 import type { ServerProgressSink } from '../../src/server/server-startup-observer.js';
-import { PUBLIC_URL } from '../support/server/server-launch-attempt-scenario.js';
-import { ServerStartupObserverScenario } from '../support/server/server-startup-observer-scenario.js';
+import { OPERATION_ID, PUBLIC_URL } from '../support/server/server-launch-attempt-scenario.js';
+import {
+  FAST,
+  JOURNAL_WARNING,
+  OUTPUT_WARNING,
+  ServerStartupObserverScenario,
+} from '../support/server/server-startup-observer-scenario.js';
 
 describe('startup journal observation of a real launch attempt', () => {
   let scenario: ServerStartupObserverScenario;
@@ -80,7 +85,7 @@ describe('startup journal observation of a real launch attempt', () => {
   );
 
   it.each(['throw', 'reject', 'hang'] as const)(
-    'disables a sink on %s without disrupting commit',
+    'skips progress output that fails by %s and still reports the committed start',
     async (failure) => {
       scenario = await new ServerStartupObserverScenario().open();
       scenario.operation.start('server-start');
@@ -93,17 +98,98 @@ describe('startup journal observation of a real launch attempt', () => {
           ? Promise.reject(new Error('private'))
           : new Promise<void>(() => undefined);
       });
-      const result = scenario.start(sink);
+      const result = scenario.start(sink, { timing: FAST });
       await vi.waitFor(() => expect(sink).toHaveBeenCalledTimes(1));
       await scenario.ready();
       scenario.attempt.committed();
-      await expect(result).rejects.toMatchObject({ code: 'START_PROGRESS_OUTPUT_FAILED' });
-      expect(sink).toHaveBeenCalledTimes(1);
+      await expect(result).resolves.toEqual({ kind: 'started', url: PUBLIC_URL });
+      expect(sink).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'ready' }));
+      expect(scenario.warnings).toEqual([OUTPUT_WARNING]);
       expect(scenario.attempt.process.detachCommittedCalls).toBe(1);
       expect(scenario.attempt.process.stopCalls).toBe(0);
       expect(scenario.attempt.process.abandonUncertainCalls).toBe(0);
     },
   );
+
+  it.each(['fail', 'hang'] as const)(
+    'reports the committed start with a synthesized ready when journal reads %s',
+    async (read) => {
+      scenario = await new ServerStartupObserverScenario().open();
+      const result = scenario.start(undefined, { read, timing: FAST });
+      await scenario.readyOverIpcOnly();
+      scenario.attempt.committed();
+
+      await expect(result).resolves.toEqual({ kind: 'started', url: PUBLIC_URL });
+      expect(scenario.events).toEqual([
+        expect.objectContaining({ operationId: OPERATION_ID, sequence: 1, status: 'ready' }),
+      ]);
+      expect(scenario.warnings).toEqual([JOURNAL_WARNING]);
+    },
+  );
+
+  it('continues the journal sequence when the journal never records ready', async () => {
+    scenario = await new ServerStartupObserverScenario().open();
+    scenario.operation.start('postgres-start');
+    scenario.operation.complete('postgres-start');
+    await scenario.publish();
+    const result = scenario.start();
+    await vi.waitFor(() => expect(scenario.events).toHaveLength(2));
+    await scenario.readyOverIpcOnly();
+    scenario.attempt.committed();
+
+    await expect(result).resolves.toEqual({ kind: 'started', url: PUBLIC_URL });
+    const [, completed, ready] = scenario.events;
+    expect(ready).toMatchObject({ sequence: 3, status: 'ready', url: PUBLIC_URL });
+    expect(ready?.elapsedMs).toBeGreaterThanOrEqual(completed?.elapsedMs ?? 0);
+    expect(scenario.warnings).toEqual([]);
+  });
+
+  it('gives the final ready delivery seconds instead of a quarter second', async () => {
+    scenario = await new ServerStartupObserverScenario().open();
+    const sink = vi.fn<ServerProgressSink>(
+      () => new Promise<void>((resolve) => setTimeout(resolve, 400)),
+    );
+    const result = scenario.start(sink);
+    await scenario.ready();
+    scenario.attempt.committed();
+
+    await expect(result).resolves.toEqual({ kind: 'started', url: PUBLIC_URL });
+    expect(sink).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status: 'ready' }));
+    expect(scenario.warnings).toEqual([]);
+  });
+
+  it('never emits a journal failure for a start that committed', async () => {
+    scenario = await new ServerStartupObserverScenario().open();
+    scenario.operation.start('server-start');
+    scenario.operation.fail('server-start', { code: 'PROGRESS_JOURNAL_LIMIT' });
+    await scenario.publish();
+    const result = scenario.start();
+    await vi.waitFor(() => expect(scenario.reads).toBeGreaterThanOrEqual(2));
+    await scenario.readyOverIpcOnly();
+    scenario.attempt.committed();
+
+    await expect(result).resolves.toEqual({ kind: 'started', url: PUBLIC_URL });
+    expect(scenario.events.map(({ sequence, status }) => `${String(sequence)}:${status}`)).toEqual([
+      '1:started',
+      '3:ready',
+    ]);
+  });
+
+  it('emits the journal failure before rejecting a failed start', async () => {
+    scenario = await new ServerStartupObserverScenario().open();
+    scenario.operation.start('postgres-start');
+    scenario.operation.fail('postgres-start', { code: 'POSTGRES_PROCESS' });
+    await scenario.publish();
+    const result = scenario.start();
+    await vi.waitFor(() => expect(scenario.reads).toBeGreaterThanOrEqual(2));
+    scenario.attempt.booted();
+    scenario.attempt.deliver('start');
+    await Promise.resolve();
+    scenario.attempt.failed('SERVER_HOST_FAILED', 'completed');
+
+    await expect(result).rejects.toMatchObject({ code: 'START_FAILED', cleanup: 'completed' });
+    expect(scenario.events.map(({ status }) => status)).toEqual(['started', 'failed']);
+  });
 
   it('keeps startup failure and cleanup primary when the sink also fails', async () => {
     scenario = await new ServerStartupObserverScenario().open();
@@ -119,5 +205,23 @@ describe('startup journal observation of a real launch attempt', () => {
     await Promise.resolve();
     scenario.attempt.failed('SERVER_HOST_FAILED', 'completed');
     await expect(result).rejects.toMatchObject({ code: 'START_FAILED', cleanup: 'completed' });
+  });
+});
+
+describe('progress for a server that is already running', () => {
+  it('reports reuse with a warning when progress output fails', async () => {
+    const reused = await ServerStartupObserverScenario.reuse(PUBLIC_URL, () => {
+      throw new Error('private output failure');
+    });
+
+    expect(reused).toEqual({ outcome: 'resolved', events: [], warnings: [OUTPUT_WARNING] });
+  });
+
+  it('reports reuse with a warning when the running server has no public URL', async () => {
+    const reused = await ServerStartupObserverScenario.reuse(undefined);
+
+    expect(reused.outcome).toBe('resolved');
+    expect(reused.events).toEqual([]);
+    expect(reused.warnings).toEqual([expect.stringContaining('did not report its URL')]);
   });
 });

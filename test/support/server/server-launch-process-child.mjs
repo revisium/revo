@@ -6,6 +6,10 @@ const eventsPath = process.env.REVO_LAUNCH_PROCESS_EVENTS;
 if (!eventsPath || typeof process.send !== 'function') {
   process.exitCode = 2;
 } else {
+  if (process.env.REVO_LAUNCH_PROCESS_OUTPUT === '1') {
+    process.stdout.write('server stdout line\n');
+    process.stderr.write('server stderr line\n');
+  }
   process.send({ protocol: PROTOCOL, type: 'booted' });
   process.on('message', (message) => {
     void handleMessage(message);

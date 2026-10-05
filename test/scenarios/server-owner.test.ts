@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ServerOwnerScenario } from '../support/server/server-owner-scenario.js';
+import { EMBEDDED_REFUSAL, ServerOwnerScenario } from '../support/server/server-owner-scenario.js';
 
 const REAL_OWNER_START_TIMEOUT_MS = 125_000;
 const REAL_OWNER_RESTART_TIMEOUT_MS = 255_000;
@@ -88,6 +88,76 @@ describe('Server owner composition', () => {
       expect.arrayContaining(['SERVER_STARTING', 'SERVER_START_FAILED']),
     );
   });
+
+  it('logs why no private control socket directory is usable', async () => {
+    const result = await scenario.logsWhyNoControlSocketDirectoryIsUsable();
+
+    expect(result.opened).toBe('rejected');
+    expect(result.log).toMatch(
+      /ERROR \[ServerOwner\] Server could not open its data directory and control endpoint: .*No private control socket directory is usable: \S*not-a-directory\S*: [^;\n]+; .*Revo Alpha\/state\/run: socket path exceeds \d+ bytes/u,
+    );
+  });
+
+  it('blames the file system, not Revo Core, when Core directories cannot be prepared', async () => {
+    const result = await scenario.failsToPrepareCoreDirectories();
+
+    expect(result.start).toMatchObject({ code: 'revo.server-owner.filesystem' });
+    expect(result.coreStarts).toBe(0);
+    expect(result.log).toMatch(
+      /ERROR \[ServerOwner\] Server start failed: a file system operation failed \(E[A-Z]+: [^)]*\/core\/(?:sessions|work)'\)\./u,
+    );
+    expect(result.log).not.toContain('Revo Core did not start');
+  });
+
+  it('logs the embedded PostgreSQL reason and its log path when PostgreSQL refuses', async () => {
+    const result = await scenario.failsWhenEmbeddedPostgresRefuses();
+
+    expect(result.start).toMatchObject({
+      code: 'revo.server-owner.database',
+      databaseFailure: { reason: 'locked', ...EMBEDDED_REFUSAL },
+    });
+    expect(result.log).toContain(
+      `ERROR [ServerOwner] Server start failed: the database did not start (embedded PostgreSQL locked failure: ${EMBEDDED_REFUSAL.detail}; PostgreSQL log: ${EMBEDDED_REFUSAL.logPath}).`,
+    );
+  });
+
+  it('reports an unusable embedded credential as a database failure', async () => {
+    const result = await scenario.failsOnUnusableEmbeddedCredential();
+
+    expect(result.start).toMatchObject({
+      code: 'revo.server-owner.database',
+      databaseFailure: { code: 'EMBEDDED_POSTGRES_ERROR', reason: 'invalid' },
+    });
+    expect(result.coreStarts).toBe(0);
+    expect(result.log).toContain(
+      'Server start failed: the database did not start (embedded PostgreSQL invalid failure).',
+    );
+  });
+
+  it('does not blame Revo Core for an unclassified start failure', async () => {
+    const result = await scenario.failsWhenReadyJournalIsFull();
+
+    expect(result.start).toMatchObject({ code: 'revo.server-owner.unexpected' });
+    expect(result.log).toContain(
+      'Server start failed: an unexpected error occurred (StartupProgressError: Startup progress journal failed).',
+    );
+  });
+
+  it(
+    'never logs the generated database password and logs a readable Core failure',
+    async () => {
+      const result = await scenario.failsWithCredentialEchoingCore();
+
+      expect(result.start).toMatchObject({ code: 'revo.server-owner.core' });
+      expect(result.password.length).toBeGreaterThan(16);
+      expect(result.log).toContain('Core echoed postgresql://postgres:[REDACTED]@127.0.0.1:');
+      expect(result.log).toContain('Core password [REDACTED] decoded [REDACTED]');
+      expect(result.log).toMatch(/ERROR \[ServerOwner\] Server start failed: Revo Core/u);
+      expect(result.log).not.toContain(result.password);
+      expect(result.log).not.toContain(encodeURIComponent(result.password));
+    },
+    REAL_OWNER_START_TIMEOUT_MS,
+  );
 
   it(
     'starts real embedded PostgreSQL and Core before publishing readiness',

@@ -1,3 +1,6 @@
+import { fork } from 'node:child_process';
+import { open } from 'node:fs/promises';
+import { join } from 'node:path';
 import process from 'node:process';
 
 import { vi } from 'vitest';
@@ -8,6 +11,7 @@ import type {
   OpenServerOwnerRequest,
   ServerOwnerOutcome,
 } from '../../../src/server/server-owner.service.js';
+import { CapturedOutput } from '../server-logs/captured-output.js';
 import { validStartMessage } from './server-host-message.js';
 
 type HeldOwner = {
@@ -109,6 +113,7 @@ export async function executeRevoServerBin(options: {
     },
   };
 
+  const output = new CapturedOutput();
   try {
     vi.doMock('../../../src/server/server-host-process-port.js', () => ({
       NodeServerHostProcessPort: function () {
@@ -150,8 +155,10 @@ export async function executeRevoServerBin(options: {
       sendDeadlineRemaining,
       portCloseDeadlineRemaining,
       exitCode: process.exitCode,
+      output: output.text(),
     };
   } finally {
+    output.restore();
     if (startDelivery) {
       clearImmediate(startDelivery);
     }
@@ -162,16 +169,47 @@ export async function executeRevoServerBin(options: {
   }
 }
 
-async function bounded<T>(operation: Promise<T>): Promise<T> {
+async function bounded<T>(operation: Promise<T>, milliseconds = 1_000): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error('revo-server bin fixture exceeded 1 second')), 1_000);
+    timer = setTimeout(
+      () => reject(new Error(`revo-server bin fixture exceeded ${String(milliseconds)} ms`)),
+      milliseconds,
+    );
   });
   try {
     return await Promise.race([operation, deadline]);
   } finally {
     if (timer) {
       clearTimeout(timer);
+    }
+  }
+}
+
+export async function rejectInvalidLaunchMessageWithFullLog() {
+  const log = await open('/dev/full', 'w');
+  const child = fork(join(process.cwd(), 'dist/bin/revo-server.js'), [], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ['ignore', log.fd, log.fd, 'ipc'],
+  });
+  await log.close();
+  const received: unknown[] = [];
+  const exited = new Promise<number | null>((resolve) =>
+    child.once('exit', (code) => resolve(code)),
+  );
+  child.on('message', (message: unknown) => {
+    received.push(message);
+    if (received.length === 1) {
+      child.send({ protocol: 'not-a-launch-message' });
+    }
+  });
+  try {
+    const exitCode = await bounded(exited, 10_000);
+    return { received, exitCode };
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
     }
   }
 }

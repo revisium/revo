@@ -1,17 +1,42 @@
-import { Inject, Injectable } from '@nestjs/common';
+import process from 'node:process';
 
-import { ProgressOperation, type ProgressEvent } from '../progress/index.js';
+import { Inject, Injectable, Optional } from '@nestjs/common';
+
+import {
+  PROGRESS_SCHEMA_VERSION,
+  ProgressOperation,
+  parseProgressEvent,
+  type ProgressEvent,
+} from '../progress/index.js';
 import { StartupProgressDiscoveryService } from '../startup-progress/index.js';
 import type { StartedServer } from './server-launch-attempt.js';
 
 export type ServerProgressSink = (event: ProgressEvent) => void | Promise<void>;
-const DELIVERY_MILLISECONDS = 250;
-const POLL_MILLISECONDS = 25;
+export type StartupProgressWarning = (message: string) => void;
+
+export interface StartupObserverTiming {
+  readonly deliveryMs: number;
+  readonly drainMs: number;
+  readonly pollMs: number;
+}
+
+export const STARTUP_PROGRESS_WARNING = Symbol('STARTUP_PROGRESS_WARNING');
+export const STARTUP_OBSERVER_TIMING = Symbol('STARTUP_OBSERVER_TIMING');
+
+const DEFAULT_TIMING: StartupObserverTiming = { deliveryMs: 2_000, drainMs: 5_000, pollMs: 25 };
+const SKIPPED = 'Warning: skipped startup progress because';
+const WARNINGS = {
+  journal: `${SKIPPED} the progress journal could not be read in time.`,
+  output: `${SKIPPED} progress output could not be written in time.`,
+  url: `${SKIPPED} the running server did not report its URL.`,
+} as const;
+
+type Settlement = 'fulfilled' | 'rejected' | 'timeout';
 
 export class StartProgressOutputError extends Error {
   readonly code = 'START_PROGRESS_OUTPUT_FAILED';
   constructor() {
-    super('Server is running, but startup progress output failed.');
+    super('Startup progress output failed.');
     this.name = 'StartProgressOutputError';
   }
 }
@@ -25,33 +50,38 @@ interface Observation {
 
 @Injectable()
 export class ServerStartupObserver {
+  private readonly timing: StartupObserverTiming;
+
   constructor(
     @Inject(StartupProgressDiscoveryService)
     private readonly discovery: Pick<
       StartupProgressDiscoveryService,
       'read'
     > = new StartupProgressDiscoveryService(),
-  ) {}
+    @Optional()
+    @Inject(STARTUP_PROGRESS_WARNING)
+    private readonly warn: StartupProgressWarning = writeWarning,
+    @Optional() @Inject(STARTUP_OBSERVER_TIMING) timing?: StartupObserverTiming,
+  ) {
+    this.timing = timing ?? DEFAULT_TIMING;
+  }
 
   async observe(attempt: Promise<StartedServer>, options: Observation): Promise<StartedServer> {
-    const session = new JournalObservation(this.discovery, options);
+    const delivery = new ProgressDelivery(options.sink, this.timing, new Warnings(this.warn));
+    const journal = new JournalObservation(this.discovery, options, this.timing, delivery);
     // Attach both handlers immediately; observation never owns attempt cancellation or cleanup.
     const outcome = attempt.then(
-      (value) => {
-        session.settled();
-        return { kind: 'started' as const, value };
-      },
-      (error: unknown) => {
-        session.settled();
-        return { kind: 'failed' as const, error };
-      },
+      (value) => ({ kind: 'started' as const, value }),
+      (error: unknown) => ({ kind: 'failed' as const, error }),
     );
-    await session.follow();
+    const following = journal.follow();
     const result = await outcome;
+    await journal.drain(following);
     if (result.kind === 'failed') {
+      await journal.reportFailure();
       throw result.error;
     }
-    await session.finish(result.value.url);
+    await journal.reportReady(result.value.url);
     return result.value;
   }
 
@@ -60,141 +90,215 @@ export class ServerStartupObserver {
     sink: ServerProgressSink,
     operationId: string,
   ): Promise<void> {
-    const operation = new ProgressOperation({ operationId, now: Date.now });
+    const warnings = new Warnings(this.warn);
+    const event = url
+      ? new ProgressOperation({ operationId, now: Date.now }).ready({ url, reused: true })
+      : undefined;
+    if (!event) {
+      warnings.emit('url');
+      return;
+    }
+    await new ProgressDelivery(sink, this.timing, warnings).final(event, Date.now());
+  }
+}
+
+class Warnings {
+  private readonly emitted = new Set<keyof typeof WARNINGS>();
+
+  constructor(private readonly warn: StartupProgressWarning) {}
+
+  emit(kind: keyof typeof WARNINGS): void {
+    if (this.emitted.has(kind)) {
+      return;
+    }
+    this.emitted.add(kind);
     try {
-      if (!url) {
-        throw new StartProgressOutputError();
-      }
-      const event = operation.ready({ url, reused: true });
-      if (!event) {
-        throw new StartProgressOutputError();
-      }
-      await bounded(() => sink(event), Date.now() + DELIVERY_MILLISECONDS);
+      this.warn(WARNINGS[kind]);
     } catch {
-      throw new StartProgressOutputError();
+      // A warning is best effort, exactly like the progress it describes.
+    }
+  }
+}
+
+class ProgressDelivery {
+  private inFlight: Promise<Settlement> | undefined;
+
+  constructor(
+    private readonly sink: ServerProgressSink,
+    private readonly timing: StartupObserverTiming,
+    readonly warnings: Warnings,
+  ) {}
+
+  async tick(event: ProgressEvent): Promise<void> {
+    if (this.inFlight) {
+      this.warnings.emit('output');
+      return;
+    }
+    await this.write(event);
+  }
+
+  async final(event: ProgressEvent, drainStarted: number): Promise<void> {
+    if (this.inFlight) {
+      await settlesWithin(this.inFlight, drainStarted + this.timing.drainMs - Date.now());
+    }
+    await this.write(event);
+  }
+
+  private async write(event: ProgressEvent): Promise<void> {
+    const write = Promise.resolve().then(() => this.sink(event));
+    const settled = settlement(write);
+    this.inFlight = settled;
+    void settled.then(() => {
+      if (this.inFlight === settled) {
+        this.inFlight = undefined;
+      }
+    });
+    if ((await settlesWithin(write, this.timing.deliveryMs)) !== 'fulfilled') {
+      this.warnings.emit('output');
     }
   }
 }
 
 class JournalObservation {
-  private sequence = 0;
+  private cursor = 0;
+  private elapsedMs = 0;
   private ready: ProgressEvent | undefined;
-  private disabled = false;
-  private done = false;
-  private deadline: number;
+  private failure: ProgressEvent | undefined;
+  private settled = false;
+  private closed = false;
+  private drainStarted = 0;
   private wake: (() => void) | undefined;
+  private readonly started = Date.now();
 
   constructor(
     private readonly discovery: Pick<StartupProgressDiscoveryService, 'read'>,
     private readonly options: Observation,
-  ) {
-    this.deadline = options.deadline;
-  }
-
-  settled(): void {
-    this.done = true;
-    // Bound the entire remaining replay, not just each individual sink invocation.
-    this.deadline = Math.min(this.deadline, Date.now() + DELIVERY_MILLISECONDS);
-    this.wake?.();
-  }
+    private readonly timing: StartupObserverTiming,
+    private readonly delivery: ProgressDelivery,
+  ) {}
 
   async follow(): Promise<void> {
-    if (this.done || this.disabled || Date.now() >= this.deadline) {
-      if (!this.disabled) {
-        await this.read();
-      }
+    const finalRead = this.settled;
+    await this.read();
+    if (finalRead || Date.now() >= this.options.deadline) {
       return;
     }
-    await this.read();
-    if (!this.done && !this.disabled) {
+    if (!this.settled) {
       // Journal polling is intentionally sequential so the cursor never overtakes a read.
-      await this.wait();
+      await this.waitForPoll();
     }
     return this.follow();
   }
 
-  private wait(): Promise<void> {
+  async drain(following: Promise<void>): Promise<void> {
+    this.settled = true;
+    this.drainStarted = Date.now();
+    this.wake?.();
+    if ((await settlesWithin(following, this.timing.drainMs)) === 'timeout') {
+      this.delivery.warnings.emit('journal');
+    }
+    this.closed = true;
+  }
+
+  async reportFailure(): Promise<void> {
+    if (this.failure) {
+      await this.delivery.final(this.failure, this.drainStarted);
+    }
+  }
+
+  async reportReady(url: string): Promise<void> {
+    const event = this.ready?.url === url ? this.ready : this.synthesizedReady(url);
+    if (event) {
+      await this.delivery.final(event, this.drainStarted);
+    }
+  }
+
+  private async read(): Promise<void> {
+    try {
+      const snapshot = await this.discovery.read(this.options.dataDir, {
+        operationId: this.options.operationId,
+        sequence: this.cursor,
+      });
+      if (snapshot.kind === 'events') {
+        await this.replay(snapshot.events);
+      }
+    } catch {
+      this.delivery.warnings.emit('journal');
+    }
+  }
+
+  private async replay(events: readonly ProgressEvent[]): Promise<void> {
+    const [event, ...later] = events;
+    if (!event || this.closed) {
+      return;
+    }
+    this.cursor = event.sequence;
+    this.elapsedMs = Math.max(this.elapsedMs, event.elapsedMs);
+    if (event.status === 'ready') {
+      this.ready = event;
+    } else if (event.status === 'failed') {
+      this.failure = event;
+    } else {
+      await this.delivery.tick(event);
+    }
+    return this.replay(later);
+  }
+
+  private synthesizedReady(url: string): ProgressEvent | undefined {
+    return parseProgressEvent({
+      schemaVersion: PROGRESS_SCHEMA_VERSION,
+      operationId: this.options.operationId,
+      sequence: this.cursor + 1,
+      phase: 'server-start',
+      status: 'ready',
+      elapsedMs: Math.max(this.elapsedMs, Date.now() - this.started),
+      url,
+    });
+  }
+
+  private waitForPoll(): Promise<void> {
     return new Promise((resolve) => {
       const finish = () => {
         clearTimeout(timer);
         this.wake = undefined;
         resolve();
       };
-      const timer = setTimeout(finish, Math.min(POLL_MILLISECONDS, this.deadline - Date.now()));
+      const timer = setTimeout(
+        finish,
+        Math.max(0, Math.min(this.timing.pollMs, this.options.deadline - Date.now())),
+      );
       this.wake = finish;
     });
   }
-
-  async finish(url: string): Promise<void> {
-    if (!this.disabled && this.ready?.url === url) {
-      await this.deliver(this.ready);
-    } else {
-      this.disabled = true;
-    }
-    if (this.disabled) {
-      throw new StartProgressOutputError();
-    }
-  }
-
-  private async read(): Promise<void> {
-    try {
-      // Each read must finish before the next cursor-bearing read starts.
-      const snapshot = await bounded(
-        () =>
-          this.discovery.read(this.options.dataDir, {
-            operationId: this.options.operationId,
-            sequence: this.sequence,
-          }),
-        this.deadline,
-      );
-      if (snapshot.kind !== 'events') {
-        return;
-      }
-      await this.replay(snapshot.events);
-    } catch {
-      this.disabled = true;
-    }
-  }
-
-  private async replay(events: readonly ProgressEvent[]): Promise<void> {
-    for (const event of events) {
-      if (this.disabled) {
-        return;
-      }
-      this.sequence = event.sequence;
-      if (event.status === 'ready') {
-        this.ready = event;
-      } else {
-        // Preserve journal order and backpressure between domain events.
-        // oxlint-disable-next-line no-await-in-loop
-        await this.deliver(event);
-      }
-    }
-  }
-
-  private async deliver(event: ProgressEvent): Promise<void> {
-    try {
-      await bounded(() => this.options.sink(event), this.deadline);
-    } catch {
-      this.disabled = true;
-    }
-  }
 }
 
-async function bounded<T>(operation: () => T | Promise<T>, deadline: number): Promise<T> {
-  const remaining = Math.min(DELIVERY_MILLISECONDS, deadline - Date.now());
-  if (remaining <= 0) {
-    throw new StartProgressOutputError();
+function settlement(operation: Promise<unknown>): Promise<Settlement> {
+  return operation.then(
+    () => 'fulfilled',
+    () => 'rejected',
+  );
+}
+
+async function settlesWithin(
+  operation: Promise<unknown>,
+  milliseconds: number,
+): Promise<Settlement> {
+  if (milliseconds <= 0) {
+    return 'timeout';
   }
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      Promise.resolve().then(operation),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new StartProgressOutputError()), remaining);
+      settlement(operation),
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), milliseconds);
       }),
     ]);
   } finally {
     clearTimeout(timer);
   }
+}
+
+function writeWarning(message: string): void {
+  process.stderr.write(`${message}\n`);
 }

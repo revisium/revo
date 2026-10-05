@@ -1,6 +1,6 @@
-import { readFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, vi } from 'vitest';
@@ -13,6 +13,7 @@ import type {
   ProcessCompletion,
   StopProcessRequest,
 } from '../../../src/processes/managed-process.types.js';
+import { serverLogPath, type ServerLogLocation } from '../../../src/server-logs/server-log.js';
 import type { ServerHostParentMessage } from '../../../src/server/server-host-protocol.js';
 import type { ServerLaunchProcessPort } from '../../../src/server/server-launch-attempt.js';
 
@@ -31,6 +32,7 @@ interface LaunchBinding {
   readonly entry: string;
   readonly env: Readonly<Record<string, string>>;
   readonly executable: string;
+  readonly log?: ServerLogLocation;
 }
 
 interface LaunchOptions {
@@ -40,7 +42,10 @@ interface LaunchOptions {
 }
 
 interface LaunchProcessModule {
-  readonly ServerLaunchProcessService: new (processes?: ManagedProcessService) => {
+  readonly ServerLaunchProcessService: new (
+    processes?: ManagedProcessService,
+    warn?: (message: string) => void,
+  ) => {
     start(binding: LaunchBinding, options: LaunchOptions): Promise<ServerLaunchProcessPort>;
   };
 }
@@ -163,6 +168,7 @@ export class ServerLaunchProcessScenario {
   private readonly managedProcesses = new RecordingManagedProcessService();
   private readonly received: unknown[] = [];
   private readonly waiters = new Set<Waiter>();
+  readonly warnings: string[] = [];
   private port: ServerLaunchProcessPort | undefined;
 
   private constructor(root: string) {
@@ -172,13 +178,17 @@ export class ServerLaunchProcessScenario {
   }
 
   static async create(): Promise<ServerLaunchProcessScenario> {
-    const { mkdtemp } = await import('node:fs/promises');
-    return new ServerLaunchProcessScenario(await mkdtemp(join(tmpdir(), 'revo-launch-process-')));
+    const { mkdtemp, realpath } = await import('node:fs/promises');
+    return new ServerLaunchProcessScenario(
+      await mkdtemp(join(await realpath(tmpdir()), 'revo-launch-process-')),
+    );
   }
 
   async start(overrides: Partial<LaunchBinding> = {}): Promise<ServerLaunchProcessPort> {
     const { ServerLaunchProcessService } = await vi.importActual<LaunchProcessModule>(MODULE_URL);
-    const service = new ServerLaunchProcessService(this.managedProcesses);
+    const service = new ServerLaunchProcessService(this.managedProcesses, (message) =>
+      this.warnings.push(message),
+    );
     this.port = await service.start(
       {
         executable: process.execPath,
@@ -191,6 +201,36 @@ export class ServerLaunchProcessScenario {
     );
     this.port.subscribe((message) => this.deliver(message));
     return this.port;
+  }
+
+  /** Starts a child that writes to stdout and stderr with its output bound to the server log. */
+  async startLogged(): Promise<ServerLaunchProcessPort> {
+    return this.start({
+      env: {
+        ...definedEnvironment(),
+        REVO_LAUNCH_PROCESS_EVENTS: this.eventsPath,
+        REVO_LAUNCH_PROCESS_OUTPUT: '1',
+      },
+      log: this.logLocation(),
+    });
+  }
+
+  async plantSymlinkedLog(): Promise<void> {
+    const path = await serverLogPath(this.logLocation());
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await symlink(join(this.root, 'elsewhere.log'), path);
+  }
+
+  async serverLog(): Promise<{ readonly text: string; readonly mode: number }> {
+    const path = await serverLogPath(this.logLocation());
+    let text = '';
+    await eventually(async () => {
+      text = await readFile(path, 'utf8');
+      if (!text.includes('server stdout line') || !text.includes('server stderr line')) {
+        throw new Error('Server output was not logged yet.');
+      }
+    });
+    return { text, mode: (await lstat(path)).mode & 0o777 };
   }
 
   managedProcessRequests(): readonly ManagedProcessRequest[] {
@@ -208,6 +248,10 @@ export class ServerLaunchProcessScenario {
       ipc: true,
       stdio: { stderr: 'ignore', stdin: 'ignore', stdout: 'ignore' },
     };
+  }
+
+  private logLocation(): ServerLogLocation {
+    return { logDir: join(this.root, 'logs'), channel: 'alpha', dataDir: join(this.root, 'data') };
   }
 
   async booted(): Promise<unknown> {

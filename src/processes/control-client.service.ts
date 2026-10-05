@@ -1,7 +1,12 @@
 import { connect, isIP } from 'node:net';
 
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 
+import {
+  CONTROL_SOCKET_ROOT,
+  DEFAULT_CONTROL_SOCKET_ROOT,
+  isPrivateEndpoint,
+} from './control-endpoint.directory.js';
 import {
   DEFAULT_CONTROL_LIMITS,
   type ControlLimits,
@@ -13,8 +18,14 @@ import { ControlTransportError, parseControlRecord, validateLimits } from './con
 
 @Injectable()
 export class ControlClientService {
+  constructor(
+    @Optional()
+    @Inject(CONTROL_SOCKET_ROOT)
+    private readonly socketRoot: string = DEFAULT_CONTROL_SOCKET_ROOT,
+  ) {}
+
   async probe(recordValue: unknown, limits: ControlLimits = DEFAULT_CONTROL_LIMITS) {
-    const record = requireRecord(recordValue, limits);
+    const record = await this.privateRecord(recordValue, limits);
     const response = await exchange(record, 'probe', limits);
     if (!isObject(response) || response.ok !== true || response.schemaVersion !== 1) {
       throw new ControlTransportError();
@@ -29,7 +40,7 @@ export class ControlClientService {
   }
 
   async requestStop(recordValue: unknown, limits: ControlLimits = DEFAULT_CONTROL_LIMITS) {
-    const record = requireRecord(recordValue, limits);
+    const record = await this.privateRecord(recordValue, limits);
     const response = await exchange(record, 'stop', limits);
     if (
       !isObject(response) ||
@@ -47,7 +58,7 @@ export class ControlClientService {
     recordValue: unknown,
     limits: ControlLimits = DEFAULT_CONTROL_LIMITS,
   ): Promise<ControlServerStatus> {
-    const record = requireRecord(recordValue, limits);
+    const record = await this.privateRecord(recordValue, limits);
     const response = await exchange(record, 'status', limits);
     if (
       !isObject(response) ||
@@ -66,7 +77,7 @@ export class ControlClientService {
     completionTimeoutMs: number,
     limits: ControlLimits = DEFAULT_CONTROL_LIMITS,
   ): Promise<ControlStopResponse> {
-    const record = requireRecord(recordValue, limits);
+    const record = await this.privateRecord(recordValue, limits);
     if (!Number.isSafeInteger(completionTimeoutMs) || completionTimeoutMs < 1) {
       throw new ControlTransportError('Invalid stop completion timeout');
     }
@@ -79,6 +90,14 @@ export class ControlClientService {
       return completion;
     }
     throw new ControlTransportError();
+  }
+
+  private async privateRecord(value: unknown, limits: ControlLimits): Promise<ControlRecord> {
+    const record = requireRecord(value, limits);
+    if (!(await isPrivateEndpoint(this.socketRoot, record.endpoint))) {
+      throw new ControlTransportError('Control endpoint is not private');
+    }
+    return record;
   }
 }
 

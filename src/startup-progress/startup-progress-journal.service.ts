@@ -63,10 +63,7 @@ export class StartupProgressJournalWriter {
         await file.close();
       }
       if (readyContext) {
-        if (readyContext.signal.aborted || Date.now() >= readyContext.deadline) {
-          throw new StartupProgressError('closed');
-        }
-        readyContext.assertRunning();
+        assertStillReady(readyContext);
       }
       await rename(temporaryPath, join(canonicalDataDir, STARTUP_PROGRESS_FILE));
     } catch (error) {
@@ -74,8 +71,19 @@ export class StartupProgressJournalWriter {
       if (error instanceof StartupProgressError) {
         throw error;
       }
-      throw new StartupProgressError('io');
+      throw new StartupProgressError('io', { cause: error });
     }
+  }
+}
+
+function assertStillReady(readyContext: StartupReadyContext): void {
+  if (readyContext.signal.aborted || Date.now() >= readyContext.deadline) {
+    throw new StartupProgressError('closed');
+  }
+  try {
+    readyContext.assertRunning();
+  } catch {
+    throw new StartupProgressError('closed');
   }
 }
 

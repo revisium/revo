@@ -31,14 +31,28 @@ describe('persisted startup progress', () => {
     });
   });
 
-  it('never publishes ready in memory when its atomic write fails', async () => {
-    const result = await scenario.readyWriteFailure();
+  it('skips a failed journal write as one tick and catches up on the next write', async () => {
+    const result = await scenario.skipsFailedJournalWrite();
     expect(result).toMatchObject({
-      outcomes: ['rejected', 'rejected'],
-      writes: 2,
-      read: { kind: 'events', events: [] },
+      outcomes: ['fulfilled', 'fulfilled'],
+      writes: 3,
+      read: {
+        kind: 'events',
+        events: [
+          { sequence: 1, status: 'started' },
+          { sequence: 2, status: 'ready' },
+        ],
+      },
     });
-    expect(JSON.stringify(result)).not.toContain('secret filesystem failure');
+    expect(result?.log).toMatch(
+      /WARN \[StartupProgress\] Skipped a startup progress journal write/u,
+    );
+    expect(result?.log).not.toContain('secret filesystem failure');
+  });
+
+  it('still rejects ready when the readiness check fails before publication', async () => {
+    const result = await scenario.readyAfterCoreExit();
+    expect(result).toMatchObject({ outcome: 'rejected', read: { kind: 'events', events: [] } });
   });
 
   it('reserves the terminal transition at the exact nonterminal count limit', async () => {

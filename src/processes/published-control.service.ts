@@ -219,11 +219,13 @@ export class PublishedControlService {
           ? { prepareEmbeddedPostgres: postgres.prepareEmbeddedPostgres.bind(postgres) }
           : {}),
       };
-    } catch {
-      throw new PublishedControlError(
+    } catch (error) {
+      const failure = new PublishedControlError(
         'startup',
         await cleanupStartup(endpoint, temporaryPath, lease, lifecycle),
       );
+      failure.cause = error;
+      throw failure;
     }
   }
 
