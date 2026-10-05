@@ -4,8 +4,10 @@ import process from 'node:process';
 import { Inject, Injectable } from '@nestjs/common';
 import { runRevoTui, type RunRevoTuiOptions } from '@revisium/revo-tui/launcher';
 
+import { channelCommand, selectChannel } from '../channel.js';
 import type { ConfigurationFlags } from '../configuration/configuration.types.js';
 import { CliExitCodeError } from './cli-error.js';
+import { PackageMetadataService } from './package-metadata.service.js';
 import { ServerCommandService } from './server-command.service.js';
 import { serverPublicOrigin } from './server-public-origin.js';
 
@@ -26,6 +28,8 @@ export class TuiCommandService {
   constructor(
     @Inject(ServerCommandService)
     private readonly server: Pick<ServerCommandService, 'ensureRunningWithConfiguration'>,
+    @Inject(PackageMetadataService)
+    private readonly metadata: Pick<PackageMetadataService, 'version'>,
     @Inject(TUI_LAUNCHER)
     private readonly launchTui: TuiLauncher,
     @Inject(TUI_TERMINAL)
@@ -35,10 +39,10 @@ export class TuiCommandService {
   async run(flags: Readonly<ConfigurationFlags>): Promise<void> {
     const terminal = this.terminal();
     if (terminal.platform !== 'linux' && terminal.platform !== 'darwin') {
-      throw new Error('revo tui is supported only on Linux and macOS.');
+      throw new Error(`${this.command(flags)} tui is supported only on Linux and macOS.`);
     }
     if (!terminal.stdin || !terminal.stdout) {
-      throw new Error('revo tui requires a TTY on stdin and stdout.');
+      throw new Error(`${this.command(flags)} tui requires a TTY on stdin and stdout.`);
     }
 
     const { configuration, outcome } = await this.server.ensureRunningWithConfiguration(flags);
@@ -50,6 +54,12 @@ export class TuiCommandService {
     if (exitCode !== 0) {
       throw new CliExitCodeError(exitCode);
     }
+  }
+
+  private command(flags: Readonly<ConfigurationFlags>): string {
+    return channelCommand(
+      selectChannel({ env: process.env, flags, packageVersion: this.metadata.version }),
+    );
   }
 }
 

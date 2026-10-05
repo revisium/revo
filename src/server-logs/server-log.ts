@@ -65,9 +65,11 @@ export async function openServerLog(
   }
 }
 
+/** With `since`, only a start attempt recorded at or after that time counts as this start's log. */
 export async function readServerLogTail(
   location: ServerLogLocation,
   maxLines = SERVER_LOG_TAIL_LINES,
+  since?: number,
 ): Promise<ServerLogTail | undefined> {
   let path: string;
   let handle: FileHandle;
@@ -86,7 +88,11 @@ export async function readServerLogTail(
     if (start > 0) {
       lines.shift();
     }
-    return { path, lines: latestAttempt(lines).slice(-maxLines).map(printable) };
+    const attempt = latestAttempt(lines);
+    if (since !== undefined && !(attemptTime(attempt[0]) >= since)) {
+      return undefined;
+    }
+    return { path, lines: attempt.slice(-maxLines).map(printable) };
   } catch {
     return undefined;
   } finally {
@@ -134,6 +140,18 @@ function latestAttempt(lines: readonly string[]): readonly string[] {
   const complete = lines.at(-1) === '' ? lines.slice(0, -1) : lines;
   const start = complete.findLastIndex((line) => line.startsWith(ATTEMPT_MARKER));
   return start < 0 ? complete : complete.slice(start);
+}
+
+function attemptTime(marker: string | undefined): number {
+  if (marker === undefined || !marker.startsWith(ATTEMPT_MARKER)) {
+    return Number.NaN;
+  }
+  return Date.parse(
+    marker
+      .slice(ATTEMPT_MARKER.length)
+      .replace(/\s*---\s*$/u, '')
+      .trim(),
+  );
 }
 
 /** Log lines reach a terminal; control characters must not become terminal commands. */

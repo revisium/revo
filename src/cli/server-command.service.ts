@@ -3,12 +3,13 @@ import process from 'node:process';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { channelCommand, selectChannel } from '../channel.js';
 import { ConfigurationResolver } from '../configuration/configuration-resolver.js';
 import type {
   ConfigurationFlags,
   ConfigurationInput,
 } from '../configuration/configuration.types.js';
-import { readServerLogTail } from '../server-logs/server-log.js';
+import { readServerLogTail, SERVER_LOG_TAIL_LINES } from '../server-logs/server-log.js';
 import {
   ServerLauncherService,
   type ServerLaunchContext,
@@ -60,7 +61,7 @@ export class ServerCommandService {
     @Inject(PackageMetadataService)
     private readonly metadata: Pick<PackageMetadataService, 'version'>,
     @Inject(OutputService)
-    private readonly output: Pick<OutputService, 'write' | 'progress'>,
+    private readonly output: Pick<OutputService, 'write' | 'writeError' | 'progress'>,
   ) {}
 
   async start(flags: Readonly<ServerStartFlags>): Promise<void> {
@@ -84,7 +85,30 @@ export class ServerCommandService {
   }
 
   async ensureRunning(flags: Readonly<ConfigurationFlags>): Promise<ServerLaunchResult> {
-    return this.launch(this.input(flags));
+    const input = this.input(flags);
+    const outcome = await this.launch(input);
+    this.noticeStaleServer(outcome, input);
+    return outcome;
+  }
+
+  /** A running server keeps its own version; say how to move it to the installed one. */
+  private noticeStaleServer(
+    outcome: ServerLaunchResult,
+    input: Readonly<ConfigurationInput>,
+  ): void {
+    if (outcome.kind !== 'running') {
+      return;
+    }
+    const running = outcome.status.version;
+    const installed = this.metadata.version;
+    if (running === undefined || running === installed) {
+      return;
+    }
+    const command = channelCommand(selectChannel(input));
+    this.output.writeError(
+      `Revo ${installed} is installed, but the running server is ${running}. ` +
+        `Run '${command} server stop', then '${command}' to start ${installed}.`,
+    );
   }
 
   async ensureRunningWithConfiguration(
@@ -151,6 +175,7 @@ export class ServerCommandService {
     input: Readonly<ConfigurationInput>,
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
+    const startedAt = Date.now();
     const controller = new AbortController();
     const abort = (): void => controller.abort();
     process.on('SIGINT', abort);
@@ -158,7 +183,7 @@ export class ServerCommandService {
     try {
       return await operation(controller.signal);
     } catch (error) {
-      throw await this.withServerLog(input, diagnose(error), error);
+      throw await this.withServerLog(input, diagnose(error), error, startedAt);
     } finally {
       process.off('SIGINT', abort);
       process.off('SIGTERM', abort);
@@ -169,6 +194,7 @@ export class ServerCommandService {
     input: Readonly<ConfigurationInput>,
     diagnosed: unknown,
     cause: unknown,
+    startedAt: number,
   ): Promise<unknown> {
     const code = cause instanceof Error ? Reflect.get(cause, 'code') : undefined;
     if (!(diagnosed instanceof Error) || typeof code !== 'string' || !LOGGED_FAILURES.has(code)) {
@@ -177,7 +203,11 @@ export class ServerCommandService {
     const tail = await this.configuration
       .resolve(input)
       .then(({ channel, layout, logDir }) =>
-        readServerLogTail({ channel, dataDir: layout.dataDir, logDir }),
+        readServerLogTail(
+          { channel, dataDir: layout.dataDir, logDir },
+          SERVER_LOG_TAIL_LINES,
+          startedAt,
+        ),
       )
       .catch(() => undefined);
     if (!tail) {

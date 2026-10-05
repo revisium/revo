@@ -21,7 +21,6 @@ export interface ConfigurationInput {
   readonly homeDir: string;
   readonly packageVersion: string;
   readonly platform: 'darwin' | 'linux';
-  readonly wrapperChannel?: ReleaseChannel;
 }
 
 export interface RevoConfiguration {

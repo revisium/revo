@@ -22,11 +22,12 @@ export class IsolatedServerScenario {
     return new IsolatedServerScenario(home, String(await freeLoopbackPort()));
   }
 
-  /** Starts with JSONL progress for a reader that has already closed stdout and stderr. */
-  startWithClosedOutput(): Promise<CliExit> {
+  /** Starts for a reader that has already closed stdout and stderr; JSONL progress is optional. */
+  startWithClosedOutput(output: 'jsonl' | 'plain' = 'jsonl'): Promise<CliExit> {
+    const progress = output === 'jsonl' ? ['--progress=jsonl'] : [];
     const child = spawn(
       process.execPath,
-      [BUILT_CLI, 'server', 'start', '--progress=jsonl', '--port', this.port],
+      [BUILT_CLI, 'server', 'start', ...progress, '--port', this.port],
       {
         cwd: this.home,
         env: isolatedEnvironment(this.home),

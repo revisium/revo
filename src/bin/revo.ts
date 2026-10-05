@@ -5,10 +5,10 @@ import 'reflect-metadata';
 import { CliBootstrapService } from '../cli/cli-bootstrap.service.js';
 import { OutputService } from '../cli/output.service.js';
 import { PackageMetadataService } from '../cli/package-metadata.service.js';
-import { ignoreDiagnosticOutputFailures } from '../server-logs/process-output.js';
+import { ignoreOutputFailures } from '../server-logs/process-output.js';
 
-// Warnings and diagnostics are best effort: a closed stderr never changes a command's outcome.
-ignoreDiagnosticOutputFailures();
+// Output is best effort: a closed stdout or stderr never changes a command's outcome.
+ignoreOutputFailures();
 
 const output = new OutputService();
 const bootstrap = new CliBootstrapService(new PackageMetadataService(), output);

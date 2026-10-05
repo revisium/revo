@@ -156,7 +156,7 @@ function unusable(directory: string, error: unknown): DirectoryOutcome {
     : refused(directory, 'unavailable');
 }
 
-const userDirectoryOf = (socketRoot: string, uid: number) =>
+export const userDirectoryOf = (socketRoot: string, uid: number) =>
   join(socketRoot, `revo-${String(uid)}`);
 
 const socketPath = (directory: string, instanceId: string) =>

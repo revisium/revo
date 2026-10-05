@@ -35,11 +35,7 @@ type AttemptState =
   | 'terminal';
 
 type Cleanup = 'completed' | 'retained' | 'unconfirmed';
-type StartErrorCode =
-  | 'START_BUSY'
-  | 'START_CANCELLED'
-  | 'START_FAILED'
-  | 'START_OUTCOME_UNKNOWN';
+type StartErrorCode = 'START_BUSY' | 'START_CANCELLED' | 'START_FAILED' | 'START_OUTCOME_UNKNOWN';
 
 class ServerLaunchError extends Error {
   readonly code: StartErrorCode;

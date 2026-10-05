@@ -5,6 +5,7 @@ export default defineConfig({
   oxc: false,
   plugins: [swc.vite()],
   test: {
+    globalSetup: ['./test/support/global-socket-cleanup.ts'],
     fileParallelism: false,
     coverage: {
       include: ['src/**/*.ts'],

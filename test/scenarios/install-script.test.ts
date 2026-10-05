@@ -40,6 +40,15 @@ describe('install.sh', { timeout: 60_000 }, () => {
     expect(await machine.channelEntries('alpha')).toEqual(['current', 'node', 'pnpm', 'versions']);
   });
 
+  it('makes each channel launcher declare its own channel to Revo', async () => {
+    const machine = await cleanMachine();
+    await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+    await machine.install(await machine.publish('stable', '1.0.0'));
+
+    expect(await machine.runCommand('revo-alpha', ['--launcher-channel'])).toBe('alpha');
+    expect(await machine.runCommand('revo', ['--launcher-channel'])).toBe('stable');
+  });
+
   it('reports an already installed version and changes nothing', async () => {
     const machine = await cleanMachine();
     const release = await machine.publish('alpha', '0.1.0-alpha.1');

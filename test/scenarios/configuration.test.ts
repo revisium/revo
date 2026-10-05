@@ -42,19 +42,71 @@ describe('configuration resolution', () => {
     expect(result.port).toBe(expected === 'alpha' ? 3211 : 3210);
   });
 
-  it('rejects a stable selection from the alpha wrapper', async () => {
-    await expect(
-      ConfigurationScenario.defaults()
-        .withWrapper('alpha')
-        .withFlags({ channel: 'stable' })
-        .resolve(),
-    ).rejects.toMatchObject({ code: 'revo.configuration.invalid', field: 'channel', exitCode: 2 });
+  it.each([
+    { launcher: 'alpha', env: {}, flags: { channel: 'stable' }, source: 'flags', command: 'revo' },
+    { launcher: 'alpha', env: { REVO_CHANNEL: 'stable' }, flags: {}, source: 'environment' },
+    { launcher: 'stable', env: {}, flags: { channel: 'alpha' }, source: 'flags' },
+    { launcher: 'stable', env: { REVO_CHANNEL: 'alpha' }, flags: {}, source: 'environment' },
+    {
+      launcher: 'alpha',
+      env: { REVO_CHANNEL: 'stable' },
+      flags: { channel: 'alpha' },
+      source: 'environment',
+    },
+  ])(
+    'refuses $source selecting another channel than the $launcher launcher',
+    async ({ launcher, env, flags, source }) => {
+      const failure = await ConfigurationScenario.defaults()
+        .withEnv(env)
+        .withLauncher(launcher)
+        .withFlags(flags)
+        .resolve()
+        .catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(ConfigurationError);
+      expect(failure).toMatchObject({
+        code: 'revo.configuration.invalid',
+        field: 'channel',
+        source,
+        exitCode: 2,
+      });
+      const command = launcher === 'alpha' ? 'revo-alpha' : 'revo';
+      expect((failure as Error).message).toContain(`${command} runs the ${launcher} channel`);
+    },
+  );
+
+  it.each([
+    { launcher: 'alpha', env: {}, flags: {} },
+    { launcher: 'alpha', env: { REVO_CHANNEL: 'alpha' }, flags: { channel: 'alpha' } },
+    { launcher: 'stable', env: {}, flags: { channel: 'stable' } },
+  ])(
+    'pins the $launcher launcher without a conflicting selection',
+    async ({ launcher, env, flags }) => {
+      const result = await ConfigurationScenario.defaults()
+        .withEnv(env)
+        .withLauncher(launcher)
+        .withFlags(flags)
+        .resolve();
+
+      expect(result.channel).toBe(launcher);
+    },
+  );
+
+  it('pins the alpha launcher over a stable package version and a stable launcher over alpha', async () => {
+    const alpha = await ConfigurationScenario.defaults().withLauncher('alpha').resolve();
+    const stable = await ConfigurationScenario.defaults()
+      .withPackageVersion('1.0.0-alpha.3')
+      .withLauncher('stable')
+      .resolve();
+
+    expect([alpha.channel, alpha.port]).toEqual(['alpha', 3211]);
+    expect([stable.channel, stable.port]).toEqual(['stable', 3210]);
   });
 
-  it('pins the alpha wrapper when package metadata has no prerelease', async () => {
-    const result = await ConfigurationScenario.defaults().withWrapper('alpha').resolve();
-
-    expect(result.channel).toBe('alpha');
+  it('rejects an unknown launcher channel', async () => {
+    await expect(
+      ConfigurationScenario.defaults().withLauncher('preview').resolve(),
+    ).rejects.toMatchObject({ field: 'REVO_LAUNCHER_CHANNEL', source: 'environment', exitCode: 2 });
   });
 
   it('applies flags over environment and file without validating a shadowed environment value', async () => {
