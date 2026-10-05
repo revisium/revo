@@ -89,7 +89,9 @@ export async function readServerLogTail(
       lines.shift();
     }
     const attempt = latestAttempt(lines);
-    const started = attemptTime(attempt[0]);
+    const marked = attempt[0]?.startsWith(ATTEMPT_MARKER) === true;
+    // Without a marker in the window, the last write time tells whether this start wrote to the log.
+    const started = marked ? attemptTime(attempt[0]) : (await handle.stat()).mtimeMs;
     if (since !== undefined && (Number.isNaN(started) || started < since)) {
       return undefined;
     }

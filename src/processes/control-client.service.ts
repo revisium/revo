@@ -4,7 +4,7 @@ import { Inject, Injectable, Optional } from '@nestjs/common';
 
 import {
   CONTROL_SOCKET_ROOT,
-  DEFAULT_CONTROL_SOCKET_ROOT,
+  controlSocketRoot,
   isPrivateEndpoint,
 } from './control-endpoint.directory.js';
 import {
@@ -21,7 +21,7 @@ export class ControlClientService {
   constructor(
     @Optional()
     @Inject(CONTROL_SOCKET_ROOT)
-    private readonly socketRoot: string = DEFAULT_CONTROL_SOCKET_ROOT,
+    private readonly socketRoot: string = controlSocketRoot(),
   ) {}
 
   async probe(recordValue: unknown, limits: ControlLimits = DEFAULT_CONTROL_LIMITS) {

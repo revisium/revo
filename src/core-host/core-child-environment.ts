@@ -8,6 +8,7 @@ const POSIX_CORE_ENVIRONMENT_NAMES = [
   'XDG_CONFIG_HOME',
   'XDG_DATA_HOME',
   'XDG_CACHE_HOME',
+  'REVO_CONTROL_SOCKET_ROOT',
 ] as const;
 
 const forbiddenName = (name: string) =>

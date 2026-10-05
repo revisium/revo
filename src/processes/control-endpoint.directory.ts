@@ -7,6 +7,19 @@ import { ControlTransportError, controlEndpointByteLimit } from './control-proto
 
 export const CONTROL_SOCKET_ROOT = Symbol('CONTROL_SOCKET_ROOT');
 export const DEFAULT_CONTROL_SOCKET_ROOT = '/tmp';
+export const CONTROL_SOCKET_ROOT_VARIABLE = 'REVO_CONTROL_SOCKET_ROOT';
+
+/** The socket root of this process: the override when set, otherwise `/tmp`. */
+export function controlSocketRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env[CONTROL_SOCKET_ROOT_VARIABLE];
+  if (override === undefined || override === '') {
+    return DEFAULT_CONTROL_SOCKET_ROOT;
+  }
+  if (!isAbsolute(override)) {
+    throw new ControlTransportError(`${CONTROL_SOCKET_ROOT_VARIABLE} must be an absolute path`);
+  }
+  return override;
+}
 
 export interface ControlEndpointScope {
   readonly runtimeDir: string;
@@ -156,7 +169,7 @@ function unusable(directory: string, error: unknown): DirectoryOutcome {
     : refused(directory, 'unavailable');
 }
 
-export const userDirectoryOf = (socketRoot: string, uid: number) =>
+const userDirectoryOf = (socketRoot: string, uid: number) =>
   join(socketRoot, `revo-${String(uid)}`);
 
 const socketPath = (directory: string, instanceId: string) =>
