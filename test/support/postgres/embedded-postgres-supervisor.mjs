@@ -13,6 +13,11 @@ const powerCut = () => {
   return new Promise(() => undefined);
 };
 
+const supervisorKilled = () => {
+  process.kill(process.pid, 'SIGKILL');
+  return new Promise(() => undefined);
+};
+
 const appears = async (path) => {
   try {
     await access(path);
@@ -32,9 +37,9 @@ class InterruptedInitialization extends ManagedProcessService {
       return powerCut();
     }
     const initdb = await super.start(request);
-    if (mode === 'inside-initdb') {
+    if (mode === 'inside-initdb' || mode === 'supervisor-killed-inside-initdb') {
       await appears(join(pgdata.slice('--pgdata='.length), 'global', 'pg_control'));
-      return powerCut();
+      return mode === 'inside-initdb' ? powerCut() : supervisorKilled();
     }
     await initdb.completion;
     return powerCut();

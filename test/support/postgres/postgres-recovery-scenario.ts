@@ -1,5 +1,7 @@
 import { fork, spawn, type ChildProcess } from 'node:child_process';
 import {
+  access,
+  chmod,
   copyFile,
   mkdir,
   mkdtemp,
@@ -15,8 +17,15 @@ import { join } from 'node:path';
 
 import { Client } from 'pg';
 
+import { EmbeddedPostgresPreparationService } from '../../../src/postgres/embedded-postgres-preparation.service.js';
+import { EmbeddedPostgresResourceService } from '../../../src/postgres/embedded-postgres-resource.service.js';
 import { EmbeddedPostgresError } from '../../../src/postgres/embedded-postgres.types.js';
 import type { PublishedControl } from '../../../src/processes/control-discovery.types.js';
+import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
+import type {
+  ManagedProcessRequest,
+  OwnedProcess,
+} from '../../../src/processes/managed-process.types.js';
 import { ProcessIdentityService } from '../../../src/processes/process-identity.service.js';
 import { PublishedControlService } from '../../../src/processes/published-control.service.js';
 import { ClusterFixture } from './postgres-readiness-scenario.js';
@@ -34,12 +43,19 @@ export interface Bystander {
   receivedSignals(): Promise<readonly string[]>;
 }
 
+export interface OrphanedInitialization {
+  resume(): void;
+  exited(): Promise<void>;
+}
+
 export type StartOutcome =
   | { readonly kind: 'started'; readonly port: number }
   | { readonly kind: 'rejected'; readonly reason: string; readonly message: string };
 
 const HOUR_SECONDS = 3600;
 const CLOCK_STEP_SECONDS = 10;
+const PGDATA_ARGUMENT = '--pgdata=';
+const STAGING_PREFIX = '.postgres-initdb';
 const SUPERVISOR = new URL('./embedded-postgres-supervisor.mjs', import.meta.url);
 const BYSTANDER = `
 for (const signal of ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGUSR1', 'SIGUSR2']) {
@@ -54,6 +70,8 @@ export class PostgresRecoveryScenario {
   private readonly owners: PublishedControl[] = [];
   private readonly children = new Set<ChildProcess>();
   private readonly postmasters = new Set<number>();
+  private readonly orphanedGroups = new Set<number>();
+  private readonly readOnlyDirectories: string[] = [];
   private readonly foreignServers: ClusterFixture[] = [];
   private root = '';
   private dataDir = '';
@@ -102,6 +120,42 @@ export class PostgresRecoveryScenario {
 
   async interruptFirstInitialization(point: InitializationInterruption): Promise<void> {
     await exited(this.supervisor(point));
+  }
+
+  async initializationOrphanedByAKilledSupervisor(): Promise<OrphanedInitialization> {
+    const supervisor = this.supervisor('supervisor-killed-inside-initdb');
+    await exited(supervisor);
+    const group = requiredPid(supervisor);
+    this.orphanedGroups.add(group);
+    process.kill(-group, 'SIGSTOP');
+    return {
+      resume: () => {
+        process.kill(-group, 'SIGCONT');
+      },
+      exited: () => processGroupExited(group),
+    };
+  }
+
+  async abandonedInitializationThatCannotBeRemoved(): Promise<void> {
+    await this.interruptFirstInitialization('inside-initdb');
+    const staging = (await readdir(this.dataDir)).find((name) => name.startsWith(STAGING_PREFIX));
+    if (staging === undefined) {
+      throw new Error('the interrupted initialization left no staging directory');
+    }
+    const undeletable = join(this.dataDir, staging, 'global');
+    await chmod(undeletable, 0o500);
+    this.readOnlyDirectories.push(undeletable);
+  }
+
+  async startResumingDuringInitialization(orphan: OrphanedInitialization): Promise<StartOutcome> {
+    const initdb = new InitdbObserver();
+    let settled = false;
+    const restart = this.start(initdb).finally(() => {
+      settled = true;
+    });
+    await eventually(async () => settled || (await initdb.writesItsCluster()));
+    orphan.resume();
+    return restart;
   }
 
   async legacyEmptyClusterDirectory(credential?: string): Promise<void> {
@@ -167,8 +221,8 @@ export class PostgresRecoveryScenario {
     return log === undefined ? '' : readFile(join(this.logDir, log), 'utf8');
   }
 
-  async start(): Promise<StartOutcome> {
-    const owner = await this.open();
+  async start(processes?: ManagedProcessService): Promise<StartOutcome> {
+    const owner = await this.open(processes);
     try {
       const started = await owner.startDatabase?.({
         signal: new AbortController().signal,
@@ -225,11 +279,20 @@ export class PostgresRecoveryScenario {
       child.kill('SIGKILL');
     }
     await Promise.allSettled([...this.children].map((child) => exited(child)));
+    await Promise.allSettled(
+      [...this.orphanedGroups].map(async (group) => {
+        killProcessGroup(group);
+        await processGroupExited(group);
+      }),
+    );
     await Promise.allSettled(this.foreignServers.map((server) => server.close()));
+    await Promise.allSettled(this.readOnlyDirectories.map((path) => chmod(path, 0o700)));
     await rm(this.root, { recursive: true, force: true });
   }
 
-  private supervisor(mode: 'serve' | InitializationInterruption): ChildProcess {
+  private supervisor(
+    mode: 'serve' | 'supervisor-killed-inside-initdb' | InitializationInterruption,
+  ): ChildProcess {
     const child = fork(SUPERVISOR, [mode], {
       detached: true,
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -263,8 +326,15 @@ export class PostgresRecoveryScenario {
     };
   }
 
-  private async open() {
-    const owner = await new PublishedControlService().open({
+  private async open(processes?: ManagedProcessService) {
+    const owner = await new PublishedControlService(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new EmbeddedPostgresResourceService(new EmbeddedPostgresPreparationService(processes)),
+    ).open({
       dataDir: this.dataDir,
       logDir: this.logDir,
       runtimeDir: this.runtimeDir,
@@ -313,6 +383,51 @@ const exited = (child: ChildProcess) =>
   child.exitCode !== null || child.signalCode !== null
     ? Promise.resolve()
     : new Promise<void>((resolve) => child.once('exit', () => resolve()));
+
+const processGroupAlive = (group: number) => {
+  try {
+    process.kill(-group, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const eventually = async (condition: () => Promise<boolean>): Promise<void> => {
+  if (!(await condition())) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return eventually(condition);
+  }
+};
+
+const processGroupExited = (group: number) => eventually(async () => !processGroupAlive(group));
+
+const killProcessGroup = (group: number) => {
+  if (processGroupAlive(group)) {
+    process.kill(-group, 'SIGKILL');
+  }
+};
+
+class InitdbObserver extends ManagedProcessService {
+  private pgdata: string | undefined;
+
+  override start(request: ManagedProcessRequest): Promise<OwnedProcess> {
+    this.pgdata ??= request.args
+      .find((argument) => argument.startsWith(PGDATA_ARGUMENT))
+      ?.slice(PGDATA_ARGUMENT.length);
+    return super.start(request);
+  }
+
+  async writesItsCluster(): Promise<boolean> {
+    if (this.pgdata === undefined) {
+      return false;
+    }
+    return access(join(this.pgdata, 'global', 'pg_control')).then(
+      () => true,
+      () => false,
+    );
+  }
+}
 
 const requiredPid = (child: ChildProcess) => {
   if (child.pid === undefined) {

@@ -217,6 +217,23 @@ describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () =
       },
     );
 
+    it('completes on the next start while initdb orphaned by its killed supervisor keeps running', async () => {
+      const orphan = await scenario.initializationOrphanedByAKilledSupervisor();
+
+      const restart = await scenario.startResumingDuringInitialization(orphan);
+      await orphan.exited();
+
+      expect(restart).toMatchObject({ kind: 'started' });
+      await scenario.commit('usable after recovery');
+      await expect(scenario.committedValues()).resolves.toEqual(['usable after recovery']);
+    });
+
+    it('completes on the next start when an abandoned initialization cannot be removed', async () => {
+      await scenario.abandonedInitializationThatCannotBeRemoved();
+
+      await expect(scenario.start()).resolves.toMatchObject({ kind: 'started' });
+    });
+
     it.each([
       ['an empty cluster directory', undefined],
       ['an empty cluster directory and a partly written credential', 'partial'],

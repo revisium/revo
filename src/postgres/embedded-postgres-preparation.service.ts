@@ -3,7 +3,7 @@ import {
   constants,
   type FileHandle,
   lstat,
-  mkdir,
+  mkdtemp,
   open,
   readdir,
   rename,
@@ -26,12 +26,12 @@ import {
   type PreparedEmbeddedPostgres,
 } from './embedded-postgres.types.js';
 
-const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const MAX_SMALL_FILE = 4096;
 const CANCEL_GRACE_MS = 1000;
 const CANCEL_KILL_WAIT_MS = 5000;
 const CREDENTIAL_FORMAT = /^[A-Za-z0-9_-]{32}$/u;
+const STAGED_CLUSTER_PREFIX = '.postgres-initdb';
 
 @Injectable()
 export class EmbeddedPostgresPreparationService {
@@ -122,6 +122,7 @@ export class OwnedEmbeddedPostgresPreparation {
     const state = await inspectState(layout);
     rejectCancellation(signal);
     if (state.kind === 'ready') {
+      await discardAbandonedStagedClusters(layout);
       return prepared(layout, binaries, false);
     }
     if (state.kind === 'invalid') {
@@ -133,22 +134,25 @@ export class OwnedEmbeddedPostgresPreparation {
     try {
       await this.progress.start(phase);
       rejectCancellation(signal);
-      await discardUncommittedCluster(layout, state.cluster);
+      if (state.cluster === 'empty') {
+        await rmdir(layout.cluster);
+      }
       if (state.credential !== 'valid') {
         await commitCredential(layout);
       }
       rejectCancellation(signal);
-      await mkdir(layout.stagedCluster, { mode: DIRECTORY_MODE });
+      const stagedCluster = await mkdtemp(join(layout.dataDir, `${STAGED_CLUSTER_PREFIX}-`));
+      await discardAbandonedStagedClusters(layout, stagedCluster);
       await this.progress.complete(phase);
       phase = 'postgres-initialization';
       await this.progress.start(phase);
       rejectCancellation(signal);
-      await this.initializeStagedCluster(binaries.initdb, layout, signal);
-      if ((await inspectCluster(layout.stagedCluster)) !== 'ready') {
+      await this.initializeStagedCluster(binaries.initdb, layout, stagedCluster, signal);
+      if ((await inspectCluster(stagedCluster)) !== 'ready') {
         throw new EmbeddedPostgresError('invalid');
       }
       rejectCancellation(signal);
-      await commitCluster(layout);
+      await commitCluster(layout, stagedCluster);
       await this.progress.complete(phase);
       rejectCancellation(signal);
       return prepared(layout, binaries, true);
@@ -171,13 +175,14 @@ export class OwnedEmbeddedPostgresPreparation {
   private async initializeStagedCluster(
     initdb: string,
     layout: ClusterLayout,
+    stagedCluster: string,
     signal: AbortSignal,
   ): Promise<void> {
     const child = await this.log.append(({ descriptor }) =>
       this.processes.start({
         executable: initdb,
         args: [
-          `--pgdata=${layout.stagedCluster}`,
+          `--pgdata=${stagedCluster}`,
           `--pwfile=${layout.credential}`,
           '--encoding=UTF8',
           '--locale=C',
@@ -226,7 +231,6 @@ export class OwnedEmbeddedPostgresPreparation {
 interface ClusterLayout {
   readonly dataDir: string;
   readonly cluster: string;
-  readonly stagedCluster: string;
   readonly credential: string;
   readonly stagedCredential: string;
 }
@@ -245,7 +249,6 @@ type PreparationState =
 const clusterLayout = (dataDir: string): ClusterLayout => ({
   dataDir,
   cluster: join(dataDir, 'postgres'),
-  stagedCluster: join(dataDir, '.postgres-initdb'),
   credential: join(dataDir, 'postgres-password'),
   stagedCredential: join(dataDir, '.postgres-password.tmp'),
 });
@@ -337,14 +340,18 @@ async function inspectCluster(path: string): Promise<ClusterState> {
   }
 }
 
-async function discardUncommittedCluster(
-  layout: ClusterLayout,
-  cluster: Extract<ClusterState, 'missing' | 'empty'>,
-) {
-  if (cluster === 'empty') {
-    await rmdir(layout.cluster);
-  }
-  await rm(layout.stagedCluster, { recursive: true, force: true });
+// Removal is best-effort because an initdb orphaned by a killed supervisor may still write there.
+// It runs only after the current staging directory exists, so that directory cannot reuse the inode
+// from which PostgreSQL derives the orphan's shared memory key.
+async function discardAbandonedStagedClusters(layout: ClusterLayout, current?: string) {
+  const entries = await readdir(layout.dataDir).catch(() => []);
+  await Promise.allSettled(
+    entries
+      .filter((name) => name.startsWith(STAGED_CLUSTER_PREFIX))
+      .map((name) => join(layout.dataDir, name))
+      .filter((path) => path !== current)
+      .map((path) => rm(path, { recursive: true, force: true })),
+  );
 }
 
 async function commitCredential(layout: ClusterLayout) {
@@ -360,8 +367,8 @@ async function commitCredential(layout: ClusterLayout) {
   await syncDirectory(layout.dataDir);
 }
 
-async function commitCluster(layout: ClusterLayout) {
-  await rename(layout.stagedCluster, layout.cluster);
+async function commitCluster(layout: ClusterLayout, stagedCluster: string) {
+  await rename(stagedCluster, layout.cluster);
   await syncDirectory(layout.dataDir);
 }
 

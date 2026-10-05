@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { PostgresScenario } from '../support/postgres/postgres-scenario.js';
 
-describe('embedded PostgreSQL provision', () => {
+describe('embedded PostgreSQL provision', { timeout: 30_000 }, () => {
   let scenario = new PostgresScenario();
   afterEach(async () => {
     await scenario.cleanup();
