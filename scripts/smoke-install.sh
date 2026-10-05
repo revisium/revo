@@ -212,6 +212,12 @@ process = subprocess.Popen(
 os.close(follower)
 screen = b""
 text = b""
+def wait_for_exit():
+    # The pty closes while the TUI is exiting, slightly before the kernel reports the exit.
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 connected = False
 next_quit = 0.0
 deadline = time.monotonic() + 60
@@ -221,6 +227,7 @@ while process.poll() is None and time.monotonic() < deadline:
         try:
             screen += os.read(leader, 65536)
         except OSError:
+            wait_for_exit()
             break
     text = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\s", b"", screen)
     # The TUI redraws only changed cells, so words of the connected screen can lose letters;
@@ -234,11 +241,7 @@ while process.poll() is None and time.monotonic() < deadline:
         try:
             os.write(leader, b"q")
         except OSError:
-            # The TUI may just have exited; give it time to be reaped before judging it.
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            wait_for_exit()
             break
         next_quit = time.monotonic() + 3
 def report(reason):
