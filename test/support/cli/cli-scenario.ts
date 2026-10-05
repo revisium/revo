@@ -24,7 +24,19 @@ export interface CliResult {
 }
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const BUILT_CLI = resolve(REPOSITORY_ROOT, 'dist/bin/revo.js');
+export const BUILT_CLI = resolve(REPOSITORY_ROOT, 'dist/bin/revo.js');
+
+/** A private home keeps ambient product state out of a built CLI run. */
+export function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
+  return {
+    HOME: home,
+    PATH: process.env.PATH ?? '',
+    XDG_CACHE_HOME: `${home}/cache`,
+    XDG_CONFIG_HOME: `${home}/config`,
+    XDG_DATA_HOME: `${home}/data`,
+    XDG_STATE_HOME: `${home}/state`,
+  };
+}
 
 export class CliScenario {
   private constructor() {}
@@ -63,14 +75,7 @@ export class CliScenario {
     // A canonical home keeps private server logs usable where tmpdir is behind a symlink.
     const home = await mkdtemp(`${await realpath(tmpdir())}/revo-home-`);
     try {
-      return await this.run(args, {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
-        XDG_CACHE_HOME: `${home}/cache`,
-        XDG_CONFIG_HOME: `${home}/config`,
-        XDG_DATA_HOME: `${home}/data`,
-        XDG_STATE_HOME: `${home}/state`,
-      });
+      return await this.run(args, isolatedEnvironment(home));
     } finally {
       await rm(home, { recursive: true, force: true });
     }

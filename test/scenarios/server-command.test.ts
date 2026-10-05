@@ -12,6 +12,7 @@ import type { ServerStatus } from '../../src/server/server-status.service.js';
 import { SERVER_STOP_CONFIRMATION_MS } from '../../src/server/server-stop.service.js';
 import { STARTUP_PROGRESS_FILE } from '../../src/startup-progress/startup-progress.types.js';
 import { CliScenario } from '../support/cli/cli-scenario.js';
+import { IsolatedServerScenario } from '../support/cli/isolated-server-scenario.js';
 import { ProgressOutputScenario } from '../support/cli/progress-output-scenario.js';
 import {
   FIXTURE_DATA_DIR,
@@ -57,6 +58,8 @@ const RETAINED = 'Server start failed. Resources may remain active.\n';
 const UNCONFIRMED = 'Server start outcome is unknown. Cleanup could not be confirmed.\n';
 const SILENT_PENDING = { listeners: { sigint: 1, sigterm: 1 }, stderr: '', stdout: '' };
 const NO_LISTENERS = { sigint: 0, sigterm: 0 };
+const CLEAN_EXIT = { exitCode: 0, signal: null };
+const RUNNING = { exitCode: 0, stderr: '', stdout: 'Server is running.\n' };
 const refused = (kind: string) => `Server is ${kind}; start was not performed.\n`;
 const reported = (kind: string) => `Server is ${kind}.\n`;
 
@@ -218,6 +221,21 @@ describe('revo server command line', () => {
       await rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('starts and then reuses a real server for a reader that closed stdout and stderr', async () => {
+    const server = await IsolatedServerScenario.create();
+    try {
+      const fresh = await server.startWithClosedOutput();
+      const afterFresh = await server.status();
+      const reused = await server.startWithClosedOutput();
+      const afterReuse = await server.status();
+
+      expect([fresh, reused]).toEqual([CLEAN_EXIT, CLEAN_EXIT]);
+      expect([afterFresh, afterReuse]).toMatchObject([RUNNING, RUNNING]);
+    } finally {
+      await server.dispose();
+    }
+  }, 240_000);
 
   it('reports an isolated home as stopped without starting a server', async () => {
     const status = await CliScenario.runIsolated(['server', 'status']);
