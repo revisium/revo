@@ -24,6 +24,8 @@ and full `src/**/*.ts` V8 coverage with text and LCOV reports.
 - Use isolated real checks when integration behavior matters. A missing platform or unavailable
   provider is not a pass.
 
-After push, require GitHub Actions and Sonar for the exact pull request head. The scan must wait for
+After push, require GitHub Actions and Sonar for the exact pull request head. Intel macOS
+(`macos-15-intel`) is a release-time check: pull requests and `master` pushes run Apple Silicon and
+Linux arm64; run the CI workflow manually to include Intel before a release. The scan must wait for
 the quality gate and `pnpm sonar:issues:local` must confirm the same revision and zero open issues in
 the pull request scope. On `master`, the same requirements apply to the exact branch revision.
