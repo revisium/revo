@@ -22,7 +22,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-15-intel, ubuntu-24.04-arm]
+        # Intel macOS is a release-time check: it runs only on manual dispatch.
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["macos-15","macos-15-intel","ubuntu-24.04-arm"]' || '["macos-15","ubuntu-24.04-arm"]') }}
 
     steps:
       - name: Check out exact revision
