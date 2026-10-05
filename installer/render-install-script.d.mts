@@ -22,7 +22,6 @@ export interface InstallScriptRelease {
 
 export const INSTALL_PLATFORMS: readonly InstallPlatform[];
 
-export function channelCommand(channel: ReleaseChannel): string;
 export function installScriptName(channel: ReleaseChannel): string;
 export function releaseAssetNames(version: string): {
   readonly package: string;
@@ -32,4 +31,3 @@ export function releaseAssetNames(version: string): {
 export function nodeArchiveName(version: string, platform: InstallPlatform): string;
 export function pnpmArchiveName(platform: InstallPlatform): string;
 export function renderInstallScript(release: InstallScriptRelease): string;
-export function renderInstallScript(release: unknown): string;

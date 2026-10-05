@@ -106,15 +106,25 @@ check_command_link() {
   fi
 }
 
+# Stale: the owner is gone, or it never recorded its pid and the lock is over five minutes old.
+lock_is_stale() {
+  if [ -n "$owner" ]; then
+    ! kill -0 "$owner" 2>/dev/null
+  else
+    [ -n "$(find "$lock" -prune -mmin +5 2>/dev/null)" ]
+  fi
+}
+
 take_over_stale_lock() {
   owner=$(cat "$lock/pid" 2>/dev/null) || owner=
-  [ -n "$owner" ] ||
-    fail "another installation of $product may be running; if it is not, remove $lock and run the installer again."
-  ! kill -0 "$owner" 2>/dev/null || fail "another installation of $product is running (pid $owner)."
+  if ! lock_is_stale; then
+    [ -z "$owner" ] || fail "another installation of $product is running (pid $owner)."
+    fail "another installation of $product is starting; if it is not, run the installer again in a few minutes."
+  fi
   mkdir "$takeover" 2>/dev/null ||
     fail "another installation of $product may be running; if it is not, remove $takeover and run the installer again."
   takeover_held=1
-  if [ "$(cat "$lock/pid" 2>/dev/null)" = "$owner" ]; then
+  if [ "$(cat "$lock/pid" 2>/dev/null)" = "$owner" ] && lock_is_stale; then
     rm -rf "$lock"
   fi
   mkdir "$lock" 2>/dev/null
@@ -225,15 +235,25 @@ EOF
   chmod 755 "$1/bin/$command_name"
 }
 
+# The release decides which packages are installed, how they are linked and which build scripts run;
+# these flags override user pnpm settings that would change that. Registry, proxy and auth still apply.
+install_dependencies() {
+  pnpm_data=$channel_root/pnpm-data
+  (cd "$revo" && PATH="$node_home/bin:$PATH" PNPM_HOME="$pnpm_data/home" "$pnpm_home/pnpm" install \
+    --prod --frozen-lockfile --trust-lockfile --ignore-pnpmfile --os=current --cpu=current --libc=current \
+    --store-dir "$pnpm_data/store" --state-dir "$pnpm_data/state" --config.cache-dir="$pnpm_data/cache" \
+    --config.offline=false --config.lockfile-dir=. --config.optional=true --config.ignore-scripts=false \
+    --config.dangerously-allow-all-builds=false --config.node-linker=isolated --config.symlink=true \
+    --config.modules-dir=node_modules --config.enable-modules-dir=true --config.virtual-store-only=false \
+    --config.virtual-store-dir=node_modules/.pnpm --config.virtual-store-type=project)
+}
+
 install_revo() {
   revo=$staging/revo
   unpack "$staging/revo.tgz" "$revo" --strip-components=1
   cp "$staging/pnpm-lock.yaml" "$staging/pnpm-workspace.yaml" "$revo/" || fail "cannot prepare $revo."
   say "Installing $product dependencies..."
-  pnpm_data=$channel_root/pnpm-data
-  (cd "$revo" && PATH="$node_home/bin:$PATH" PNPM_HOME="$pnpm_data/home" "$pnpm_home/pnpm" install \
-    --prod --frozen-lockfile --store-dir "$pnpm_data/store" --state-dir "$pnpm_data/state" \
-    --config.cache-dir="$pnpm_data/cache") || fail 'dependency installation failed; run the installer again.'
+  install_dependencies || fail 'dependency installation failed; run the installer again.'
   write_launcher "$revo" || fail "cannot create the $command_name launcher."
   publish "$revo" "$version_home"
 }

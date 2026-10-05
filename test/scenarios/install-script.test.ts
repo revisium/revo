@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { InstallMachine } from '../support/installation/install-machine.js';
+import { InstallMachine, type MachineOptions } from '../support/installation/install-machine.js';
 
 const machines: InstallMachine[] = [];
 
@@ -11,7 +11,7 @@ afterEach(async () => {
   await Promise.all(machines.splice(0).map((machine) => machine.dispose()));
 });
 
-async function cleanMachine(options: { readonly binDirOnPath?: boolean } = {}) {
+async function cleanMachine(options: MachineOptions = {}) {
   const machine = await InstallMachine.create(options);
   machines.push(machine);
   return machine;
@@ -127,6 +127,35 @@ describe('install.sh', { timeout: 60_000 }, () => {
     expect(await machine.install(release)).toMatchObject({ exitCode: 0, stderr: '' });
     expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
     expect(await machine.installerLeftovers('alpha')).toEqual([]);
+  });
+
+  it.each(['empty', 'missing'] as const)(
+    'takes over an old install lock whose owner pid file is %s',
+    async (pidFile) => {
+      const machine = await cleanMachine();
+      const release = await machine.publish('alpha', '0.1.0-alpha.1');
+      await machine.leaveOwnerlessLock('alpha', { pidFile, minutesAgo: 10 });
+
+      expect(await machine.install(release)).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+      expect(await machine.installerLeftovers('alpha')).toEqual([]);
+    },
+  );
+
+  it('refuses while a new install lock has not recorded its owner yet', async () => {
+    const machine = await cleanMachine();
+    const release = await machine.publish('alpha', '0.1.0-alpha.1');
+    await machine.leaveOwnerlessLock('alpha', { pidFile: 'missing', minutesAgo: 0 });
+
+    const result = await machine.install(release);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      stderr:
+        'revo-alpha install: another installation of Revo alpha is starting; if it is not, run the installer again in a few minutes.\n',
+    });
+    expect(await machine.activeVersion('alpha')).toBeUndefined();
+    expect(machine.downloads()).toEqual([]);
   });
 
   it('lets only one of two installers take over the lock of a killed installer', async () => {
@@ -282,6 +311,29 @@ describe('install.sh', { timeout: 60_000 }, () => {
     expect(await machine.runCommand('revo-alpha', ['--version'])).toBe('0.1.0-alpha.1');
     expect(await machine.runCommand('revo', ['--version'])).toBe('1.0.0');
     expect(await machine.existingUserDirectories()).toEqual([]);
+  });
+
+  it.each(['configuration file', 'environment'] as const)(
+    'runs dependency build scripts even when the user pnpm %s skips them',
+    async (source) => {
+      const machine = await cleanMachine();
+      await machine.skipBuildScriptsInUserPnpmSettings(source);
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.runCommand('revo-alpha', ['--version'])).toBe('0.1.0-alpha.1');
+    },
+  );
+
+  it('installs into an install root whose path has a space and a quote', async () => {
+    const machine = await cleanMachine({ installRoot: "Revo's programs" });
+
+    const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+    expect(await machine.runCommand('revo-alpha', ['--version'])).toBe('0.1.0-alpha.1');
   });
 
   it('installs from a project directory that pins another package manager', async () => {

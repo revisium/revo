@@ -9,6 +9,7 @@ import {
   readFile,
   readlink,
   rm,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -34,6 +35,7 @@ const PNPM_VERSION = '12.8.2';
 const SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const FOREIGN_COMMAND = '#!/bin/sh\necho "not Revo"\n';
 const CHANNELS: readonly ReleaseChannel[] = ['stable', 'alpha'];
+const USER_PNPM_CONFIG_DIRS = [join('.config', 'pnpm'), join('Library', 'Preferences', 'pnpm')];
 
 export type ReleaseAsset = 'package' | 'lockfile' | 'workspace';
 
@@ -62,6 +64,18 @@ export interface HeldDependencyInstallation {
   release(): void;
 }
 
+export interface MachineOptions {
+  readonly binDirOnPath?: boolean;
+  readonly installRoot?: string;
+}
+
+export type UserPnpmSettingSource = 'configuration file' | 'environment';
+
+export interface OwnerlessLock {
+  readonly pidFile: 'empty' | 'missing';
+  readonly minutesAgo: number;
+}
+
 export interface ReportedPlatform {
   readonly system: string;
   readonly machine: string;
@@ -79,16 +93,18 @@ export class InstallMachine {
 
   private workingDirectory: string;
 
+  private readonly userPnpmEnvironment: Record<string, string> = {};
+
   private constructor(
     private readonly root: string,
     private readonly certificate: FixtureCertificate,
     private readonly origin: FixtureOrigin,
-    private readonly binDirOnPath: boolean,
+    private readonly options: MachineOptions,
   ) {
     this.workingDirectory = this.home;
   }
 
-  static async create(options: { readonly binDirOnPath?: boolean } = {}): Promise<InstallMachine> {
+  static async create(options: MachineOptions = {}): Promise<InstallMachine> {
     const root = await mkdtemp(join(tmpdir(), 'revo-install-machine-'));
     await Promise.all(
       ['home', 'platform-bin', 'host-bin', 'control', 'build'].map((name) =>
@@ -100,7 +116,7 @@ export class InstallMachine {
       root,
       certificate,
       await FixtureOrigin.start(certificate),
-      options.binDirOnPath ?? false,
+      options,
     );
     await machine.installHostNodeAndPnpm();
     return machine;
@@ -228,6 +244,29 @@ export class InstallMachine {
     };
   }
 
+  async skipBuildScriptsInUserPnpmSettings(source: UserPnpmSettingSource): Promise<void> {
+    if (source === 'environment') {
+      this.userPnpmEnvironment.pnpm_config_ignore_scripts = 'true';
+      return;
+    }
+    await Promise.all(
+      USER_PNPM_CONFIG_DIRS.map(async (directory) => {
+        await mkdir(join(this.home, directory), { recursive: true });
+        await writeFile(join(this.home, directory, 'config.yaml'), 'ignoreScripts: true\n');
+      }),
+    );
+  }
+
+  async leaveOwnerlessLock(channel: ReleaseChannel, lock: OwnerlessLock): Promise<void> {
+    const directory = join(this.channelRoot(channel), '.lock');
+    await mkdir(directory, { recursive: true });
+    if (lock.pidFile === 'empty') {
+      await writeFile(join(directory, 'pid'), '');
+    }
+    const time = new Date(Date.now() - lock.minutesAgo * 60_000);
+    await utimes(directory, time, time);
+  }
+
   async reportPlatform(platform: ReportedPlatform): Promise<void> {
     await executable(
       join(this.root, 'platform-bin', 'uname'),
@@ -257,7 +296,7 @@ export class InstallMachine {
   }
 
   channelRoot(channel: ReleaseChannel): string {
-    return join(this.home, '.local', 'share', 'revo-install', channel);
+    return join(this.installRoot(), channel);
   }
 
   privateNode(channel: ReleaseChannel): string {
@@ -346,15 +385,27 @@ export class InstallMachine {
     const path = [
       join(this.root, 'platform-bin'),
       join(this.root, 'host-bin'),
-      ...(this.binDirOnPath ? [join(this.home, '.local', 'bin')] : []),
+      ...(this.options.binDirOnPath === true ? [join(this.home, '.local', 'bin')] : []),
       SYSTEM_PATH,
     ];
-    return {
+    const environment: NodeJS.ProcessEnv = {
+      ...this.userPnpmEnvironment,
       CURL_CA_BUNDLE: this.certificate.certPath,
       HOME: this.home,
       LC_ALL: 'C',
       PATH: path.join(':'),
     };
+    if (this.options.installRoot !== undefined) {
+      environment.REVO_INSTALL_ROOT = this.installRoot();
+    }
+    return environment;
+  }
+
+  private installRoot(): string {
+    if (this.options.installRoot === undefined) {
+      return join(this.home, '.local', 'share', 'revo-install');
+    }
+    return join(this.root, this.options.installRoot);
   }
 
   private control(name: string): string {
@@ -434,11 +485,13 @@ export class InstallMachine {
         `if [ "\${1:-}" = --version ]; then echo ${PNPM_VERSION}; exit 0; fi`,
         `printf '%s|%s\\n' "$(command -v node)" "$*" >> ${quote(this.control('pnpm-installs.log'))}`,
         '[ -f package.json ] && [ -f pnpm-lock.yaml ] && [ -f pnpm-workspace.yaml ] || exit 3',
+        ...ignoreScriptsSetting(),
         `if mv ${quote(this.control('pnpm-gate'))} ${quote(this.control('pnpm-held'))} 2>/dev/null; then`,
         `  : > ${quote(this.control('pnpm-started'))}`,
         `  { read -r _ < ${quote(this.control('pnpm-held'))}; } 2>/dev/null`,
         'fi',
         'mkdir -p node_modules && : > node_modules/.fixture-installed',
+        '[ "$ignore_scripts" = true ] || : > node_modules/.fixture-built',
         '',
       ].join('\n'),
     });
@@ -448,8 +501,12 @@ export class InstallMachine {
     return this.archive(`revo-${version}`, 'package', {
       'package/package.json': `${JSON.stringify({ name: '@revisium/revo', version, type: 'module' })}\n`,
       'package/dist/bin/revo.js': [
-        "import { appendFileSync } from 'node:fs';",
+        "import { appendFileSync, existsSync } from 'node:fs';",
         `appendFileSync(${JSON.stringify(this.control('revo-invocations.log'))}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+        "if (!existsSync(new URL('../../node_modules/.fixture-built', import.meta.url))) {",
+        "  console.error('dependencies were installed without their build scripts');",
+        '  process.exit(1);',
+        '}',
         `if (process.argv[2] === '--version') console.log(${JSON.stringify(version)});`,
         '',
       ].join('\n'),
@@ -492,6 +549,20 @@ function quote(value: string): string {
 async function executable(path: string, body: string): Promise<void> {
   await writeFile(path, `#!/bin/sh\n${body}`);
   await chmod(path, 0o755);
+}
+
+// The fixture pnpm reads ignoreScripts like pnpm: the command line wins over the environment, which
+// wins over the user's configuration file.
+function ignoreScriptsSetting(): readonly string[] {
+  return [
+    'ignore_scripts=false',
+    ...USER_PNPM_CONFIG_DIRS.map(
+      (directory) =>
+        `! grep -qx 'ignoreScripts: true' "$HOME"/${quote(directory)}/config.yaml 2>/dev/null || ignore_scripts=true`,
+    ),
+    'ignore_scripts=${pnpm_config_ignore_scripts:-$ignore_scripts}',
+    'for arg; do case "$arg" in --config.ignore-scripts=*) ignore_scripts=${arg#*=} ;; esac; done',
+  ];
 }
 
 // The second installer reads the stale owner before the first takes the lock over, and acts after.

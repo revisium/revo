@@ -25,7 +25,9 @@ const release: InstallScriptRelease = {
   },
 };
 
-const render = (value: unknown) => () => renderInstallScript(value);
+const render = (value: unknown) => () =>
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rejected values are invalid on purpose
+  renderInstallScript(value as InstallScriptRelease);
 
 describe('install script release values', () => {
   it('renders a complete script for each channel', () => {

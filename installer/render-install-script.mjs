@@ -21,10 +21,6 @@ const RELEASE_KEYS = ['channel', 'node', 'pnpm', 'releaseUrl', 'sha256', 'versio
 const TOOLCHAIN_KEYS = ['sha256', 'url', 'version'];
 const ASSET_KEYS = ['lockfile', 'package', 'workspace'];
 
-export function channelCommand(channel) {
-  return channelOf(channel).command;
-}
-
 export function installScriptName(channel) {
   return channelOf(channel).script;
 }

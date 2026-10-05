@@ -29,7 +29,8 @@ Supported platforms are Linux x64 and arm64 with glibc 2.35 or newer (for exampl
 newer), and macOS 15 or newer on Apple Silicon or Intel. Administrator rights and preinstalled
 Node.js, pnpm, or PostgreSQL are not required: the installer downloads its own Node.js and pnpm,
 verifies every download against SHA-256 checksums embedded in the script, and never uses or changes
-copies already installed on the system.
+copies already installed on the system. Your pnpm settings do not change what it installs; registry,
+proxy, and credential settings still apply.
 
 The installer creates `~/.local/bin/revo-alpha`. If `~/.local/bin` is not on your `PATH`, it prints
 the line to add to your shell profile; it never edits shell profiles itself:
