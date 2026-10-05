@@ -33,9 +33,13 @@ serve a bundle from `https://127.0.0.1:8443`.
 ## Smoke test
 
 `scripts/smoke-install.sh` installs into a throwaway `HOME` with host Node.js and pnpm hidden, from a
-project directory that pins npm as its package manager, then checks the version, the first start,
-the Admin HTML and GraphQL, a clean stop without `postmaster.pid`, a data sentinel across a restart,
-a same-version reinstall, and `tui` under a pseudo-terminal.
+project directory that pins npm as its package manager, with user pnpm settings in `config.yaml` and
+the environment that would skip build scripts and optional dependencies, enforce supply-chain
+policies, and forbid network access. It then checks the version, the first start, the Admin HTML and
+GraphQL, a clean stop without `postmaster.pid`, a data sentinel across a restart, a same-version
+reinstall, and `tui` under a pseudo-terminal. After the installation, each start, and the TUI it
+checks that no host tool ran and that no shared pnpm directory changed, on Linux and macOS paths.
+CI runs it against a locally built bundle on Linux x64, Linux arm64, and macOS 15.
 
 ```sh
 scripts/smoke-install.sh https://github.com/revisium/revo/releases/download/v<version>/install-alpha.sh
@@ -63,8 +67,8 @@ Pushing a `v<version>` tag that matches `package.json` runs `.github/workflows/r
    `https://revisium.github.io/revo/install-alpha.sh`, keeping the other channel's script.
 
 Pages deployments run one at a time. The job fails instead of deploying when the currently served
-scripts cannot be read (any answer other than 200 or 404) or when Pages already serves a newer
-version of the channel's script.
+scripts cannot be read (any answer other than 200 or 404), when the served channel script has no
+readable version, or when Pages already serves a newer version of the channel's script.
 
 The workflow requires GitHub Pages with the GitHub Actions source, and the `github-pages`
 environment must allow deployments from `v*` tags (its deployment branch and tag rules allow only

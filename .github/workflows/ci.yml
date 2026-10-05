@@ -1074,9 +1074,13 @@ jobs:
           pnpm exec vitest run test/scenarios/core-host.test.ts test/scenarios/core-host-runtime.test.ts test/scenarios/core-host-process.test.ts test/scenarios/server-owner.test.ts test/scenarios/server-status-stop.test.ts test/scenarios/core-database-handoff.test.ts test/scenarios/admin-spa.test.ts test/scenarios/server-startup-observer.test.ts test/scenarios/server-launch-attempt.test.ts test/scenarios/server-launcher.test.ts test/scenarios/server-command.test.ts
 
   install-e2e:
-    name: Install end to end (local bundle)
-    runs-on: ubuntu-24.04
+    name: Install end to end (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
 
     steps:
       - name: Check out exact revision

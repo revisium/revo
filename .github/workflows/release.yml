@@ -228,7 +228,12 @@ jobs:
             esac
           done
           if [ -f "served/$SCRIPT" ]; then
-            served=$(sed -n "s/^  version='\(.*\)'$/\1/p" "served/$SCRIPT")
+            served=$(tr -d '\r' <"served/$SCRIPT" |
+              sed -n -E "s/^[[:space:]]*version=[\"']?([0-9A-Za-z.+-]+)[\"']?[[:space:]]*\$/\1/p" | head -n 1)
+            if [ -z "$served" ]; then
+              echo "::error title=Unknown served version::Pages serves $SCRIPT, but its version cannot be read."
+              exit 1
+            fi
             if [ "$(printf '%s\n%s\n' "$served" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
               echo "::error title=Older release::Pages already serves $SCRIPT for $served, newer than $VERSION."
               exit 1

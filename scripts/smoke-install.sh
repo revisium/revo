@@ -1,6 +1,7 @@
 #!/bin/sh
 # Smoke test of a Revo installation in a throwaway HOME without host Node.js or pnpm, run from a
-# project directory that pins another package manager.
+# project directory that pins another package manager, with user pnpm settings that would break the
+# installation if the installer honoured them.
 # Usage:
 #   scripts/smoke-install.sh <install script URL>
 #   scripts/smoke-install.sh --bundle <directory>
@@ -11,6 +12,7 @@ set -eu
 port=${REVO_SMOKE_PORT:-8443}
 system_path=/usr/bin:/bin:/usr/sbin:/sbin
 sentinel_id=smoke-sentinel
+shared_pnpm_dirs='.cache/pnpm .config/pnpm .local/share/pnpm .local/state/pnpm Library/pnpm Library/Caches/pnpm Library/Preferences/pnpm'
 
 say() {
   printf 'smoke: %s\n' "$*"
@@ -102,6 +104,26 @@ prepare_home() {
     printf '#!/bin/sh\necho %s >>"%s/host-tools.log"\nexit 97\n' "$tool" "$work" >"$host_bin/$tool"
     chmod 755 "$host_bin/$tool"
   done
+  for config in .config/pnpm Library/Preferences/pnpm; do
+    mkdir -p "$home/$config"
+    printf '%s\n' 'ignoreScripts: true' 'optional: false' 'enableGlobalVirtualStore: true' \
+      'minimumReleaseAge: 5256000' 'trustPolicy: no-downgrade' >"$home/$config/config.yaml"
+  done
+  user_pnpm_files=$(shared_pnpm_files)
+}
+
+shared_pnpm_files() {
+  for shared in $shared_pnpm_dirs; do
+    if [ -e "$home/$shared" ]; then
+      (cd "$home" && find "$shared" -print)
+    fi
+  done | sort
+}
+
+check_private_tools() {
+  [ ! -e "$work/host-tools.log" ] || fail "host tools were used $1: $(cat "$work/host-tools.log")"
+  [ "$(shared_pnpm_files)" = "$user_pnpm_files" ] ||
+    fail "shared pnpm data was written $1: $(shared_pnpm_files)"
 }
 
 select_command() {
@@ -113,7 +135,8 @@ select_command() {
 }
 
 install_revo() {
-  (cd "$project" && clean_env curl --fail --silent --show-error --location --proto =https "$script_url" | clean_env sh)
+  (cd "$project" && clean_env curl --fail --silent --show-error --location --proto =https "$script_url" |
+    clean_env pnpm_config_ignore_scripts=true PNPM_CONFIG_OFFLINE=true sh)
 }
 
 check_fresh_install() {
@@ -122,10 +145,7 @@ check_fresh_install() {
   version=$(printf '%s\n' "$output" | sed -n 's/^.* \([^ ]*\) is installed\.$/\1/p')
   [ -n "$version" ] || fail 'the installer did not report the installed version'
   printf '%s\n' "$output" | grep -qF "Run \`$command_name\` to start Revo." || fail 'no next step was printed'
-  [ ! -e "$work/host-tools.log" ] || fail "host tools were used: $(cat "$work/host-tools.log")"
-  for shared in .cache/pnpm .local/state/pnpm .local/share/pnpm; do
-    [ ! -e "$home/$shared" ] || fail "the installer wrote pnpm data to ~/$shared"
-  done
+  check_private_tools 'by the installer'
   [ "$(revo --version)" = "$version" ] || fail "$command_name --version does not report $version"
   say "installed $command_name $version"
 }
@@ -145,6 +165,7 @@ check_admin_and_api() {
   graphql '{ __typename }' | grep -qF '"__typename":"Query"' || fail 'GraphQL does not answer'
   graphql "mutation { createPlaybook(data: { id: \\\"$sentinel_id\\\", name: \\\"Smoke sentinel\\\" }) { id } }" |
     grep -qF "\"$sentinel_id\"" || fail 'cannot write the data sentinel'
+  check_private_tools 'by the first start'
   say 'Admin and GraphQL answer; the data sentinel is written'
 }
 
@@ -159,6 +180,7 @@ check_sentinel_after_restart() {
   start_server
   graphql "{ playbook(id: \\\"$sentinel_id\\\", scope: DRAFT) { name } }" | grep -qF 'Smoke sentinel' ||
     fail 'the data sentinel did not survive the restart'
+  check_private_tools 'by the restart'
   say 'the data sentinel survived the restart'
 }
 
@@ -208,6 +230,7 @@ if process.poll() is None:
     sys.exit("TUI did not exit")
 sys.exit(0 if connected and process.returncode == 0 else f"TUI exited with {process.returncode}")
 PY
+  check_private_tools 'by the TUI'
   say 'the TUI connected and exited'
 }
 
