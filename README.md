@@ -10,10 +10,68 @@
 
 ## Status
 
-Production CLI foundation. The `revo` binary starts the configured server and prints its verified
-public URL through a thin NestJS application context. Cross-platform channel layout resolution,
-release metadata validation, and server lifecycle commands are also implemented; installation
-commands arrive in later production stages.
+Alpha. The `revo` binary starts the configured server and prints its verified public URL through a
+thin NestJS application context. Cross-platform channel layout resolution, release metadata
+validation, server lifecycle commands, and the alpha installer are implemented.
+
+## Install
+
+Install or update the alpha channel with one command:
+
+```sh
+curl -fsSL https://revisium.github.io/revo/install-alpha.sh | sh
+```
+
+The alpha channel's command is `revo-alpha`; the stable channel will use `revo`. Run `revo-alpha`
+to start the server and print its URL. The installer does not start the server itself.
+
+Supported platforms are Linux x64 and arm64 with glibc 2.35 or newer (for example Ubuntu 22.04 or
+newer), and macOS 15 or newer on Apple Silicon or Intel. Administrator rights and preinstalled
+Node.js, pnpm, or PostgreSQL are not required: the installer downloads its own Node.js and pnpm,
+verifies every download against SHA-256 checksums embedded in the script, and never uses or changes
+copies already installed on the system.
+
+The installer creates `~/.local/bin/revo-alpha`. If `~/.local/bin` is not on your `PATH`, it prints
+the line to add to your shell profile; it never edits shell profiles itself:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+New versions are published on the [Releases](https://github.com/revisium/revo/releases) page; use
+**Watch → Custom → Releases** to be notified. Running the install command again installs the newest
+alpha next to the current version and switches `revo-alpha` to it. A server that is already running
+keeps the previous version until you restart it with `revo-alpha server stop` and `revo-alpha`.
+
+### Where Revo lives
+
+The program lives in `~/.local/share/revo/alpha` (`$REVO_INSTALL_ROOT/alpha` when that variable is
+set): private Node.js and pnpm, one directory per installed version, and the `current` link to the
+active version. User data is stored separately and the installer never touches it:
+
+| Platform | Data, configuration, state, and logs                                                                    |
+| -------- | ------------------------------------------------------------------------------------------------------- |
+| Linux    | `~/.local/share/revo-alpha`, `~/.config/revo-alpha`, `~/.local/state/revo-alpha`, `~/.cache/revo-alpha` |
+| macOS    | `~/Library/Application Support/Revo Alpha`, `~/Library/Caches/Revo Alpha`                               |
+
+On Linux the `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` variables
+move these directories. `revo-alpha doctor` prints the paths in use.
+
+### Uninstall
+
+Stop the server, then remove the program and the command:
+
+```sh
+revo-alpha server stop
+rm -rf ~/.local/share/revo/alpha ~/.local/bin/revo-alpha
+```
+
+Your data stays in place. To remove it as well, which cannot be undone, delete the data directories
+listed above, for example on Linux:
+
+```sh
+rm -rf ~/.local/share/revo-alpha ~/.config/revo-alpha ~/.local/state/revo-alpha ~/.cache/revo-alpha
+```
 
 ## Responsibilities
 
@@ -83,11 +141,12 @@ directory, so long home directories and user names stay within the macOS socket 
 
 ## Development
 
-Use Node.js 26.8.2 and pnpm 12.4.1 in an isolated development environment:
+Use Node.js 26.8.2 and pnpm 12.8.2 in an isolated development environment:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm verify
 ```
 
-See [VERIFICATION.md](VERIFICATION.md) for the complete local gate.
+See [VERIFICATION.md](VERIFICATION.md) for the complete local gate and
+[docs/release-bundle.md](docs/release-bundle.md) for release assets and the installer smoke test.

@@ -54,6 +54,18 @@ export function tarFixture(files: Record<string, string>, gzip = true): Uint8Arr
   return gzip ? gzipSync(tar) : tar;
 }
 
+function pinnedVersions(manifest: {
+  readonly dependencies: Readonly<Record<string, string>>;
+  readonly packageManager: string;
+}) {
+  return {
+    core: manifest.dependencies['@revisium/revo-core'] ?? '',
+    admin: manifest.dependencies['@revisium/revo-admin'] ?? '',
+    node: '26.8.2',
+    pnpm: manifest.packageManager.replace(/^pnpm@/u, ''),
+  };
+}
+
 export async function packageArtifactScenario(
   options: {
     readonly channel?: 'stable' | 'alpha';
@@ -75,6 +87,7 @@ export async function packageArtifactScenario(
       : {
           ...(options.channel === undefined ? {} : { channel: options.channel }),
           version: options.version ?? actualManifest?.version,
+          ...(actualManifest === undefined ? {} : { versions: pinnedVersions(actualManifest) }),
         },
   );
   const release = fixture.manifest.release;
