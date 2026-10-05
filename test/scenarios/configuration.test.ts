@@ -71,7 +71,10 @@ describe('configuration resolution', () => {
         exitCode: 2,
       });
       const command = launcher === 'alpha' ? 'revo-alpha' : 'revo';
-      expect((failure as Error).message).toContain(`${command} runs the ${launcher} channel`);
+      expect(failure).toHaveProperty(
+        'message',
+        expect.stringContaining(`${command} runs the ${launcher} channel`),
+      );
     },
   );
 

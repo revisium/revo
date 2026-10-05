@@ -335,7 +335,7 @@ describe('server command presentation', () => {
       { read: unused },
       { stop: unused },
       { version: '2.0.0' },
-      { write: unused, writeError: (message) => written.push(message), progress },
+      { write: () => undefined, writeError: (message) => written.push(message), progress },
     );
 
     await expect(service.ensureRunning({ channel: 'alpha' })).resolves.toBe(stale);
@@ -587,9 +587,10 @@ describe('readable server start failures', () => {
     run(['server', 'start', '--log-dir', log.configuration.logDir], {
       resolve: async () => log.configuration,
       launch: async () => {
-        for (const attempt of attempts) {
-          await log.startAttempt(attempt);
-        }
+        await attempts.reduce(
+          (written, attempt) => written.then(() => log.startAttempt(attempt)),
+          Promise.resolve(),
+        );
         throw error;
       },
     });

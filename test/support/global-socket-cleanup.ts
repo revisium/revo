@@ -23,11 +23,10 @@ export default async function setup(): Promise<() => Promise<void>> {
   const userDirectory = userDirectoryOf(DEFAULT_CONTROL_SOCKET_ROOT, uid);
   const before = await entries(userDirectory);
   return async () => {
-    for (const name of await entries(userDirectory)) {
-      if (before?.has(name) !== true) {
-        await removeScope(join(userDirectory, name));
-      }
-    }
+    const added = [...((await entries(userDirectory)) ?? [])].filter(
+      (name) => before?.has(name) !== true,
+    );
+    await Promise.all(added.map((name) => removeScope(join(userDirectory, name))));
     if (before === undefined) {
       await rmdir(userDirectory).catch(() => undefined);
     }
@@ -43,12 +42,14 @@ async function entries(directory: string): Promise<Set<string> | undefined> {
 }
 
 async function removeScope(directory: string): Promise<void> {
-  for (const name of (await entries(directory)) ?? []) {
-    const path = join(directory, name);
-    if (await isStale(path)) {
-      await unlink(path).catch(() => undefined);
-    }
-  }
+  const sockets = [...((await entries(directory)) ?? [])].map((name) => join(directory, name));
+  await Promise.all(
+    sockets.map(async (path) => {
+      if (await isStale(path)) {
+        await unlink(path).catch(() => undefined);
+      }
+    }),
+  );
   await rmdir(directory).catch(() => undefined);
 }
 

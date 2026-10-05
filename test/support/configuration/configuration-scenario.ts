@@ -8,7 +8,6 @@ import type {
   RevoConfiguration,
 } from '../../../src/configuration/configuration.types.js';
 import { ConfigurationResolver } from '../../../src/configuration/index.js';
-import type { ReleaseChannel } from '../../../src/layout.js';
 
 export class ConfigurationScenario {
   private env: Record<string, string | undefined> = {};
@@ -56,7 +55,7 @@ export class ConfigurationScenario {
     return this;
   }
 
-  withLauncher(channel: ReleaseChannel | string): this {
+  withLauncher(channel: string): this {
     this.env = { ...this.env, REVO_LAUNCHER_CHANNEL: channel };
     return this;
   }

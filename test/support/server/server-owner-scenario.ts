@@ -28,7 +28,6 @@ import type {
   ProcessMessage,
   StopProcessRequest,
 } from '../../../src/processes/managed-process.types.js';
-import type { ServerOwnership } from '../../../src/processes/ownership.types.js';
 import {
   PublishedControlError,
   PublishedControlService,

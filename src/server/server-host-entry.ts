@@ -172,12 +172,12 @@ export class ServerHostEntry {
       if (this.mode === 'foreground' && this.state === 'ready-awaiting-commit') {
         this.clearDeadline();
       }
-    } catch (error) {
-      this.handleOpenFailure(error);
+    } catch {
+      this.handleOpenFailure();
     }
   }
 
-  private handleOpenFailure(error: unknown): void {
+  private handleOpenFailure(): void {
     this.openPending = false;
     if (this.state === 'committed') {
       return;
