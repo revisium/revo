@@ -9,6 +9,8 @@ import type {
   StopProcessRequest,
 } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
+import { EmbeddedDataVersion } from './embedded-data-version.js';
+import { EmbeddedPostgresBackupService } from './embedded-postgres-backup.service.js';
 import { EmbeddedPostgresLockRecovery } from './embedded-postgres-lock.js';
 import { EmbeddedPostgresLog } from './embedded-postgres-log.js';
 import {
@@ -50,12 +52,20 @@ export class EmbeddedPostgresResourceService {
     private readonly ports = new LoopbackPortAllocator(),
     @Inject(EmbeddedPostgresLockRecovery)
     private readonly lockRecovery = new EmbeddedPostgresLockRecovery(undefined, processes),
+    @Inject(EmbeddedPostgresBackupService)
+    private readonly backups = new EmbeddedPostgresBackupService(),
   ) {}
 
-  bind(canonicalDataDir: string, progress: StartupProgressFacade, logPath: string) {
+  bind(
+    canonicalDataDir: string,
+    progress: StartupProgressFacade,
+    logPath: string,
+    revoVersion: string,
+  ) {
     const log = new EmbeddedPostgresLog(logPath);
     return new OwnedEmbeddedPostgresResource(
       this.preparation.bind(canonicalDataDir, progress, log),
+      new EmbeddedDataVersion(canonicalDataDir, revoVersion, this.backups),
       this.processes,
       this.ports,
       this.lockRecovery,
@@ -79,6 +89,7 @@ export class OwnedEmbeddedPostgresResource {
 
   constructor(
     private readonly preparation: OwnedEmbeddedPostgresPreparation,
+    private readonly dataVersion: EmbeddedDataVersion,
     private readonly processes: ManagedProcessService,
     private readonly ports: LoopbackPortAllocator,
     private readonly lockRecovery: EmbeddedPostgresLockRecovery,
@@ -140,6 +151,7 @@ export class OwnedEmbeddedPostgresResource {
     const deadline = Date.now() + request.timeoutMs;
     const timer = setTimeout(abort, request.timeoutMs);
     try {
+      const admitted = await this.dataVersion.admit();
       const prepared = await this.preparation.prepare({
         signal: controller.signal,
         timeoutMs: remaining(deadline),
@@ -153,6 +165,7 @@ export class OwnedEmbeddedPostgresResource {
         signal: controller.signal,
         deadline,
       });
+      await this.dataVersion.adopt(admitted, prepared, controller.signal);
       const ready = await this.startAttempts(
         prepared.postgres,
         prepared.clusterDir,

@@ -18,7 +18,9 @@ export interface PreparedEmbeddedPostgres {
 }
 
 export type EmbeddedPostgresFailureReason =
+  | 'backup'
   | 'cancelled'
+  | 'incompatible'
   | 'invalid'
   | 'locked'
   | 'process'
