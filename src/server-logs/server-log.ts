@@ -65,9 +65,11 @@ export async function openServerLog(
   }
 }
 
+/** With `since`, only a start attempt recorded at or after that time counts as this start's log. */
 export async function readServerLogTail(
   location: ServerLogLocation,
   maxLines = SERVER_LOG_TAIL_LINES,
+  since?: number,
 ): Promise<ServerLogTail | undefined> {
   let path: string;
   let handle: FileHandle;
@@ -86,7 +88,14 @@ export async function readServerLogTail(
     if (start > 0) {
       lines.shift();
     }
-    return { path, lines: latestAttempt(lines).slice(-maxLines).map(printable) };
+    const attempt = latestAttempt(lines);
+    const marked = attempt[0]?.startsWith(ATTEMPT_MARKER) === true;
+    // Without a marker in the window, the last write time tells whether this start wrote to the log.
+    const started = marked ? attemptTime(attempt[0]) : (await handle.stat()).mtimeMs;
+    if (since !== undefined && (Number.isNaN(started) || started < since)) {
+      return undefined;
+    }
+    return { path, lines: attempt.slice(-maxLines).map(printable) };
   } catch {
     return undefined;
   } finally {
@@ -134,6 +143,14 @@ function latestAttempt(lines: readonly string[]): readonly string[] {
   const complete = lines.at(-1) === '' ? lines.slice(0, -1) : lines;
   const start = complete.findLastIndex((line) => line.startsWith(ATTEMPT_MARKER));
   return start < 0 ? complete : complete.slice(start);
+}
+
+function attemptTime(marker: string | undefined): number {
+  if (marker?.startsWith(ATTEMPT_MARKER) !== true) {
+    return Number.NaN;
+  }
+  const [stamp = ''] = marker.slice(ATTEMPT_MARKER.length).trim().split(' ');
+  return Date.parse(stamp);
 }
 
 /** Log lines reach a terminal; control characters must not become terminal commands. */

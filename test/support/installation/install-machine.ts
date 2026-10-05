@@ -562,6 +562,7 @@ export class InstallMachine {
         '  process.exit(1);',
         '}',
         `if (process.argv[2] === '--version') console.log(${JSON.stringify(version)});`,
+        "if (process.argv[2] === '--launcher-channel') console.log(process.env.REVO_LAUNCHER_CHANNEL);",
         '',
       ].join('\n'),
     });

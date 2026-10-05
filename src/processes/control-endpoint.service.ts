@@ -6,7 +6,7 @@ import { Inject, Injectable, Optional } from '@nestjs/common';
 
 import {
   CONTROL_SOCKET_ROOT,
-  DEFAULT_CONTROL_SOCKET_ROOT,
+  controlSocketRoot,
   prepareControlEndpoint,
 } from './control-endpoint.directory.js';
 import {
@@ -42,7 +42,7 @@ export class ControlEndpointService {
   constructor(
     @Optional()
     @Inject(CONTROL_SOCKET_ROOT)
-    private readonly socketRoot: string = DEFAULT_CONTROL_SOCKET_ROOT,
+    private readonly socketRoot: string = controlSocketRoot(),
   ) {}
 
   async listen(request: ListenControlEndpointRequest): Promise<HeldControlEndpoint> {

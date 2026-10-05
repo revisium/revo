@@ -91,6 +91,22 @@ describe('revo tui command', () => {
     expect(result.launches).toEqual([]);
   });
 
+  it.each([
+    { args: [], fixture: { launcherChannel: 'alpha' }, command: 'revo-alpha' },
+    { args: ['--channel', 'alpha'], fixture: {}, command: 'revo-alpha' },
+    { args: [], fixture: { launcherChannel: 'stable' }, command: 'revo' },
+  ] as const)('names the $command command when the platform is unsupported', async (input) => {
+    const result = await run(input.args, { ...input.fixture, platform: 'freebsd' });
+
+    expect(result.stderr).toBe(`${input.command} tui is supported only on Linux and macOS.\n`);
+  });
+
+  it('names the alpha command when the terminal is not interactive', async () => {
+    const result = await run([], { launcherChannel: 'alpha', stdoutTTY: false });
+
+    expect(result.stderr).toBe('revo-alpha tui requires a TTY on stdin and stdout.\n');
+  });
+
   it.each(['linux', 'darwin'] as const)(
     'continues to launch on supported platform %s',
     async (platform) => {

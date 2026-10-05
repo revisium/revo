@@ -49,6 +49,7 @@ export class AbandonedServerFixture {
         REVO_TEST_DATA: this.dataDir,
         REVO_TEST_LOG: join(this.root, 'l'),
         REVO_TEST_RUNTIME: join(this.root, 'r'),
+        REVO_CONTROL_SOCKET_ROOT: process.env.REVO_CONTROL_SOCKET_ROOT,
       },
     });
     await new Promise<void>((resolve, reject) => {

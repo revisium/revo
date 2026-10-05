@@ -24,6 +24,8 @@ export type ControlServerStatus = {
   readonly port?: number;
   readonly publicUrl?: string;
   readonly ownership?: 'retained' | 'unconfirmed';
+  /** Revo version of the answering server, taken from its verified control record. */
+  readonly version?: string;
 };
 
 export interface ListenControlEndpointRequest {

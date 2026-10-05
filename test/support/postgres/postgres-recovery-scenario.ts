@@ -321,6 +321,7 @@ export class PostgresRecoveryScenario {
         REVO_TEST_DATA: this.dataDir,
         REVO_TEST_LOG: this.logDir,
         REVO_TEST_RUNTIME: this.runtimeDir,
+        REVO_CONTROL_SOCKET_ROOT: process.env.REVO_CONTROL_SOCKET_ROOT,
       },
     });
     this.children.add(child);

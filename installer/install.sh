@@ -233,6 +233,8 @@ write_launcher() {
   mkdir "$1/bin" || return 1
   cat >"$1/bin/$command_name" <<EOF || return 1
 #!/bin/sh
+REVO_LAUNCHER_CHANNEL=$channel
+export REVO_LAUNCHER_CHANNEL
 exec $(quoted "$node_home/bin/node") $(quoted "$version_home/dist/bin/revo.js") "\$@"
 EOF
   chmod 755 "$1/bin/$command_name"

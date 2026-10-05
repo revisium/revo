@@ -22,34 +22,6 @@ import { ServerOwnershipService } from './server-ownership.service.js';
 
 type PublishedControlCleanupFailure = 'endpoint' | 'metadata' | 'ownership';
 
-async function acquirePublishedLease(
-  ownership: ServerOwnershipService,
-  request: OpenPublishedControlRequest,
-) {
-  const lease = await ownership.acquire(request.dataDir);
-  if (lease.kind === 'busy' || request.afterOwnershipAcquired === undefined) {
-    return lease;
-  }
-  try {
-    await request.afterOwnershipAcquired();
-  } catch (error) {
-    let state: 'released' | 'unconfirmed' = 'released';
-    try {
-      await lease.release();
-    } catch {
-      state = 'unconfirmed';
-    }
-    const failure = new PublishedControlError(
-      'startup',
-      state === 'unconfirmed' ? ['ownership'] : [],
-      state,
-    );
-    failure.cause = error;
-    throw failure;
-  }
-  return lease;
-}
-
 export class PublishedControlError extends Error {
   readonly code = 'PUBLISHED_CONTROL_ERROR';
   constructor(
@@ -78,7 +50,7 @@ export class PublishedControlService {
   ) {}
 
   async open(request: OpenPublishedControlRequest): Promise<PublishedControl> {
-    const lease = await acquirePublishedLease(this.ownership, request);
+    const lease = await this.ownership.acquire(request.dataDir);
     if (lease.kind === 'busy') {
       return lease;
     }

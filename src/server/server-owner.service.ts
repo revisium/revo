@@ -12,9 +12,6 @@ import {
   CoreHostProcessResource,
   CoreHostProcessService,
 } from '../core-host/core-host-process.service.js';
-import type { ActivationBinding } from '../installation/activation-record.js';
-import { ActivationRecordError } from '../installation/activation-record.js';
-import { readActivation } from '../installation/activation-store.js';
 import { readEmbeddedPostgresCredential } from '../postgres/embedded-postgres-preparation.service.js';
 import {
   EmbeddedPostgresError,
@@ -51,7 +48,6 @@ export interface ServerOwnerConfiguration {
   readonly runtimeDir: string;
   readonly startupTimeout: number;
   readonly version: string;
-  readonly activation?: ActivationBinding;
 }
 
 export interface OpenServerOwnerRequest {
@@ -133,18 +129,12 @@ export class ServerOwnerService {
     });
     void ownerAssigned.catch(() => undefined);
     let held: PublishedControl;
-    const activation = request.configuration.activation;
     try {
       held = await this.controls.open({
         dataDir: request.configuration.dataDir,
         logDir: request.configuration.logDir,
         runtimeDir: request.configuration.runtimeDir,
         version: request.configuration.version,
-        ...(activation === undefined
-          ? {}
-          : {
-              afterOwnershipAcquired: () => validateActivation(request.configuration, activation),
-            }),
         channel: request.configuration.channel,
         ...(request.configuration.databaseUrl !== undefined
           ? { databaseUrl: request.configuration.databaseUrl }
@@ -172,24 +162,6 @@ export class ServerOwnerService {
     resolveOwner(owner);
     await earlyStop;
     return owner;
-  }
-}
-
-async function validateActivation(
-  configuration: ServerOwnerConfiguration,
-  binding: ActivationBinding,
-): Promise<void> {
-  const current = await readActivation(binding.channelRoot);
-  if (current.status === 'invalid' && current.code === 'REVO_ACTIVATION_STATE_INCOMPATIBLE') {
-    throw new ActivationRecordError(current.reason);
-  }
-  if (
-    current.status !== 'valid' ||
-    current.record.generationId !== binding.generationId ||
-    current.record.channel !== configuration.channel ||
-    current.record.release.version !== configuration.version
-  ) {
-    throw new Error('activation binding does not match current generation');
   }
 }
 

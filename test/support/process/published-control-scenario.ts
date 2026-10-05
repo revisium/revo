@@ -257,6 +257,7 @@ export class PublishedControlScenario {
         REVO_TEST_DATA: fixture.dataDir,
         REVO_TEST_LOG: fixture.logDir,
         REVO_TEST_RUNTIME: fixture.runtimeDir,
+        REVO_CONTROL_SOCKET_ROOT: process.env.REVO_CONTROL_SOCKET_ROOT,
       },
     });
     this.children.add(child);

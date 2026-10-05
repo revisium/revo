@@ -72,7 +72,7 @@ export class ServerStatusService {
     if (!(await this.probeLive(status, first.record, dataDir, bounded, deadline))) {
       return { kind: 'unknown' };
     }
-    return { kind: 'running', status };
+    return { kind: 'running', status: { ...status, version: first.record.version } };
   }
 
   private async probeLive(

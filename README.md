@@ -114,8 +114,8 @@ node dist/bin/revo.js server status
 node dist/bin/revo.js server stop
 ```
 
-Running `revo` without arguments ensures the server is running and prints one verified URL. `--web`
-also opens that URL in the default browser. `revo tui` starts or reuses the selected local server,
+Running `revo-alpha` without arguments ensures the server is running and prints one verified URL.
+`--web` also opens that URL in the default browser. `revo-alpha tui` starts or reuses the selected local server,
 then opens the terminal client against its verified GraphQL endpoint. It requires an interactive
 stdin/stdout and is supported on Linux and macOS only; other platforms fail before the server is
 started. Exiting the TUI leaves the server running. `--channel`, `--config`, `--data-dir`, and
@@ -124,12 +124,19 @@ settings, including host, port, public URL, database URL, and log directory, com
 configuration file or environment. Unknown arguments and options fail with exit code 2. The package
 manifest remains private during the foundation stage.
 
+Each installed command belongs to one channel: `revo-alpha` always runs the alpha channel and
+`revo` the stable one, and the commands in Revo's messages name the channel in use. A command
+refuses `--channel` or `REVO_CHANNEL` naming another channel. If a server is already running when
+you start a different installed version, `revo-alpha` prints a notice that the server keeps its
+version until you run `revo-alpha server stop` and then `revo-alpha`. The examples above run the
+built package directly and stay on the channel that its version selects.
+
 ## Server logs
 
 A started server appends its own and Revo Core's output to a private `server.log` (mode `0600`)
-next to the lifecycle journal shown by `revo server logs`, in
+next to the lifecycle journal shown by `revo-alpha server logs`, in
 `<log directory>/<channel>/<data directory hash>/`. Embedded PostgreSQL writes to `postgres.log` in
-the same directory. Database credentials are redacted. When a start fails, `revo server start`
+the same directory. Database credentials are redacted. When a start fails, `revo-alpha server start`
 prints the reason, the log path, and the last 40 lines of that start; a PostgreSQL failure also
 names its own reason and `postgres.log`. A start over a server that no longer answers but still owns
 the data directory is refused with that explanation.

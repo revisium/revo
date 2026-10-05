@@ -6,6 +6,7 @@ import { CommandFactory } from 'nest-commander';
 
 import { cliFailure } from '../../../src/cli/cli-error.js';
 import { TuiCommand } from '../../../src/cli/commands/tui.command.js';
+import { PackageMetadataService } from '../../../src/cli/package-metadata.service.js';
 import { ServerCommandService } from '../../../src/cli/server-command.service.js';
 import {
   TUI_LAUNCHER,
@@ -51,6 +52,7 @@ export interface TuiCommandFixture {
   readonly resolvedDataDir?: string;
   readonly exitCode?: number;
   readonly launchError?: Error;
+  readonly launcherChannel?: 'stable' | 'alpha';
 }
 
 export class TuiCommandScenario {
@@ -96,6 +98,7 @@ export class TuiCommandScenario {
         TuiCommand,
         TuiCommandService,
         { provide: ServerCommandService, useValue: server },
+        { provide: PackageMetadataService, useValue: { cliName: 'revo', version: '1.0.0' } },
         { provide: TUI_LAUNCHER, useValue: launch },
         { provide: TUI_TERMINAL, useValue: terminal },
       ],
@@ -104,7 +107,13 @@ export class TuiCommandScenario {
     class TestModule {}
 
     const argv = process.argv;
+    const launcher = process.env.REVO_LAUNCHER_CHANNEL;
     process.argv = ['node', 'revo', ...args];
+    if (fixture.launcherChannel === undefined) {
+      delete process.env.REVO_LAUNCHER_CHANNEL;
+    } else {
+      process.env.REVO_LAUNCHER_CHANNEL = fixture.launcherChannel;
+    }
     let exitCode = 0;
     try {
       await CommandFactory.run(TestModule, {
@@ -125,6 +134,11 @@ export class TuiCommandScenario {
       }
     } finally {
       process.argv = argv;
+      if (launcher === undefined) {
+        delete process.env.REVO_LAUNCHER_CHANNEL;
+      } else {
+        process.env.REVO_LAUNCHER_CHANNEL = launcher;
+      }
     }
 
     return {

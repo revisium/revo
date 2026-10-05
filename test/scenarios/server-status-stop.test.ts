@@ -83,7 +83,11 @@ describe('server status and stop services', () => {
     });
     await expect(new ServerStatusService().read(fixture.dataDir, limits)).resolves.toMatchObject({
       kind: 'running',
-      status: { operationId: 'abcdefabcdefabcdefabcdefabcdefab', port: address.port },
+      status: {
+        operationId: 'abcdefabcdefabcdefabcdefabcdefab',
+        port: address.port,
+        version: '0.0.0',
+      },
     });
     let changed = false;
     http.on('request', () => {

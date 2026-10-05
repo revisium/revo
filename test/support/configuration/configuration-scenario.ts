@@ -8,7 +8,6 @@ import type {
   RevoConfiguration,
 } from '../../../src/configuration/configuration.types.js';
 import { ConfigurationResolver } from '../../../src/configuration/index.js';
-import type { ReleaseChannel } from '../../../src/layout.js';
 
 export class ConfigurationScenario {
   private env: Record<string, string | undefined> = {};
@@ -16,7 +15,6 @@ export class ConfigurationScenario {
   private flags: ConfigurationFlags = {};
   private packageVersion = '1.0.0';
   private platform: 'darwin' | 'linux' = 'linux';
-  private wrapperChannel: ReleaseChannel | undefined;
   private explicitMissing = false;
   private fileSelection: 'environment' | 'flags' = 'flags';
 
@@ -57,8 +55,8 @@ export class ConfigurationScenario {
     return this;
   }
 
-  withWrapper(channel: ReleaseChannel): this {
-    this.wrapperChannel = channel;
+  withLauncher(channel: string): this {
+    this.env = { ...this.env, REVO_LAUNCHER_CHANNEL: channel };
     return this;
   }
 
@@ -92,7 +90,6 @@ export class ConfigurationScenario {
         homeDir,
         packageVersion: this.packageVersion,
         platform: this.platform,
-        ...(this.wrapperChannel === undefined ? {} : { wrapperChannel: this.wrapperChannel }),
       });
     });
   }

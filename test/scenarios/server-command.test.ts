@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { ServerCommandService } from '../../src/cli/server-command.service.js';
 import { ConfigurationError } from '../../src/configuration/configuration-error.js';
 import { ManagedProcessError } from '../../src/processes/managed-process-error.js';
 import { ProgressOperation, parseProgressEvent } from '../../src/progress/index.js';
@@ -237,6 +238,20 @@ describe('revo server command line', () => {
     }
   }, 240_000);
 
+  it('keeps a plain-mode server running and exits cleanly when stdout and stderr are closed', async () => {
+    const server = await IsolatedServerScenario.create();
+    try {
+      const fresh = await server.startWithClosedOutput('plain');
+      const afterFresh = await server.status();
+      const reused = await server.startWithClosedOutput('plain');
+
+      expect([fresh, reused]).toEqual([CLEAN_EXIT, CLEAN_EXIT]);
+      expect(afterFresh).toMatchObject(RUNNING);
+    } finally {
+      await server.dispose();
+    }
+  }, 240_000);
+
   it('reports an isolated home as stopped without starting a server', async () => {
     const status = await CliScenario.runIsolated(['server', 'status']);
     const stop = await CliScenario.runIsolated(['server', 'stop']);
@@ -263,6 +278,85 @@ describe('server command presentation', () => {
     expect(result).toMatchObject({ exitCode: code, stderr: err, stdout: out });
     expect(result.listeners).toEqual(NO_LISTENERS);
     expect([result.resolves, result.reads]).toEqual([[], []]);
+  });
+
+  it.each([
+    { flags: [], command: 'revo' },
+    { flags: ['--channel', 'alpha'], command: 'revo-alpha' },
+  ])('tells how to restart a stale server with $command', async ({ flags, command }) => {
+    const stale: ServerLaunchResult = {
+      kind: 'running',
+      status: { phase: 'running', version: '1.0.0' },
+    };
+
+    const result = await run(['server', 'start', ...flags], {
+      launch: async () => stale,
+      version: '2.0.0',
+    });
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stdout: 'Server is already running.\n',
+      stderr: `Revo 2.0.0 is installed, but the running server is 1.0.0. Run '${command} server stop', then '${command}' to start 2.0.0.\n`,
+    });
+  });
+
+  it('stays quiet when the running server has the installed version', async () => {
+    const current: ServerLaunchResult = {
+      kind: 'running',
+      status: { phase: 'running', version: '2.0.0' },
+    };
+
+    const result = await run(['server', 'start'], {
+      launch: async () => current,
+      version: '2.0.0',
+    });
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: '',
+      stdout: 'Server is already running.\n',
+    });
+  });
+
+  it('tells how to restart a stale server for the default command too', async () => {
+    const written: string[] = [];
+    const stale: ServerLaunchResult = {
+      kind: 'running',
+      status: { phase: 'running', version: '1.0.0' },
+    };
+    const unused = async () => Promise.reject(new Error('unused'));
+    const progress = (): never => {
+      throw new Error('unused');
+    };
+    const service = new ServerCommandService(
+      { launch: async () => stale, launchWithConfiguration: unused },
+      { resolve: unused },
+      { read: unused },
+      { stop: unused },
+      { version: '2.0.0' },
+      { write: () => undefined, writeError: (message) => written.push(message), progress },
+    );
+
+    await expect(service.ensureRunning({ channel: 'alpha' })).resolves.toBe(stale);
+
+    expect(written).toEqual([
+      "Revo 2.0.0 is installed, but the running server is 1.0.0. Run 'revo-alpha server stop', then 'revo-alpha' to start 2.0.0.",
+    ]);
+  });
+
+  it('does not mix the restart notice into JSONL progress', async () => {
+    const stale: ServerLaunchResult = {
+      kind: 'running',
+      status: { phase: 'running', version: '1.0.0' },
+    };
+
+    const result = await run(['server', 'start', '--progress=jsonl'], {
+      launch: async () => stale,
+      version: '2.0.0',
+    });
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
   });
 
   it.each<InspectRow>([
@@ -399,7 +493,6 @@ describe('server command requests and failures', () => {
       expect(request?.packageVersion).toBe('9.8.7');
       expect(request?.platform).toBe(process.platform);
       expect(request?.signal.aborted).toBe(false);
-      expect(request).not.toHaveProperty('wrapperChannel');
       expect(result.resolves).toEqual([]);
     } finally {
       delete process.env.REVO_COMMAND_SNAPSHOT;
@@ -427,11 +520,6 @@ describe('server command requests and failures', () => {
   );
 
   it.each([
-    {
-      error: launchError('REVO_ACTIVATION_STATE_INCOMPATIBLE'),
-      stderr:
-        'Installation activation format is incompatible. Keep your data and reinstall into a new installation directory.\n',
-    },
     { error: launchError('START_BUSY'), stderr: 'Server start is busy.\n' },
     { error: launchError('START_CANCELLED'), stderr: CANCELLED },
     { error: new ManagedProcessError('revo.process.cancelled', 'cancelled'), stderr: CANCELLED },
@@ -490,18 +578,30 @@ describe('readable server start failures', () => {
     logs.push(log);
     return log;
   };
-  const failedStart = (log: ServerLogFixture, error: Error) =>
+  /** The launch records its attempts in the log, as the real launcher does, and then fails. */
+  const failedStart = (
+    log: ServerLogFixture,
+    error: Error,
+    attempts: readonly (readonly string[])[] = [],
+  ) =>
     run(['server', 'start', '--log-dir', log.configuration.logDir], {
       resolve: async () => log.configuration,
-      launch: () => Promise.reject(error),
+      launch: async () => {
+        await attempts.reduce(
+          (written, attempt) => written.then(() => log.startAttempt(attempt)),
+          Promise.resolve(),
+        );
+        throw error;
+      },
     });
 
   it('prints the reason, the server log path, and the last 40 lines of the failed start', async () => {
     const log = await fixture();
     const lines = Array.from({ length: 60 }, (_, index) => `core output ${String(index + 1)}`);
-    await log.startAttempt([...lines.slice(0, -1), 'ERROR [CoreHost] Core migration failed']);
 
-    const result = await failedStart(log, launchError('START_FAILED', 'completed'));
+    const result = await failedStart(log, launchError('START_FAILED', 'completed'), [
+      [...lines.slice(0, -1), 'ERROR [CoreHost] Core migration failed'],
+    ]);
 
     expect(result.exitCode).toBe(1);
     expect(result.resolves.map((input) => input.flags)).toEqual([
@@ -521,15 +621,26 @@ describe('readable server start failures', () => {
 
   it('shows only the lines of the latest start attempt', async () => {
     const log = await fixture();
-    await log.startAttempt(['previous attempt failure']);
-    await log.startAttempt(['Database start failed: connection refused']);
 
-    const result = await failedStart(log, launchError('START_OUTCOME_UNKNOWN'));
+    const result = await failedStart(log, launchError('START_OUTCOME_UNKNOWN'), [
+      ['previous attempt failure'],
+      ['Database start failed: connection refused'],
+    ]);
 
     expect(result.stderr).toContain('Server start outcome is unknown.\n');
     expect(result.stderr).toContain('Database start failed: connection refused');
     expect(result.stderr).not.toContain('previous attempt failure');
     expect(result.stderr).toMatch(/Last 2 log lines:\n--- Revo server start \S+ ---\n/u);
+  });
+
+  it('does not print the tail of an earlier start when this start could not open the log', async () => {
+    const log = await fixture();
+    await log.startAttempt(['failure of a previous start']);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const result = await failedStart(log, launchError('START_FAILED'));
+
+    expect(result).toMatchObject({ exitCode: 1, stderr: FAILED, stdout: '' });
   });
 
   it('prints only the diagnostic when no server log exists', async () => {

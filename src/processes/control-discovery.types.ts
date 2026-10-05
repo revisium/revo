@@ -31,7 +31,6 @@ export interface OpenPublishedControlRequest {
   readonly onStatus?: () => ControlServerStatus | Promise<ControlServerStatus>;
   readonly startupProgress?: StartupProgressOptions;
   readonly databaseUrl?: string;
-  readonly afterOwnershipAcquired?: () => void | Promise<void>;
 }
 
 interface HeldPublishedControlBase {

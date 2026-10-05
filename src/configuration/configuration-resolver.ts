@@ -1,7 +1,8 @@
 import net from 'node:net';
 import path from 'node:path';
 
-import { resolveRevoLayout, type ReleaseChannel } from '../layout.js';
+import { selectChannel } from '../channel.js';
+import { resolveRevoLayout } from '../layout.js';
 import { ConfigFileLoader } from './config-file-loader.js';
 import { invalidConfiguration } from './configuration-error.js';
 import {
@@ -39,7 +40,7 @@ export class ConfigurationResolver {
   constructor(private readonly fileLoader = new ConfigFileLoader()) {}
 
   async resolve(input: Readonly<ConfigurationInput>): Promise<Readonly<RevoConfiguration>> {
-    const channel = this.channel(input);
+    const channel = selectChannel(input);
     this.layoutPaths(input);
     const baseLayout = resolveRevoLayout({
       channel,
@@ -103,28 +104,6 @@ export class ConfigurationResolver {
       publicUrl,
       startupTimeout,
     });
-  }
-
-  private channel(input: Readonly<ConfigurationInput>): ReleaseChannel {
-    const selected =
-      input.flags.channel ??
-      input.env.REVO_CHANNEL ??
-      (input.wrapperChannel === 'alpha' ? 'alpha' : this.packageChannel(input.packageVersion));
-    if (selected !== 'stable' && selected !== 'alpha') {
-      invalidConfiguration(
-        'channel',
-        input.flags.channel === undefined ? 'environment' : 'flags',
-        'must be stable or alpha',
-      );
-    }
-    if (input.wrapperChannel === 'alpha' && selected !== 'alpha') {
-      invalidConfiguration('channel', 'wrapper', 'alpha wrapper cannot select stable');
-    }
-    return selected;
-  }
-
-  private packageChannel(version: string): ReleaseChannel {
-    return /^\d+\.\d+\.\d+-/u.test(version) ? 'alpha' : 'stable';
   }
 
   private configurationFile(value: unknown): Readonly<ConfigurationFile> {
