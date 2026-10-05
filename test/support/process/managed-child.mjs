@@ -16,4 +16,8 @@ if (mode === 'environment') {
 } else if (mode === 'resist') {
   process.on('SIGTERM', () => process.send({ state: 'term-received' }));
   process.on('message', () => process.send({ state: 'ready' }));
+} else if (mode === 'quit-only') {
+  process.on('SIGINT', () => process.send({ state: 'int-received' }));
+  process.on('SIGQUIT', () => process.exit(0));
+  process.on('message', () => process.send({ state: 'ready' }));
 }

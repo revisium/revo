@@ -1,4 +1,13 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 
@@ -21,6 +30,7 @@ import {
   PublishedControlError,
   PublishedControlService,
 } from '../../../src/processes/published-control.service.js';
+import type { ProgressEvent } from '../../../src/progress/index.js';
 import { StartupProgressJournalWriter } from '../../../src/startup-progress/startup-progress-journal.service.js';
 import { BlockingJournal } from '../startup-progress/blocking-journal.js';
 import { ClusterFixture } from './postgres-readiness-scenario.js';
@@ -63,6 +73,67 @@ export class PostgresLifecycleScenario {
       second,
       rows,
       passwordLength: (await readFile(join(fixture.dataDir, 'postgres-password'), 'utf8')).length,
+    };
+  }
+
+  async stopsAnOpenTransactionWithAFastShutdown() {
+    const fixture = await this.fixture();
+    const processes = new TrackedPostgresProcesses();
+    const resource = new EmbeddedPostgresResourceService(
+      new EmbeddedPostgresPreparationService(processes),
+      processes,
+    );
+    const owner = await this.open(fixture, FIRST_OPERATION, undefined, resource);
+    const started = await this.start(owner);
+    if (started.kind !== 'embedded') {
+      throw new Error('embedded database missing');
+    }
+    const transaction = await this.openTransaction(fixture.dataDir, started.port);
+    try {
+      const closed = await owner.close().then(
+        () => 'confirmed' as const,
+        () => 'unconfirmed' as const,
+      );
+      const log = await this.postgresLog(fixture.logDir);
+      return {
+        closed,
+        completion: await processes.completion,
+        fastShutdownLogged: log.content.includes('received fast shutdown request'),
+        logMode: log.mode,
+      };
+    } finally {
+      await transaction.end().catch(() => undefined);
+    }
+  }
+
+  async namesThePostgresLogWhenTheServerCannotStart() {
+    const fixture = await this.fixture();
+    const journal = new RecordingJournal();
+    const owner = await this.open(fixture, FIRST_OPERATION, undefined, undefined, journal);
+    await owner.prepareEmbeddedPostgres?.({
+      signal: new AbortController().signal,
+      timeoutMs: 30_000,
+    });
+    await appendFile(
+      join(fixture.dataDir, 'postgres', 'postgresql.conf'),
+      "\nshared_buffers = 'not-a-size'\n",
+    );
+    const outcome = await this.start(owner).then(
+      () => ({ kind: 'resolved' as const }),
+      (error: unknown) => ({
+        kind: 'rejected' as const,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    await owner.close();
+    const log = await this.postgresLog(fixture.logDir);
+    const failure = journal.failure();
+    return {
+      outcome,
+      failure: { phase: failure?.phase, logPath: failure?.logPath },
+      errorNamesLog: outcome.kind === 'rejected' && outcome.message.includes(log.path),
+      logPath: log.path,
+      causeLogged: log.content.includes('invalid value for parameter "shared_buffers"'),
     };
   }
 
@@ -460,6 +531,36 @@ export class PostgresLifecycleScenario {
     return owner.startDatabase({ signal: new AbortController().signal, timeoutMs: 30_000 });
   }
 
+  private async openTransaction(dataDir: string, port: number) {
+    const client = new Client({
+      host: '127.0.0.1',
+      port,
+      user: 'postgres',
+      password: await readFile(join(dataDir, 'postgres-password'), 'utf8'),
+      database: 'revo',
+      ssl: false,
+    });
+    client.on('error', () => undefined);
+    await client.connect();
+    await client.query('BEGIN');
+    await client.query('CREATE TABLE uncommitted_value (value text NOT NULL)');
+    return client;
+  }
+
+  private async postgresLog(logDir: string) {
+    const entries = await readdir(logDir, { recursive: true });
+    const relative = entries.find((entry) => entry.endsWith('postgres.log'));
+    if (relative === undefined) {
+      return { path: '', content: '', mode: undefined };
+    }
+    const path = join(logDir, relative);
+    return {
+      path,
+      content: await readFile(path, 'utf8'),
+      mode: (await stat(path)).mode & 0o777,
+    };
+  }
+
   private async query(dataDir: string, port: number, statements: readonly string[]) {
     const client = new Client({
       host: '127.0.0.1',
@@ -479,6 +580,19 @@ export class PostgresLifecycleScenario {
     } finally {
       await client.end();
     }
+  }
+}
+
+class RecordingJournal extends StartupProgressJournalWriter {
+  private events: readonly ProgressEvent[] = [];
+
+  override async write(...parameters: Parameters<StartupProgressJournalWriter['write']>) {
+    this.events = parameters[2];
+    return super.write(...parameters);
+  }
+
+  failure() {
+    return this.events.find((event) => event.status === 'failed');
   }
 }
 

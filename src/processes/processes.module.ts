@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 
+import { EmbeddedPostgresLockRecovery } from '../postgres/embedded-postgres-lock.js';
 import { EmbeddedPostgresPreparationService } from '../postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresResourceService } from '../postgres/embedded-postgres-resource.service.js';
 import { ExternalPostgresResourceService } from '../postgres/external-postgres-resource.service.js';
@@ -31,6 +32,7 @@ import { ServerOwnershipService } from './server-ownership.service.js';
   ],
   providers: [
     DarwinProcessIdentityAdapter,
+    EmbeddedPostgresLockRecovery,
     EmbeddedPostgresPreparationService,
     EmbeddedPostgresResourceService,
     ExternalPostgresResourceService,

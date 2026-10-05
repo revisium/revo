@@ -30,6 +30,24 @@ describe('process identity', () => {
       nativeBirthValid: true,
     });
   });
+  it('observes the working directory of a live child and reports it missing after exit', async () => {
+    const result = await scenario.observesChildWorkingDirectory();
+    expect(result.whileRunning).toEqual({ kind: 'captured', directory: result.expected });
+    expect(result.afterExit).toEqual({ kind: 'missing' });
+  });
+  it('decodes the Darwin working directory ABI exactly and maps its failures', async () => {
+    await expect(scenario.provesDarwinWorkingDirectoryBoundary()).resolves.toEqual({
+      complete: {
+        kind: 'captured',
+        directory: { device: 16_777_232n, inode: 9_007_199_254_740_993n },
+      },
+      partial: { kind: 'unknown' },
+      missing: { kind: 'missing' },
+      denied: { kind: 'unknown' },
+      unavailable: { kind: 'unknown' },
+      flavors: [9],
+    });
+  });
   it('parses Linux comm delimiters and uint64 ticks without precision loss', async () => {
     await expect(scenario.provesLinuxParsing()).resolves.toMatchObject({
       birth: { startTicks: '18446744073709551614' },
@@ -91,7 +109,18 @@ describe('process identity', () => {
       { kind: 'missing' },
       { kind: 'unknown', reason: 'malformed' },
       { kind: 'unknown', reason: 'unavailable' },
+      { kind: 'unknown', reason: 'denied' },
     ]);
+  });
+  it('reads the owner of a Darwin process whose details belong to another user', async () => {
+    await expect(scenario.observesAnotherUsersDarwinProcess()).resolves.toEqual({
+      live: { kind: 'restricted', uid: 0 },
+      flavors: [3, 13],
+      exited: { kind: 'missing' },
+      zombie: { kind: 'missing' },
+      partial: { kind: 'unknown', reason: 'denied' },
+      reused: { kind: 'unknown', reason: 'denied' },
+    });
   });
   it('rejects missing and incomplete Linux Uid status fields', async () => {
     await expect(scenario.observesMalformedLinuxStatus()).resolves.toEqual([

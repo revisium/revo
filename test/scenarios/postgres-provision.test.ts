@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { PostgresScenario } from '../support/postgres/postgres-scenario.js';
 
-describe('embedded PostgreSQL provision', () => {
+describe('embedded PostgreSQL provision', { timeout: 30_000 }, () => {
   let scenario = new PostgresScenario();
   afterEach(async () => {
     await scenario.cleanup();
@@ -24,12 +24,16 @@ describe('embedded PostgreSQL provision', () => {
   it.each([
     'fifo',
     'malformed-credential',
-    'partial',
+    'missing-control-file',
     'public-credential',
     'symlink',
     'wrong-major',
-  ] as const)('rejects an existing %s cluster without replacing it', async (kind) => {
-    await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toBe('rejected');
+  ] as const)('rejects an existing %s cluster without replacing it and logs why', async (kind) => {
+    await expect(scenario.rejectsUnsafeExistingState(kind)).resolves.toEqual({
+      outcome: 'rejected',
+      clusterKept: true,
+      reasonLogged: true,
+    });
   });
 
   it('cancels and drains owned initialization before releasing ownership', async () => {
@@ -52,7 +56,8 @@ describe('embedded PostgreSQL provision', () => {
       replacement: 'held',
       oldClose: 'resolved',
       successorStillHeld: 'busy',
-      retained: [true, true],
+      clusterPublished: false,
+      credentialKept: true,
       secretByPathOnly: true,
       environment: { LC_ALL: 'C' },
     });

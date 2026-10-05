@@ -7,7 +7,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { EmbeddedPostgresResourceService } from '../postgres/embedded-postgres-resource.service.js';
 import { ExternalPostgresResourceService } from '../postgres/external-postgres-resource.service.js';
 import type { ServerLifecycleSink } from '../server-logs/server-lifecycle.types.js';
-import { openServerLifecycleStore } from '../server-logs/store.service.js';
+import { openServerLifecycleStore, serverLifecyclePath } from '../server-logs/store.service.js';
 import { OwnedStartupProgress } from '../startup-progress/startup-progress-facade.js';
 import { StartupProgressJournalWriter } from '../startup-progress/startup-progress-journal.service.js';
 import {
@@ -112,7 +112,11 @@ export class PublishedControlService {
         if (request.databaseUrl !== undefined) {
           postgres = this.externalPostgres.bind(request.databaseUrl, progress);
         } else {
-          postgres = this.postgres.bind(canonicalDataDir, progress);
+          postgres = this.postgres.bind(
+            canonicalDataDir,
+            progress,
+            postgresLogPath(request, canonicalDataDir),
+          );
         }
       }
       await progress?.initialize();
@@ -323,12 +327,22 @@ async function openLifecycle(
   request: OpenPublishedControlRequest,
   canonicalDataDir: string,
 ): Promise<ServerLifecycleSink | undefined> {
-  return openServerLifecycleStore({
-    logDir: request.logDir,
-    canonicalDataDir,
-    channel: request.channel === 'alpha' ? 'alpha' : 'stable',
-  });
+  return openServerLifecycleStore(lifecycleConfiguration(request, canonicalDataDir));
 }
+
+function postgresLogPath(request: OpenPublishedControlRequest, canonicalDataDir: string) {
+  const lifecycle = serverLifecyclePath(lifecycleConfiguration(request, canonicalDataDir));
+  return join(dirname(lifecycle), 'postgres.log');
+}
+
+const lifecycleConfiguration = (
+  request: OpenPublishedControlRequest,
+  canonicalDataDir: string,
+) => ({
+  logDir: request.logDir,
+  canonicalDataDir,
+  channel: request.channel === 'alpha' ? ('alpha' as const) : ('stable' as const),
+});
 
 class LifecycleStop {
   private started = false;

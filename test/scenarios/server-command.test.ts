@@ -9,6 +9,7 @@ import { ManagedProcessError } from '../../src/processes/managed-process-error.j
 import { ProgressOperation, parseProgressEvent } from '../../src/progress/index.js';
 import type { ServerLaunchResult } from '../../src/server/server-launcher.service.js';
 import type { ServerStatus } from '../../src/server/server-status.service.js';
+import { SERVER_STOP_CONFIRMATION_MS } from '../../src/server/server-stop.service.js';
 import { CliScenario } from '../support/cli/cli-scenario.js';
 import { ProgressOutputScenario } from '../support/cli/progress-output-scenario.js';
 import {
@@ -44,7 +45,7 @@ const NO_START = `${UNAVAILABLE}; start was not performed.\n`;
 const NO_STOP = `${UNAVAILABLE}; stop was not performed.\n`;
 const STOPPED = 'Server stopped.\n';
 const ALREADY_STOPPED = 'Server is already stopped.\n';
-const STOP_CALL = { dataDir: FIXTURE_DATA_DIR, timeoutMs: 5_000 };
+const STOP_CALL = { dataDir: FIXTURE_DATA_DIR, timeoutMs: SERVER_STOP_CONFIRMATION_MS };
 const CANCELLED = 'Server start was cancelled.\n';
 const FAILED = 'Server start failed.\n';
 const OUTCOME = 'Server start outcome is unknown.\n';

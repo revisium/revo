@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -59,6 +59,37 @@ export class ProcessIdentityScenario {
         BigInt(identity.birth.microseconds) <= 999_999n);
     this.child = undefined;
     return { identity, whileRunning, afterExit, nativeBirthValid };
+  }
+  async observesChildWorkingDirectory() {
+    const directory = await mkdtemp(join(tmpdir(), 'revo-identity-cwd-'));
+    this.fixtureRoots.add(directory);
+    const child = spawn(
+      process.execPath,
+      ['-e', "process.send?.('ready');setInterval(()=>{},1000)"],
+      {
+        cwd: directory,
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      },
+    );
+    this.child = child;
+    await new Promise<void>((resolve, reject) => {
+      child.once('message', () => resolve());
+      child.once('error', reject);
+    });
+    if (child.pid === undefined) {
+      throw new Error('Identity fixture child did not start');
+    }
+    const expected = await lstat(directory, { bigint: true });
+    const whileRunning = await this.service.workingDirectory(child.pid);
+    child.kill('SIGTERM');
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    const afterExit = await this.service.workingDirectory(child.pid);
+    this.child = undefined;
+    return {
+      expected: { device: expected.dev, inode: expected.ino },
+      whileRunning,
+      afterExit,
+    };
   }
   async rejectsChangedAndInvalidRecords(identity: ProcessIdentity) {
     const changed = {
@@ -168,7 +199,21 @@ export class ProcessIdentityScenario {
       inspect(FixtureDarwinAdapter.buffer(77, 5)),
       inspect(FixtureDarwinAdapter.buffer(78, 2)),
       inspect(new FailingDarwinAdapter()),
+      inspect(new RestrictedDarwinAdapter({})),
     ]);
+  }
+  async observesAnotherUsersDarwinProcess() {
+    const live = new RestrictedDarwinAdapter({});
+    const observe = (shortInfo: Partial<ShortInfo>) =>
+      new RestrictedDarwinAdapter(shortInfo).capture(77);
+    return {
+      live: await live.capture(77),
+      flavors: live.flavors,
+      exited: await observe({ read: 0, errno: 3 }),
+      zombie: await observe({ status: 5 }),
+      partial: await observe({ read: 12 }),
+      reused: await observe({ pid: 78 }),
+    };
   }
   async observesMalformedLinuxStatus() {
     return Promise.all(
@@ -216,6 +261,35 @@ export class ProcessIdentityScenario {
     const failed = await adapter.capture(77);
     return { complete, partial, failed };
   }
+  async provesDarwinWorkingDirectoryBoundary() {
+    const buffer = Buffer.alloc(2352);
+    buffer.writeUInt32LE(16_777_232, 0);
+    buffer.writeBigUInt64LE(9_007_199_254_740_993n, 8);
+    const flavors: number[] = [];
+    const adapter = new FixtureDarwinAdapter({
+      pidInfo: (_p, flavor, _a, destination) => (
+        flavors.push(flavor),
+        buffer.copy(destination),
+        2352
+      ),
+      errno: () => 3,
+      noSuchProcess: [3],
+      denied: [1, 13],
+    });
+    const complete = await adapter.workingDirectory(77);
+    adapter.result = 136;
+    const partial = await adapter.workingDirectory(77);
+    adapter.result = 0;
+    const missing = await adapter.workingDirectory(77);
+    return {
+      complete,
+      partial,
+      missing,
+      denied: await FixtureDarwinAdapter.zero(1).workingDirectory(77),
+      unavailable: await new FailingDarwinAdapter().workingDirectory(77),
+      flavors,
+    };
+  }
   async cleanup(): Promise<void> {
     this.child?.kill('SIGKILL');
     await Promise.all(
@@ -238,14 +312,14 @@ export class ProcessIdentityScenario {
   }
 }
 class FixtureDarwinAdapter extends DarwinProcessIdentityAdapter {
-  result = 136;
+  result: number | undefined;
   constructor(private readonly fixture: DarwinBinding) {
     super();
   }
   protected override async loadBinding(): Promise<DarwinBinding> {
     return {
       ...this.fixture,
-      pidInfo: (...args) => (this.result === 136 ? this.fixture.pidInfo(...args) : this.result),
+      pidInfo: (...args) => this.result ?? this.fixture.pidInfo(...args),
     };
   }
   static zero(errno: number) {
@@ -270,6 +344,38 @@ class FixtureDarwinAdapter extends DarwinProcessIdentityAdapter {
       noSuchProcess: [3],
       denied: [1, 13],
     });
+  }
+}
+interface ShortInfo {
+  readonly read: number;
+  readonly errno: number;
+  readonly pid: number;
+  readonly status: number;
+  readonly uid: number;
+}
+class RestrictedDarwinAdapter extends DarwinProcessIdentityAdapter {
+  readonly flavors: number[] = [];
+  private readonly shortInfo: ShortInfo;
+  constructor(shortInfo: Partial<ShortInfo>) {
+    super();
+    this.shortInfo = { read: 64, errno: 0, pid: 77, status: 2, uid: 0, ...shortInfo };
+  }
+  protected override async loadBinding(): Promise<DarwinBinding> {
+    return {
+      pidInfo: (_p, flavor, _a, destination) => {
+        this.flavors.push(flavor);
+        if (flavor !== 13) {
+          return 0;
+        }
+        destination.writeUInt32LE(this.shortInfo.pid, 0);
+        destination.writeUInt32LE(this.shortInfo.status, 12);
+        destination.writeUInt32LE(this.shortInfo.uid, 36);
+        return this.shortInfo.read;
+      },
+      errno: () => (this.flavors.at(-1) === 13 ? this.shortInfo.errno : 1),
+      noSuchProcess: [3],
+      denied: [1, 13],
+    };
   }
 }
 class FailingDarwinAdapter extends DarwinProcessIdentityAdapter {

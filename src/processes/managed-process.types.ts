@@ -11,6 +11,7 @@ export interface ManagedProcessRequest {
     readonly graceMs: number;
     readonly killWaitMs: number;
     readonly signal: AbortSignal;
+    readonly signals?: StopSignals;
   }>;
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
@@ -29,9 +30,15 @@ export interface ProcessCompletion {
   readonly signal: NodeJS.Signals | null;
 }
 
+export interface StopSignals {
+  readonly graceful: NodeJS.Signals;
+  readonly escalation: NodeJS.Signals;
+}
+
 export interface StopProcessRequest {
   readonly graceMs: number;
   readonly killWaitMs: number;
+  readonly signals?: StopSignals;
 }
 
 export type ProcessCancellationResult =

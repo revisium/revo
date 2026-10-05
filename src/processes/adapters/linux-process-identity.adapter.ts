@@ -1,10 +1,14 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { Inject, Injectable, Optional } from '@nestjs/common';
 
 import { parseLinuxStat, parseLinuxUid, validPid } from '../process-identity.parser.js';
-import type { IdentityObservation, ProcessIdentityAdapter } from '../process-identity.types.js';
+import type {
+  IdentityObservation,
+  ProcessIdentityAdapter,
+  WorkingDirectoryObservation,
+} from '../process-identity.types.js';
 
 const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const code = (error: unknown) =>
@@ -28,6 +32,21 @@ export class LinuxProcessIdentityAdapter implements ProcessIdentityAdapter {
     }
     const { bootId } = boot;
     return this.captureFromProc(pid, bootId);
+  }
+
+  async workingDirectory(pid: number): Promise<WorkingDirectoryObservation> {
+    if (!validPid(pid)) {
+      return { kind: 'unknown' };
+    }
+    try {
+      const directory = await stat(join(this.procRoot, String(pid), 'cwd'), { bigint: true });
+      return { kind: 'captured', directory: { device: directory.dev, inode: directory.ino } };
+    } catch (error) {
+      const errorCode = code(error);
+      return errorCode === 'ENOENT' || errorCode === 'ESRCH'
+        ? { kind: 'missing' }
+        : { kind: 'unknown' };
+    }
   }
 
   private async readBootId(): Promise<BootIdResult> {
