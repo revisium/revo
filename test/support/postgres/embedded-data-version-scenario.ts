@@ -8,6 +8,7 @@ import {
   readlink,
   realpath,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -103,6 +104,35 @@ export class EmbeddedDataVersionScenario {
 
   async backupPathOccupiedByAUserDirectory(): Promise<void> {
     await mkdir(join(this.dataDir, BACKUP_LINK), { mode: 0o700 });
+  }
+
+  async backupStoreReplacedByALinkToAForeignDirectory(): Promise<string> {
+    const foreign = join(this.root, 'foreign');
+    await mkdir(foreign, { mode: 0o700 });
+    await writeFile(join(foreign, 'keep-me'), 'x');
+    await symlink(foreign, join(this.dataDir, BACKUP_STORE));
+    return foreign;
+  }
+
+  async directoryModes(directory: 'source' | 'backup'): Promise<Record<string, number>> {
+    const root =
+      directory === 'source'
+        ? join(this.dataDir, 'postgres')
+        : join(this.dataDir, BACKUP_LINK, 'postgres');
+    const entries = await readdir(root, { recursive: true, withFileTypes: true });
+    const paths = [
+      root,
+      ...entries
+        .filter((item) => item.isDirectory())
+        .map((item) => join(item.parentPath, item.name)),
+    ];
+    const stats = await Promise.all(paths.map((path) => lstat(path)));
+    return Object.fromEntries(
+      paths.map((path, index) => [
+        path.slice(root.length + 1) || '.',
+        Number(stats[index]?.mode) & 0o7777,
+      ]),
+    );
   }
 
   startAs(version: string): Promise<DataVersionStart> {

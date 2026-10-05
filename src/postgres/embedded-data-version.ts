@@ -1,4 +1,4 @@
-import { constants, type FileHandle, open, rename, rm } from 'node:fs/promises';
+import { constants, type FileHandle, lstat, open, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { compareSemVer, isSemVerString } from '../release-metadata.js';
@@ -12,6 +12,8 @@ const STAGED_DATA_VERSION_FILE = '.data-version.json.tmp';
 const DATA_VERSION_SCHEMA = 1;
 const MAX_DATA_VERSION_BYTES = 4096;
 const MIB = 1024 * 1024;
+const restoreRemedy =
+  '. To return to this older Revo, restore database-backup in the data directory as the Revo README describes';
 const logger = new RevoConsoleLogger('EmbeddedPostgres');
 
 /** Data this Revo may open: its own, an earlier version's, or data without a recorded version. */
@@ -47,13 +49,20 @@ export class EmbeddedDataVersion {
         detail:
           `the data in ${this.dataDir} was last opened by Revo ${recorded}, which is newer than ` +
           `this Revo ${this.runningVersion}; nothing was changed. Use Revo ${recorded} or newer ` +
-          'with this data',
+          `with this data${(await this.hasBackup()) ? restoreRemedy : ''}`,
       });
     }
     if (order === 0) {
       return { kind: 'current' };
     }
     return { kind: 'earlier', version: recorded };
+  }
+
+  private hasBackup(): Promise<boolean> {
+    return lstat(join(this.dataDir, 'database-backup')).then(
+      () => true,
+      () => false,
+    );
   }
 
   /**

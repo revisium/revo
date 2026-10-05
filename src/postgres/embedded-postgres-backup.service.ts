@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { constants, type Dirent } from 'node:fs';
 import {
   copyFile,
+  chmod,
   cp,
   lstat,
   mkdir,
@@ -24,6 +25,7 @@ const BACKUP_LINK = 'database-backup';
 const BACKUP_STORE = '.database-backups';
 const STAGED_LINK_PREFIX = '.database-backup-';
 const BACKUP_ID = /^\.database-backups\/([0-9a-f]{16})$/u;
+const COPY_NAME = /^[0-9a-f]{16}$/u;
 const BATCH = 32;
 const BLOCK_BYTES = 512;
 const MIB = 1024 * 1024;
@@ -74,7 +76,7 @@ export class EmbeddedPostgresBackupService {
   }
 
   private async prepareRoom(layout: BackupLayout, clusterDir: string): Promise<number> {
-    await mkdir(layout.store, { recursive: true, mode: 0o700 });
+    await ensureStore(layout);
     const link = await readBackupLink(layout);
     if (link.kind === 'foreign') {
       throw new EmbeddedPostgresError('backup', false, undefined, {
@@ -102,7 +104,9 @@ export class EmbeddedPostgresBackupService {
     const staged = join(layout.store, id);
     try {
       await mkdir(staged, { mode: 0o700 });
-      await this.copyCluster(request.clusterDir, join(staged, 'postgres'), request.signal);
+      const copy = join(staged, 'postgres');
+      await this.copyCluster(request.clusterDir, copy, request.signal);
+      await restoreDirectoryModes(request.clusterDir, copy);
       await copyDataVersion(request.dataVersionFile, staged);
       await syncTree(staged);
       return id;
@@ -154,7 +158,7 @@ async function readBackupLink(layout: BackupLayout): Promise<BackupLink> {
 /** Removes copies that no link references: replaced backups and interrupted attempts. */
 async function discardBackupsExcept(layout: BackupLayout, kept: string | undefined) {
   const [copies, entries] = await Promise.all([
-    readdir(layout.store).catch(() => []),
+    readdir(layout.store).then((names) => names.filter((name) => COPY_NAME.test(name))),
     readdir(layout.dataDir).catch(() => []),
   ]);
   const stagedLinks = entries.filter(
@@ -166,6 +170,39 @@ async function discardBackupsExcept(layout: BackupLayout, kept: string | undefin
       .map((name) => rm(join(layout.store, name), { recursive: true, force: true })),
     ...stagedLinks.map((name) => rm(join(layout.dataDir, name), { force: true })),
   ]);
+}
+
+/** Creates the store as a real directory of this user; a symbolic link or foreign directory fails. */
+async function ensureStore(layout: BackupLayout) {
+  try {
+    await mkdir(layout.store, { mode: 0o700 });
+    return;
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') {
+      throw error;
+    }
+  }
+  const stat = await lstat(layout.store);
+  const owner = process.getuid?.();
+  if (!stat.isDirectory() || (owner !== undefined && stat.uid !== owner)) {
+    throw new EmbeddedPostgresError('backup', false, undefined, {
+      detail:
+        `${layout.store} is not a directory that Revo created, so Revo does not use it; the ` +
+        'database was not changed. Move it out of the data directory and start again',
+    });
+  }
+}
+
+/** `cp` applies the umask to directories; PostgreSQL refuses a data directory that is not 0700. */
+async function restoreDirectoryModes(source: string, destination: string) {
+  const entries = await readdir(source, { recursive: true, withFileTypes: true });
+  const relative = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(entry.parentPath, entry.name).slice(source.length));
+  await inBatches(['', ...relative], async (path) => {
+    const { mode } = await lstat(source + path);
+    await chmod(destination + path, mode & 0o7777);
+  });
 }
 
 async function allocatedBytes(clusterDir: string): Promise<number> {

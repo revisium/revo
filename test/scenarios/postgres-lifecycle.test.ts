@@ -1,3 +1,5 @@
+import { readdir } from 'node:fs/promises';
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { EmbeddedDataVersionScenario } from '../support/postgres/embedded-data-version-scenario.js';
@@ -442,6 +444,43 @@ describe('embedded data prepared by another Revo version', { timeout: 60_000 }, 
     await scenario.restoreBackupAsReadmeDescribes();
     await expect(scenario.startAs('0.1.0-alpha.2')).resolves.toEqual({ kind: 'started' });
     await expect(scenario.committedValues()).resolves.toEqual(['from alpha.2']);
+  });
+
+  it('names the backup as the remedy when it refuses data from a newer Revo', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'a');
+    await scenario.dataPreparedBy('0.1.0-alpha.3', 'b');
+
+    await expect(scenario.startAs('0.1.0-alpha.2')).resolves.toMatchObject({
+      reason: 'incompatible',
+      message: expect.stringContaining('restore database-backup'),
+    });
+  });
+
+  it('keeps the directory modes of the cluster in the backup', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'from alpha.2');
+    const source = await scenario.directoryModes('source');
+
+    const umask = process.umask(0o022);
+    try {
+      await expect(scenario.startAs('0.1.0-alpha.3')).resolves.toEqual({ kind: 'started' });
+    } finally {
+      process.umask(umask);
+    }
+    await scenario.stop();
+
+    await expect(scenario.directoryModes('backup')).resolves.toEqual(source);
+    expect(source['.']).toBe(0o700);
+  });
+
+  it('does not use a backup store that is a link to another directory', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'kept');
+    const foreign = await scenario.backupStoreReplacedByALinkToAForeignDirectory();
+
+    const outcome = await scenario.startAs('0.1.0-alpha.3');
+
+    expect(outcome).toMatchObject({ kind: 'rejected', reason: 'backup' });
+    expect(scenario.postgresStarted).toBe(false);
+    await expect(readdir(foreign)).resolves.toEqual(['keep-me']);
   });
 
   it('keeps only the latest backup when another version follows', async () => {

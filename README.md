@@ -143,7 +143,7 @@ directory, so long home directories and user names stay within the macOS socket 
 ## Upgrades and the database backup
 
 The embedded database records the newest Revo version that opened it in `data-version.json` in the
-channel's data directory, which `revo-alpha doctor` prints. A start on data that a newer Revo
+channel's data directory (`revo-alpha doctor` prints that directory). A start on data that a newer Revo
 version opened is refused before PostgreSQL starts and leaves the data unchanged; run that version
 or a newer one. An unreadable `data-version.json` stops the start the same way and names the file.
 
@@ -171,6 +171,10 @@ database is the database as it was before that upgrade, and anything written sin
 `data-version.json` names the version that last opened it: only that version or a newer one starts
 it, and a newer one backs it up and upgrades it again. A copy without `data-version.json` comes from
 data written before Revo recorded versions.
+
+If the first start of a new version fails during the database change, `data-version.json` already
+names the new version, so an older Revo refuses the data. Retry or fix the new version; do not start
+the old version on the same data. To go back, restore the backup as above.
 
 An external PostgreSQL database (`REVO_DATABASE_URL`) gets neither the version check nor the
 backup; back it up with your own tools before you upgrade.
