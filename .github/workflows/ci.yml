@@ -51,7 +51,7 @@ jobs:
           pnpm build
 
       - name: Verify installer scenarios
-        run: pnpm exec vitest run test/release-bundle.test.ts
+        run: pnpm exec vitest run test/scenarios/install-script.test.ts test/scenarios/install-script-release.test.ts test/release-bundle.test.ts
 
       - name: Verify remaining process services
         run: |
@@ -89,6 +89,12 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Run the installer scenarios with the default Ubuntu 26.04 coreutils
+        if: ${{ matrix.os == 'ubuntu-26.04' }}
+        run: |
+          echo "mkdir is $(readlink -f "$(command -v mkdir)")"
+          pnpm exec vitest run test/scenarios/install-script.test.ts
 
       - name: Version the checkout as an alpha prerelease
         run: |
