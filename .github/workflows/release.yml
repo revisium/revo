@@ -39,19 +39,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build
-        run: pnpm build
-
-      - name: Resolve the release channel
+      - name: Resolve the release version and channel from the tag
         id: release
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          version=$(node -p "require('./package.json').version")
-          if [ "v$version" != "$TAG" ]; then
-            echo "::error title=Version mismatch::Tag $TAG does not match package.json version $version."
+          # The tag is the only source of the release version; master keeps 0.0.0.
+          version=${TAG#v}
+          if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "::error title=Invalid tag::Tag $TAG is not v<semver>."
             exit 1
           fi
+          npm pkg set version="$version"
           case "$version" in
             *-*) channel=alpha script=install-alpha.sh ;;
             *) channel=stable script=install.sh ;;
@@ -61,6 +60,9 @@ jobs:
             echo "channel=$channel"
             echo "script=$script"
           } >>"$GITHUB_OUTPUT"
+
+      - name: Build
+        run: pnpm build
 
       - name: Build the bundle
         env:
