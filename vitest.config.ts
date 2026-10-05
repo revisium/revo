@@ -7,6 +7,8 @@ export default defineConfig({
   test: {
     globalSetup: ['./test/support/global-socket-root.ts'],
     fileParallelism: false,
+    // Real processes and PostgreSQL run noticeably slower on the macos-15-intel release runner.
+    testTimeout: 20_000,
     coverage: {
       include: ['src/**/*.ts'],
       provider: 'v8',
