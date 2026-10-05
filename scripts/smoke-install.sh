@@ -245,7 +245,8 @@ main() {
       ;;
     *) fail 'usage: smoke-install.sh <install script URL> | --bundle <directory>' ;;
   esac
-  work=$(mktemp -d /tmp/revo-smoke.XXXXXX)
+  # Revo refuses log directories under a symlink, and /tmp is one on macOS: use its real path.
+  work=$(cd "$(mktemp -d /tmp/revo-smoke.XXXXXX)" && pwd -P)
   home=$work/home
   host_bin=$work/host-bin
   project=$work/project
