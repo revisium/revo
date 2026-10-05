@@ -212,7 +212,7 @@ process = subprocess.Popen(
 os.close(follower)
 screen = b""
 connected = False
-deadline = time.monotonic() + 120
+deadline = time.monotonic() + 60
 while process.poll() is None and time.monotonic() < deadline:
     ready, _, _ = select.select([leader], [], [], 0.5)
     if ready:
@@ -221,7 +221,9 @@ while process.poll() is None and time.monotonic() < deadline:
         except OSError:
             break
     text = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\s", b"", screen)
-    if not connected and b"Nodialoguesyet" in text:
+    # The TUI redraws only changed cells, so words of the connected screen can lose letters;
+    # the subscription status is a short word that is written whole once updates connect.
+    if not connected and b"Live" in text:
         connected = True
         os.write(leader, b"q")
         deadline = time.monotonic() + 30
