@@ -254,10 +254,10 @@ const isPnpmAssetFixture = (value: unknown): value is PnpmAssetFixture =>
       typeof archive.sha256 === 'string',
   );
 
-const readPnpmAssetFixture = (): PnpmAssetFixture => {
+const readPnpmAssetFixture = (version: string): PnpmAssetFixture => {
   const value: unknown = JSON.parse(
     readFileSync(
-      new URL('../../fixtures/installation/pnpm-v12.4.1-assets.json', import.meta.url),
+      new URL(`../../fixtures/installation/pnpm-v${version}-assets.json`, import.meta.url),
       'utf8',
     ),
   );
@@ -267,7 +267,7 @@ const readPnpmAssetFixture = (): PnpmAssetFixture => {
   return value;
 };
 
-const PNPM_ASSET_FIXTURE = readPnpmAssetFixture();
+const PNPM_ASSET_FIXTURES = ['12.4.1', '12.8.2'].map(readPnpmAssetFixture);
 
 export function futureReleaseManifestFixture(
   options: FutureReleaseManifestFixtureOptions = {},
@@ -323,9 +323,10 @@ export function pnpmReleaseManifestFixture(
   const policy = options.policy ?? pnpmReleasePolicyFixture();
   const fixture = futureReleaseManifestFixture({ ...options, policy });
   const pnpmVersion = fixture.manifest.toolchain.pnpm;
+  const assetFixture = PNPM_ASSET_FIXTURES.find((assets) => assets.version === pnpmVersion);
   const pnpmArchives =
-    pnpmVersion === PNPM_ASSET_FIXTURE.version
-      ? PNPM_ASSET_FIXTURE.archives.map((archive) => ({
+    assetFixture !== undefined
+      ? assetFixture.archives.map((archive) => ({
           ...archive,
           url: policy.locators.pnpmArchive(
             pnpmVersion,

@@ -1,0 +1,256 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Build release bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      channel: ${{ steps.release.outputs.channel }}
+      script: ${{ steps.release.outputs.script }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Resolve the release channel
+        id: release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error title=Version mismatch::Tag $TAG does not match package.json version $version."
+            exit 1
+          fi
+          case "$version" in
+            *-*) channel=alpha script=install-alpha.sh ;;
+            *) channel=stable script=install.sh ;;
+          esac
+          {
+            echo "version=$version"
+            echo "channel=$channel"
+            echo "script=$script"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build the bundle
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+        run: node scripts/build-release-bundle.mjs --channel "$CHANNEL" --output "$RUNNER_TEMP/bundle"
+
+      - name: Verify the bundle checksums
+        working-directory: ${{ runner.temp }}/bundle
+        run: sha256sum -c SHA256SUMS
+
+      - name: Build the same candidate for a local origin
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          node scripts/build-release-bundle.mjs --channel "$CHANNEL" \
+            --release-url https://127.0.0.1:8443 --output "$RUNNER_TEMP/candidate"
+          for asset in "revo-$VERSION.tgz" pnpm-lock.yaml pnpm-workspace.yaml; do
+            cmp "$RUNNER_TEMP/bundle/$asset" "$RUNNER_TEMP/candidate/$asset"
+          done
+
+      - name: Keep the bundle for the release jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/bundle/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Keep the local-origin candidate for the smoke jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate
+          path: ${{ runner.temp }}/candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+  candidate:
+    name: Smoke install before publication (${{ matrix.os }})
+    needs: bundle
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, ubuntu-24.04, macos-15, macos-15-intel, macos-26]
+
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download the candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Install the candidate from a local origin and smoke-test Revo
+        run: sh scripts/smoke-install.sh --bundle "$RUNNER_TEMP/candidate"
+
+  release:
+    name: Publish GitHub release
+    needs: [bundle, candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: bundle
+
+      - name: Create the release with its assets
+        env:
+          CHANNEL: ${{ needs.bundle.outputs.channel }}
+          GH_TOKEN: ${{ github.token }}
+          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          SCRIPT: ${{ needs.bundle.outputs.script }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.bundle.outputs.version }}
+        run: |
+          if [ "$CHANNEL" = alpha ]; then
+            set -- --prerelease
+          else
+            set -- --latest
+          fi
+          {
+            echo "Install or update with:"
+            echo
+            echo '```sh'
+            echo "curl -fsSL $PAGES_URL/$SCRIPT | sh"
+            echo '```'
+            echo
+            echo 'SHA256SUMS lists the checksums of all release assets.'
+          } >notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft "$@" \
+            --title "Revo $VERSION" --notes-file notes.md bundle/*
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  smoke:
+    name: Smoke install from the release (${{ matrix.os }})
+    needs: [bundle, release]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, ubuntu-24.04, macos-15, macos-15-intel, macos-26]
+
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install from the release and smoke-test Revo
+        env:
+          SCRIPT_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ needs.bundle.outputs.script }}
+        run: sh scripts/smoke-install.sh "$SCRIPT_URL"
+
+  pages:
+    name: Publish install script
+    needs: [bundle, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      pages: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - name: Download the bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: bundle
+
+      - name: Assemble the site with every channel's install script
+        env:
+          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          SCRIPT: ${{ needs.bundle.outputs.script }}
+          VERSION: ${{ needs.bundle.outputs.version }}
+        run: |
+          mkdir served site
+          for name in install.sh install-alpha.sh; do
+            status=$(curl --silent --show-error --location --proto '=https' \
+              --output "served/$name" --write-out '%{http_code}' "$PAGES_URL/$name")
+            case "$status" in
+              200) ;;
+              404) rm -f "served/$name" ;;
+              *)
+                echo "::error title=Pages unavailable::$PAGES_URL/$name returned HTTP $status."
+                exit 1
+                ;;
+            esac
+          done
+          if [ -f "served/$SCRIPT" ]; then
+            served=$(tr -d '\r' <"served/$SCRIPT" |
+              sed -n -E "s/^[[:space:]]*version=[\"']?([0-9A-Za-z.+-]+)[\"']?[[:space:]]*\$/\1/p" | head -n 1)
+            if [ -z "$served" ]; then
+              echo "::error title=Unknown served version::Pages serves $SCRIPT, but its version cannot be read."
+              exit 1
+            fi
+            if [ "$(printf '%s\n%s\n' "$served" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+              echo "::error title=Older release::Pages already serves $SCRIPT for $served, newer than $VERSION."
+              exit 1
+            fi
+          fi
+          for name in install.sh install-alpha.sh; do
+            if [ "$name" != "$SCRIPT" ] && [ -f "served/$name" ]; then
+              cp "served/$name" site/
+            fi
+          done
+          cp "bundle/$SCRIPT" site/
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+      - name: Deploy the site
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
