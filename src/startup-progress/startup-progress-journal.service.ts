@@ -71,7 +71,7 @@ export class StartupProgressJournalWriter {
       if (error instanceof StartupProgressError) {
         throw error;
       }
-      throw new StartupProgressError('io');
+      throw new StartupProgressError('io', { cause: error });
     }
   }
 }

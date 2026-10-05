@@ -155,6 +155,7 @@ export class ServerOwnerService {
         onStatus: () => owner?.status() ?? { phase: 'starting', operationId: request.operationId },
       });
     } catch (error) {
+      logger.failure('Server could not open its data directory and control endpoint', error);
       rejectOwner(new ServerOwnerError('revo.server-owner.stop'));
       throw error;
     }

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,6 +10,7 @@ import { ProgressOperation, parseProgressEvent } from '../../src/progress/index.
 import type { ServerLaunchResult } from '../../src/server/server-launcher.service.js';
 import type { ServerStatus } from '../../src/server/server-status.service.js';
 import { SERVER_STOP_CONFIRMATION_MS } from '../../src/server/server-stop.service.js';
+import { STARTUP_PROGRESS_FILE } from '../../src/startup-progress/startup-progress.types.js';
 import { CliScenario } from '../support/cli/cli-scenario.js';
 import { ProgressOutputScenario } from '../support/cli/progress-output-scenario.js';
 import {
@@ -179,6 +180,23 @@ describe('revo server command line', () => {
     expect(result.stderr).toMatch(/ERROR \[ServerOwner\] Server start failed: the database/u);
     expect(result.stderr).not.toContain('p@ss');
     expect(result.stderr).not.toContain(encodeURIComponent(password));
+  });
+
+  it('explains a server that could not open its data directory with the logged cause', async () => {
+    const dataDir = await mkdtemp(join(await realpath(tmpdir()), 'revo-blocked-data-'));
+    try {
+      await mkdir(join(dataDir, STARTUP_PROGRESS_FILE));
+
+      const result = await CliScenario.runIsolated(['server', 'start', '--data-dir', dataDir]);
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toMatch(/\nServer log: \/[^\n]+\/server\.log\nLast \d+ log lines:\n/u);
+      expect(result.stderr).toMatch(
+        /ERROR \[ServerOwner\] Server could not open its data directory and control endpoint: .*Startup progress journal failed: .*\.revo-progress\.json/u,
+      );
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('reports an isolated home as stopped without starting a server', async () => {

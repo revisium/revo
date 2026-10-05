@@ -89,6 +89,15 @@ describe('Server owner composition', () => {
     );
   });
 
+  it('logs why no private control socket directory is usable', async () => {
+    const result = await scenario.logsWhyNoControlSocketDirectoryIsUsable();
+
+    expect(result.opened).toBe('rejected');
+    expect(result.log).toMatch(
+      /ERROR \[ServerOwner\] Server could not open its data directory and control endpoint: .*No private control socket directory is usable: \S*not-a-directory\S*: [^;\n]+; .*Revo Alpha\/state\/run: socket path exceeds \d+ bytes/u,
+    );
+  });
+
   it(
     'never logs the generated database password and logs a readable Core failure',
     async () => {

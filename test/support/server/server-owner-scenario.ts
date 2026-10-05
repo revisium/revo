@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +15,7 @@ import {
   CONTROL_FILE,
   ControlDiscoveryService,
 } from '../../../src/processes/control-discovery.service.js';
+import { ControlEndpointService } from '../../../src/processes/control-endpoint.service.js';
 import { ManagedProcessService } from '../../../src/processes/managed-process.service.js';
 import type {
   ManagedProcessRequest,
@@ -241,6 +242,42 @@ export class ServerOwnerScenario {
         password: await readEmbeddedPostgresCredential(this.dataDir),
         log: output.text(),
       };
+    } finally {
+      output.restore();
+    }
+  }
+
+  async logsWhyNoControlSocketDirectoryIsUsable() {
+    const unusableSocketRoot = join(this.root, 'not-a-directory');
+    await writeFile(unusableSocketRoot, '');
+    const controls = new PublishedControlService(
+      undefined,
+      undefined,
+      new ControlEndpointService(unusableSocketRoot),
+    );
+    const output = new CapturedOutput();
+    try {
+      const opened = await new ServerOwnerService(controls)
+        .open({
+          configuration: {
+            channel: 'alpha',
+            dataDir: this.dataDir,
+            logDir: join(this.root, 'logs'),
+            host: '127.0.0.1',
+            port: 0,
+            publicUrl: 'http://127.0.0.1:3210',
+            runtimeDir: this.runtimeDir,
+            startupTimeout: STARTUP_MILLISECONDS,
+            version: '0.0.0',
+          },
+          environment: this.environment(),
+          operationId: this.nextOperation(),
+        })
+        .then(
+          () => 'opened' as const,
+          () => 'rejected' as const,
+        );
+      return { opened, log: output.text() };
     } finally {
       output.restore();
     }
