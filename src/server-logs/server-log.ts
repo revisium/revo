@@ -89,7 +89,8 @@ export async function readServerLogTail(
       lines.shift();
     }
     const attempt = latestAttempt(lines);
-    if (since !== undefined && !(attemptTime(attempt[0]) >= since)) {
+    const started = attemptTime(attempt[0]);
+    if (since !== undefined && (Number.isNaN(started) || started < since)) {
       return undefined;
     }
     return { path, lines: attempt.slice(-maxLines).map(printable) };
@@ -143,15 +144,11 @@ function latestAttempt(lines: readonly string[]): readonly string[] {
 }
 
 function attemptTime(marker: string | undefined): number {
-  if (marker === undefined || !marker.startsWith(ATTEMPT_MARKER)) {
+  if (marker?.startsWith(ATTEMPT_MARKER) !== true) {
     return Number.NaN;
   }
-  return Date.parse(
-    marker
-      .slice(ATTEMPT_MARKER.length)
-      .replace(/\s*---\s*$/u, '')
-      .trim(),
-  );
+  const [stamp = ''] = marker.slice(ATTEMPT_MARKER.length).trim().split(' ');
+  return Date.parse(stamp);
 }
 
 /** Log lines reach a terminal; control characters must not become terminal commands. */
