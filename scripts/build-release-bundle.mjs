@@ -10,7 +10,6 @@ import {
   mkdtemp,
   readdir,
   readFile,
-  rename,
   rm,
   writeFile,
 } from 'node:fs/promises';
@@ -179,7 +178,8 @@ async function packPackage(destination) {
     ) {
       fail('the package tarball has no built CLI; run pnpm build first');
     }
-    await rename(tarball, destination);
+    // The temporary directory may be on another file system (tmpfs /tmp), so copy instead of rename.
+    await copyFile(tarball, destination);
   } finally {
     await rm(stage, { recursive: true, force: true });
   }

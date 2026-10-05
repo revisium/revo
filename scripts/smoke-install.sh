@@ -225,10 +225,14 @@ while process.poll() is None and time.monotonic() < deadline:
         connected = True
         os.write(leader, b"q")
         deadline = time.monotonic() + 30
+def report(reason):
+    tail = text.decode("utf-8", "replace")[-600:]
+    sys.exit(f"{reason}; connected={connected}; last screen text: {tail}")
 if process.poll() is None:
     process.kill()
-    sys.exit("TUI did not exit")
-sys.exit(0 if connected and process.returncode == 0 else f"TUI exited with {process.returncode}")
+    report("TUI did not exit")
+if not connected or process.returncode != 0:
+    report(f"TUI exited with {process.returncode}")
 PY
   check_private_tools 'by the TUI'
   say 'the TUI connected and exited'
