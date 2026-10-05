@@ -211,6 +211,7 @@ process = subprocess.Popen(
 )
 os.close(follower)
 screen = b""
+text = b""
 connected = False
 next_quit = 0.0
 deadline = time.monotonic() + 60
@@ -233,6 +234,11 @@ while process.poll() is None and time.monotonic() < deadline:
         try:
             os.write(leader, b"q")
         except OSError:
+            # The TUI may just have exited; give it time to be reaped before judging it.
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             break
         next_quit = time.monotonic() + 3
 def report(reason):
