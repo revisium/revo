@@ -17,6 +17,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
+import { syncDirectory } from './directory-sync.js';
 import { loadEmbeddedPostgresBinaries } from './embedded-postgres-binaries.js';
 import type { EmbeddedPostgresLog } from './embedded-postgres-log.js';
 import {
@@ -370,15 +371,6 @@ async function commitCredential(layout: ClusterLayout) {
 async function commitCluster(layout: ClusterLayout, stagedCluster: string) {
   await rename(stagedCluster, layout.cluster);
   await syncDirectory(layout.dataDir);
-}
-
-async function syncDirectory(path: string) {
-  const directory = await open(path, constants.O_RDONLY | constants.O_DIRECTORY);
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
 }
 
 async function pathKind(path: string) {

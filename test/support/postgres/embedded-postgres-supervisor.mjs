@@ -1,6 +1,7 @@
-import { access } from 'node:fs/promises';
+import { access, cp, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { EmbeddedPostgresBackupService } from '../../../dist/postgres/embedded-postgres-backup.service.js';
 import { EmbeddedPostgresPreparationService } from '../../../dist/postgres/embedded-postgres-preparation.service.js';
 import { EmbeddedPostgresResourceService } from '../../../dist/postgres/embedded-postgres-resource.service.js';
 import { ManagedProcessService } from '../../../dist/processes/managed-process.service.js';
@@ -30,7 +31,7 @@ const appears = async (path) => {
 class InterruptedInitialization extends ManagedProcessService {
   async start(request) {
     const pgdata = request.args.find((argument) => argument.startsWith('--pgdata='));
-    if (!pgdata || mode === 'serve') {
+    if (!pgdata || mode === 'serve' || mode === 'inside-backup') {
       return super.start(request);
     }
     if (mode === 'before-initdb') {
@@ -46,6 +47,14 @@ class InterruptedInitialization extends ManagedProcessService {
   }
 }
 
+class InterruptedBackup extends EmbeddedPostgresBackupService {
+  async copyCluster(clusterDir, destination) {
+    await mkdir(destination, { mode: 0o700 });
+    await cp(join(clusterDir, 'global'), join(destination, 'global'), { recursive: true });
+    return powerCut();
+  }
+}
+
 const processes = new InterruptedInitialization();
 const held = await new PublishedControlService(
   undefined,
@@ -53,12 +62,18 @@ const held = await new PublishedControlService(
   undefined,
   undefined,
   undefined,
-  new EmbeddedPostgresResourceService(new EmbeddedPostgresPreparationService(processes), processes),
+  new EmbeddedPostgresResourceService(
+    new EmbeddedPostgresPreparationService(processes),
+    processes,
+    undefined,
+    undefined,
+    mode === 'inside-backup' ? new InterruptedBackup() : undefined,
+  ),
 ).open({
   dataDir: process.env.REVO_TEST_DATA,
   logDir: process.env.REVO_TEST_LOG,
   runtimeDir: process.env.REVO_TEST_RUNTIME,
-  version: '1.2.3',
+  version: process.env.REVO_TEST_VERSION ?? '1.2.3',
   channel: 'stable',
   onStop: () => undefined,
   startupProgress: { operationId: 'feedfacefeedfacefeedfacefeedface', now: () => Date.now() },

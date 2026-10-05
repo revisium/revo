@@ -134,6 +134,51 @@ describe('Server owner composition', () => {
     );
   });
 
+  it('refuses data from a newer Revo before PostgreSQL or Revo Core starts', async () => {
+    const result = await scenario.failsWhenDataIsFromANewerRevo('0.0.1-alpha.1');
+
+    expect(result.start).toMatchObject({
+      code: 'revo.server-owner.database',
+      databaseFailure: { code: 'EMBEDDED_POSTGRES_ERROR', reason: 'incompatible' },
+    });
+    expect(result.coreStarts).toBe(0);
+    expect(result.clusterCreated).toBe(false);
+    expect(result.marker).toBe(true);
+    expect(result.log).toMatch(
+      /Server start failed: the database did not start \(embedded PostgreSQL incompatible failure: the data in \S+ was last opened by Revo 0\.0\.1-alpha\.1, which is newer than this Revo 0\.0\.0/u,
+    );
+  });
+
+  it.each([
+    ['refused', 'connect ECONNREFUSED 127.0.0.1:1'],
+    ['authentication', 'password authentication failed for user "postgres"'],
+  ] as const)(
+    'logs why the external PostgreSQL connection was %s',
+    async (failure, cause) => {
+      const result = await scenario.failsToReachExternalPostgres(failure);
+
+      expect(result.start).toMatchObject({
+        code: 'revo.server-owner.database',
+        databaseFailure: { code: 'revo.postgres.external.lifecycle', reason: 'connection' },
+      });
+      expect(result.log).toContain(
+        `Server start failed: the database did not start (external PostgreSQL connection failure: ${cause}`,
+      );
+      expect(result.log).not.toContain(result.password);
+    },
+    REAL_OWNER_START_TIMEOUT_MS,
+  );
+
+  it('does not blame the database for a non-database error from the database start', async () => {
+    const result = await scenario.failsWithANonDatabaseErrorFromTheDatabaseStart();
+
+    expect(result.start).toMatchObject({ code: 'revo.server-owner.unexpected' });
+    expect(result.log).toContain(
+      'Server start failed: an unexpected error occurred (Error: secret-database-detail).',
+    );
+    expect(result.log).not.toContain('the database did not start');
+  });
+
   it('does not blame Revo Core for an unclassified start failure', async () => {
     const result = await scenario.failsWhenReadyJournalIsFull();
 

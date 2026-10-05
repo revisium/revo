@@ -116,6 +116,7 @@ export class PublishedControlService {
             canonicalDataDir,
             progress,
             postgresLogPath(request, canonicalDataDir),
+            request.version,
           );
         }
       }

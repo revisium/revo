@@ -105,6 +105,7 @@ export class ServerOwnerError extends Error {
       | {
           readonly code: 'revo.postgres.external.lifecycle';
           readonly reason: ExternalPostgresError['reason'];
+          readonly detail?: string;
         },
   ) {
     super('Server owner operation failed.');
@@ -385,6 +386,9 @@ export class ServerOwnerResource {
       return database;
     } catch (error) {
       this.emitLifecycle('DATABASE_FAILED');
+      if (!isDatabaseFailure(error)) {
+        throw error;
+      }
       throw new ServerOwnerError(
         'revo.server-owner.database',
         undefined,
@@ -579,7 +583,7 @@ function normalizeOwnerError(error: unknown, signal: AbortSignal): ServerOwnerEr
   if (error instanceof CoreHostProcessError) {
     return new ServerOwnerError('revo.server-owner.core');
   }
-  if (error instanceof EmbeddedPostgresError || error instanceof ExternalPostgresError) {
+  if (isDatabaseFailure(error)) {
     return new ServerOwnerError(
       'revo.server-owner.database',
       undefined,
@@ -620,7 +624,8 @@ function databaseFailureDetail(failure: ServerOwnerError['databaseFailure']): st
     return 'unknown database failure';
   }
   if (failure.code === 'revo.postgres.external.lifecycle') {
-    return `external PostgreSQL ${failure.reason} failure`;
+    const detail = failure.detail === undefined ? '' : `: ${failure.detail}`;
+    return `external PostgreSQL ${failure.reason} failure${detail}`;
   }
   const exit = failure.observedCompletion
     ? `, exit code ${String(failure.observedCompletion.exitCode)}, signal ${String(failure.observedCompletion.signal)}`
@@ -640,7 +645,14 @@ const isFileSystemError = (error: unknown): error is NodeJS.ErrnoException =>
   typeof Reflect.get(error, 'syscall') === 'string' &&
   typeof Reflect.get(error, 'path') === 'string';
 
-function safeDatabaseFailure(error: unknown): ServerOwnerError['databaseFailure'] {
+const isDatabaseFailure = (
+  error: unknown,
+): error is EmbeddedPostgresError | ExternalPostgresError =>
+  error instanceof EmbeddedPostgresError || error instanceof ExternalPostgresError;
+
+function safeDatabaseFailure(
+  error: EmbeddedPostgresError | ExternalPostgresError,
+): ServerOwnerError['databaseFailure'] {
   if (error instanceof EmbeddedPostgresError) {
     return {
       code: error.code,
@@ -649,10 +661,17 @@ function safeDatabaseFailure(error: unknown): ServerOwnerError['databaseFailure'
       ...embeddedDiagnostic(error),
     };
   }
-  if (error instanceof ExternalPostgresError) {
+  return externalDiagnostic(error);
+}
+
+/** Copies the reason and Revo's one-line description of the connection failure. */
+function externalDiagnostic(
+  error: ExternalPostgresError,
+): Extract<ServerOwnerError['databaseFailure'], { code: ExternalPostgresError['code'] }> {
+  if (error.detail === undefined) {
     return { code: error.code, reason: error.reason };
   }
-  return undefined;
+  return { code: error.code, reason: error.reason, detail: error.detail };
 }
 
 /** Copies only the fields Revo itself composed: exit status, refusal detail, and log path. */

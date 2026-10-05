@@ -49,6 +49,7 @@ import {
   StartupProgressJournalWriter,
 } from '../../../src/startup-progress/startup-progress-journal.service.js';
 import { StartupProgressError } from '../../../src/startup-progress/startup-progress.types.js';
+import { ClusterFixture } from '../postgres/postgres-readiness-scenario.js';
 import { CapturedOutput } from '../server-logs/captured-output.js';
 import { ServerLifecycleProbe } from './server-lifecycle-probe.js';
 
@@ -76,6 +77,7 @@ export class ServerOwnerScenario {
   private readonly owners: ServerOwnerResource[] = [];
   private readonly servers: Server[] = [];
   private readonly journals: OwnerJournal[] = [];
+  private readonly clusters: ClusterFixture[] = [];
   private operation = 0;
 
   async setup(options: { readonly dataDir?: string } = {}) {
@@ -312,6 +314,76 @@ export class ServerOwnerScenario {
   async failsOnUnusableEmbeddedCredential() {
     await writeFile(join(this.dataDir, 'postgres-password'), 'p'.repeat(32), { mode: 0o644 });
     return this.failedStart('unusable-credential');
+  }
+
+  async failsWhenDataIsFromANewerRevo(newer: string) {
+    const marker = `${JSON.stringify({ schemaVersion: 1, version: newer })}\n`;
+    await writeFile(join(this.dataDir, 'data-version.json'), marker, { mode: 0o600 });
+    const processes = new OwnerControlledProcesses(false);
+    const output = new CapturedOutput();
+    try {
+      const owner = await new ServerOwnerService(
+        new PublishedControlService(),
+        new CoreHostProcessService(processes),
+      ).open({
+        configuration: this.configuration(),
+        environment: this.environment(),
+        operationId: this.nextOperation(),
+      });
+      if (owner.kind === 'busy') {
+        throw new Error('Server owner lease is unexpectedly busy');
+      }
+      this.owners.push(owner);
+      const start = await owner.start(new AbortController().signal).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      return {
+        start,
+        coreStarts: processes.startCalls,
+        clusterCreated: await readFile(join(this.dataDir, 'postgres', 'PG_VERSION')).then(
+          () => true,
+          () => false,
+        ),
+        marker: (await readFile(join(this.dataDir, 'data-version.json'), 'utf8')) === marker,
+        log: output.text(),
+      };
+    } finally {
+      output.restore();
+    }
+  }
+
+  async failsToReachExternalPostgres(failure: 'refused' | 'authentication') {
+    const password = 'secret-external-password';
+    let databaseUrl = `postgresql://postgres:${password}@127.0.0.1:1/revo?sslmode=disable`;
+    if (failure === 'authentication') {
+      const cluster = await ClusterFixture.start('scram');
+      this.clusters.push(cluster);
+      databaseUrl = `postgresql://postgres:${password}@127.0.0.1:${String(cluster.port)}/postgres?sslmode=disable`;
+    }
+    const output = new CapturedOutput();
+    try {
+      const owner = await new ServerOwnerService().open({
+        configuration: { ...this.configuration(), databaseUrl },
+        environment: this.environment(),
+        operationId: this.nextOperation(),
+      });
+      if (owner.kind === 'busy') {
+        throw new Error('Server owner lease is unexpectedly busy');
+      }
+      this.owners.push(owner);
+      const start = await owner.start(new AbortController().signal).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      return { start, password, log: output.text() };
+    } finally {
+      output.restore();
+    }
+  }
+
+  async failsWithANonDatabaseErrorFromTheDatabaseStart() {
+    return this.failedStart('unknown');
   }
 
   async failsWhenReadyJournalIsFull() {
@@ -786,6 +858,7 @@ export class ServerOwnerScenario {
     const serverResults = await Promise.allSettled(
       this.servers.map((server) => closeServer(server)),
     );
+    await Promise.allSettled(this.clusters.map((cluster) => cluster.close()));
     const failures = [...ownerResults, ...serverResults].flatMap((result) =>
       result.status === 'rejected' ? [result.reason] : [],
     );
@@ -839,6 +912,20 @@ export class ServerOwnerScenario {
     } finally {
       output.restore();
     }
+  }
+
+  private configuration() {
+    return {
+      channel: 'stable',
+      dataDir: this.dataDir,
+      logDir: join(this.root, 'logs'),
+      host: '127.0.0.1',
+      port: 0,
+      publicUrl: 'http://127.0.0.1:3210',
+      runtimeDir: this.runtimeDir,
+      startupTimeout: STARTUP_MILLISECONDS,
+      version: '0.0.0',
+    };
   }
 
   private lifecyclePath(channel: 'stable' | 'alpha' = 'stable') {

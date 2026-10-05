@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Client, type ClientConfig } from 'pg';
 
+import { protectDatabaseUrl } from '../server-logs/log-redaction.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
 import type {
   StartDatabaseRequest,
@@ -9,19 +10,30 @@ import type {
 import { buildExternalPostgresClientConfig } from './external-postgres-client-config.js';
 
 const CLOSE_TIMEOUT_MS = 1000;
+const MAX_DETAIL_LENGTH = 300;
 
 export class ExternalPostgresError extends Error {
   readonly code = 'revo.postgres.external.lifecycle';
+  /** One line naming the connection failure: refusal, DNS, TLS, or authentication. */
+  readonly detail?: string;
 
-  constructor(readonly reason: 'cancelled' | 'connection') {
+  constructor(
+    readonly reason: 'cancelled' | 'connection',
+    cause?: unknown,
+  ) {
     super('External PostgreSQL lifecycle failed');
     this.name = 'ExternalPostgresError';
+    const detail = connectionFailureDetail(cause);
+    if (detail !== undefined) {
+      this.detail = detail;
+    }
   }
 }
 
 @Injectable()
 export class ExternalPostgresResourceService {
   bind(connectionUrl: string, progress: StartupProgressFacade) {
+    protectDatabaseUrl(connectionUrl);
     return new OwnedExternalPostgresResource(
       buildExternalPostgresClientConfig(connectionUrl),
       progress,
@@ -93,7 +105,7 @@ export class OwnedExternalPostgresResource {
       void this.endClient(client).catch(() => undefined);
     };
     const abort = () => fail(new ExternalPostgresError('cancelled'));
-    client.on('error', () => fail(new ExternalPostgresError('connection')));
+    client.on('error', (error) => fail(new ExternalPostgresError('connection', error)));
     this.cancelStart = abort;
     request.signal.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(abort, remaining(deadline));
@@ -115,7 +127,7 @@ export class OwnedExternalPostgresResource {
       } else if (this.closing || request.signal.aborted) {
         failure = new ExternalPostgresError('cancelled');
       } else {
-        failure = new ExternalPostgresError('connection');
+        failure = new ExternalPostgresError('connection', error);
       }
       await this.progress
         .fail('postgres-connect', { code: `POSTGRES_EXTERNAL_${failure.reason.toUpperCase()}` })
@@ -171,6 +183,29 @@ export class OwnedExternalPostgresResource {
 }
 
 const remaining = (deadline: number) => Math.max(1, deadline - Date.now());
+
+function connectionFailureDetail(cause: unknown): string | undefined {
+  if (!(cause instanceof Error)) {
+    return undefined;
+  }
+  const message = causeMessage(cause).replaceAll(/\s+/gu, ' ').trim();
+  const code: unknown = Reflect.get(cause, 'code');
+  const named =
+    typeof code === 'string' && code !== '' && !message.includes(code)
+      ? `${message} (${code})`
+      : message;
+  const detail = named.slice(0, MAX_DETAIL_LENGTH).trim();
+  return detail === '' ? undefined : detail;
+}
+
+/** Node reports a refused dual-stack connection as an AggregateError without its own message. */
+function causeMessage(cause: Error): string {
+  if (cause.message !== '' || !(cause instanceof AggregateError)) {
+    return cause.message;
+  }
+  const [first]: unknown[] = cause.errors;
+  return first instanceof Error ? first.message : '';
+}
 
 const bounded = <T>(operation: Promise<T>, timeoutMs: number) =>
   new Promise<T>((resolve, reject) => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseReleaseMetadata } from '../src/release-metadata.js';
+import { compareSemVer, parseReleaseMetadata } from '../src/release-metadata.js';
 
 describe('parseReleaseMetadata', () => {
   it.each([
@@ -79,5 +79,42 @@ describe('parseReleaseMetadata', () => {
     ],
   ])('rejects invalid metadata: %j', (metadata, message) => {
     expect(() => parseReleaseMetadata(metadata)).toThrow(message);
+  });
+});
+
+describe('compareSemVer', () => {
+  it('orders versions by SemVer precedence, including prerelease identifiers', () => {
+    const ascending = [
+      '0.1.0-alpha.2',
+      '0.1.0-alpha.10',
+      '0.1.0-beta',
+      '0.1.0',
+      '0.1.1-alpha.1',
+      '0.2.0',
+      '1.0.0-alpha',
+      '1.0.0-alpha.1',
+      '1.0.0-alpha.beta',
+      '1.0.0-beta.2',
+      '1.0.0-beta.11',
+      '1.0.0-rc.1',
+      '1.0.0',
+      '10.0.0',
+    ];
+
+    const sorted = ascending.toReversed().toSorted(compareSemVer);
+
+    expect(sorted).toEqual(ascending);
+  });
+
+  it('treats versions that differ only in build metadata as equal', () => {
+    expect(compareSemVer('0.1.0-alpha.2+build.1', '0.1.0-alpha.2+build.2')).toBe(0);
+  });
+
+  it('compares numeric identifiers beyond the safe integer range exactly', () => {
+    expect(compareSemVer('1.0.0-9007199254740993', '1.0.0-9007199254740992')).toBeGreaterThan(0);
+  });
+
+  it('rejects a value that is not SemVer', () => {
+    expect(() => compareSemVer('latest', '1.0.0')).toThrow('latest is not a SemVer version');
   });
 });

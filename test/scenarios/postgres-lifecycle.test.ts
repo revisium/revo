@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { EmbeddedDataVersionScenario } from '../support/postgres/embedded-data-version-scenario.js';
 import { PostgresLifecycleScenario } from '../support/postgres/postgres-lifecycle-scenario.js';
 import { PostgresRecoveryScenario } from '../support/postgres/postgres-recovery-scenario.js';
 
@@ -336,5 +337,199 @@ describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () =
       expect(restart).toMatchObject({ kind: 'rejected', reason: 'locked' });
       await expect(foreign.isAlive()).resolves.toBe(true);
     });
+  });
+});
+
+describe('embedded data prepared by another Revo version', { timeout: 60_000 }, () => {
+  let scenario: EmbeddedDataVersionScenario;
+
+  beforeEach(async () => {
+    scenario = await new EmbeddedDataVersionScenario().setup();
+  });
+
+  afterEach(async () => {
+    await scenario.cleanup();
+  });
+
+  it('records the version that prepares new data and makes no backup of it', async () => {
+    const outcome = await scenario.startAs('0.1.0-alpha.2');
+
+    expect(outcome).toEqual({ kind: 'started' });
+    await expect(scenario.recordedVersion()).resolves.toBe('0.1.0-alpha.2');
+    await expect(scenario.backup()).resolves.toBeUndefined();
+  });
+
+  it('starts the same version again without a backup', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'before the restart');
+
+    const outcome = await scenario.startAs('0.1.0-alpha.2');
+
+    expect(outcome).toEqual({ kind: 'started' });
+    await expect(scenario.committedValues()).resolves.toEqual(['before the restart']);
+    await expect(scenario.backup()).resolves.toBeUndefined();
+    await expect(scenario.storedBackups()).resolves.toEqual([]);
+  });
+
+  it.each([
+    ['0.1.0-alpha.10', '0.1.0-alpha.2'],
+    ['0.1.0', '0.1.0-alpha.10'],
+    ['0.2.0-alpha.1', '0.1.9'],
+  ])(
+    'refuses data that Revo %s prepared when this Revo is %s and changes nothing',
+    async (newer, older) => {
+      await scenario.dataPreparedBy(newer, 'written by the newer version');
+      const before = await scenario.databaseSnapshot();
+
+      const outcome = await scenario.startAs(older);
+
+      expect(outcome).toEqual({
+        kind: 'rejected',
+        reason: 'incompatible',
+        message: expect.stringContaining(
+          `was last opened by Revo ${newer}, which is newer than this Revo ${older}`,
+        ),
+      });
+      expect(scenario.postgresStarted).toBe(false);
+      await expect(scenario.databaseSnapshot()).resolves.toEqual(before);
+    },
+  );
+
+  it.each([
+    ['text that is not JSON', 'revo'],
+    ['an unknown format', '{"schemaVersion":2,"version":"0.1.0-alpha.2"}'],
+    ['an invalid version', '{"schemaVersion":1,"version":"latest"}'],
+  ])('refuses a data version file with %s and changes nothing', async (_, content) => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'kept');
+    await scenario.dataVersionFileContains(content);
+    const before = await scenario.databaseSnapshot();
+
+    const outcome = await scenario.startAs('0.1.0-alpha.2');
+
+    expect(outcome).toEqual({
+      kind: 'rejected',
+      reason: 'invalid',
+      message: expect.stringMatching(
+        /data version file \S+data-version\.json is unreadable or has an unknown format/u,
+      ),
+    });
+    expect(scenario.postgresStarted).toBe(false);
+    await expect(scenario.databaseSnapshot()).resolves.toEqual(before);
+  });
+
+  it('refuses a data version path that is not a file', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'kept');
+    await scenario.dataVersionFileReplacedByADirectory();
+
+    const outcome = await scenario.startAs('0.1.0-alpha.3');
+
+    expect(outcome).toMatchObject({ kind: 'rejected', reason: 'invalid' });
+    expect(scenario.postgresStarted).toBe(false);
+    await expect(scenario.backup()).resolves.toBeUndefined();
+  });
+
+  it('backs up the earlier data before PostgreSQL starts for a new version', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'from alpha.2');
+
+    const outcome = await scenario.startAs('0.1.0-alpha.10');
+    await scenario.commit('from alpha.10');
+    await scenario.stop();
+
+    expect(outcome).toEqual({ kind: 'started' });
+    expect(scenario.dataWhenPostgresStarted()).toEqual({
+      recordedVersion: '0.1.0-alpha.10',
+      backupVersion: '0.1.0-alpha.2',
+    });
+    await scenario.restoreBackupAsReadmeDescribes();
+    await expect(scenario.startAs('0.1.0-alpha.2')).resolves.toEqual({ kind: 'started' });
+    await expect(scenario.committedValues()).resolves.toEqual(['from alpha.2']);
+  });
+
+  it('keeps only the latest backup when another version follows', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'from alpha.2');
+    await scenario.dataPreparedBy('0.1.0-alpha.3', 'from alpha.3');
+
+    await expect(scenario.startAs('0.1.0-alpha.4')).resolves.toEqual({ kind: 'started' });
+    await scenario.stop();
+
+    await expect(scenario.storedBackups()).resolves.toHaveLength(1);
+    await expect(scenario.backup()).resolves.toMatchObject({ version: '0.1.0-alpha.3' });
+    await scenario.restoreBackupAsReadmeDescribes();
+    await expect(scenario.startAs('0.1.0-alpha.3')).resolves.toEqual({ kind: 'started' });
+    await expect(scenario.committedValues()).resolves.toEqual(['from alpha.2', 'from alpha.3']);
+  });
+
+  it('keeps the previous backup through a power cut during a backup and retries on the next start', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'from alpha.2');
+    await scenario.dataPreparedBy('0.1.0-alpha.3', 'from alpha.3');
+    const previous = await scenario.backup();
+
+    await scenario.backupInterruptedByAPowerCutAs('0.1.0-alpha.4');
+
+    await expect(scenario.backup()).resolves.toEqual(previous);
+    await expect(scenario.recordedVersion()).resolves.toBe('0.1.0-alpha.3');
+    await expect(scenario.startAs('0.1.0-alpha.4')).resolves.toEqual({ kind: 'started' });
+    await scenario.stop();
+    await expect(scenario.storedBackups()).resolves.toHaveLength(1);
+    await expect(scenario.backup()).resolves.toMatchObject({ version: '0.1.0-alpha.3' });
+    await scenario.restoreBackupAsReadmeDescribes();
+    await expect(scenario.startAs('0.1.0-alpha.3')).resolves.toEqual({ kind: 'started' });
+    await expect(scenario.committedValues()).resolves.toEqual(['from alpha.2', 'from alpha.3']);
+  });
+
+  it('backs up data written before Revo recorded data versions', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'before the version file');
+    await scenario.dataVersionFileRemoved();
+
+    await expect(scenario.startAs('0.1.0-alpha.3')).resolves.toEqual({ kind: 'started' });
+    await scenario.stop();
+
+    await expect(scenario.recordedVersion()).resolves.toBe('0.1.0-alpha.3');
+    await expect(scenario.backup()).resolves.toMatchObject({ version: undefined });
+    await scenario.restoreBackupAsReadmeDescribes();
+    await expect(scenario.recordedVersion()).resolves.toBeUndefined();
+    await expect(scenario.startAs('0.1.0-alpha.2')).resolves.toEqual({ kind: 'started' });
+    await expect(scenario.committedValues()).resolves.toEqual(['before the version file']);
+  });
+
+  it('does not start a new version without room for the backup', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'kept');
+    const before = await scenario.databaseSnapshot();
+
+    const outcome = await scenario.startWithoutRoomForABackupAs('0.1.0-alpha.3');
+
+    expect(outcome).toEqual({
+      kind: 'rejected',
+      reason: 'backup',
+      message: expect.stringMatching(/the database backup needs \d+ MiB of free disk space/u),
+    });
+    expect(scenario.postgresStarted).toBe(false);
+    await expect(scenario.databaseSnapshot()).resolves.toEqual(before);
+    await expect(scenario.storedBackups()).resolves.toEqual([]);
+  });
+
+  it('does not replace a backup path that Revo did not save', async () => {
+    await scenario.dataPreparedBy('0.1.0-alpha.2', 'kept');
+    await scenario.backupPathOccupiedByAUserDirectory();
+    const before = await scenario.databaseSnapshot();
+
+    const outcome = await scenario.startAs('0.1.0-alpha.3');
+
+    expect(outcome).toEqual({
+      kind: 'rejected',
+      reason: 'backup',
+      message: expect.stringMatching(/\S+database-backup is not a backup that Revo saved/u),
+    });
+    expect(scenario.postgresStarted).toBe(false);
+    await expect(scenario.databaseSnapshot()).resolves.toEqual(before);
+    await expect(scenario.storedBackups()).resolves.toEqual([]);
+  });
+
+  it('leaves an external database without a data version file or backup', async () => {
+    const outcome = await scenario.startExternalAs('0.1.0-alpha.3');
+
+    expect(outcome).toEqual({ kind: 'started' });
+    await expect(scenario.recordedVersion()).resolves.toBeUndefined();
+    await expect(scenario.backup()).resolves.toBeUndefined();
+    await expect(scenario.storedBackups()).resolves.toEqual([]);
   });
 });

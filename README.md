@@ -140,6 +140,41 @@ skipped with a warning on stderr, and a server that started still exits with cod
 The control socket lives in a private `/tmp/revo-<uid>/` directory, isolated per channel and data
 directory, so long home directories and user names stay within the macOS socket path limit.
 
+## Upgrades and the database backup
+
+The embedded database records the newest Revo version that opened it in `data-version.json` in the
+channel's data directory, which `revo-alpha doctor` prints. A start on data that a newer Revo
+version opened is refused before PostgreSQL starts and leaves the data unchanged; run that version
+or a newer one. An unreadable `data-version.json` stops the start the same way and names the file.
+
+The first start of a different version copies the stopped database to `database-backup` in the data
+directory before PostgreSQL starts and before Revo Core changes the database structure. Revo Core
+does not report whether its migrations will change anything, so every version change makes a copy.
+Only the latest copy is kept. A new copy replaces it only once complete, so an interrupted backup
+leaves the previous copy intact and the next start retries. When the disk has no room for the copy,
+the start fails without changing the database. Copying counts toward the startup timeout.
+
+The backup is insurance, not a rollback: Revo does not support returning to an earlier version. To
+restore the database from the backup, stop the server and replace the database with the copy. On
+Linux, for the alpha channel:
+
+```sh
+revo-alpha server stop
+cd ~/.local/share/revo-alpha
+rm -rf postgres data-version.json
+cp -Rp database-backup/. .
+```
+
+On macOS the data directory is `~/Library/Application Support/Revo Alpha/data`; the stable channel
+uses `revo`, `~/.local/share/revo`, and `~/Library/Application Support/Revo/data`. The restored
+database is the database as it was before that upgrade, and anything written since is lost. Its
+`data-version.json` names the version that last opened it: only that version or a newer one starts
+it, and a newer one backs it up and upgrades it again. A copy without `data-version.json` comes from
+data written before Revo recorded versions.
+
+An external PostgreSQL database (`REVO_DATABASE_URL`) gets neither the version check nor the
+backup; back it up with your own tools before you upgrade.
+
 ## Development
 
 Use Node.js 26.8.2 and pnpm 12.8.2 in an isolated development environment:
