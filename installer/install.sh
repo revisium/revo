@@ -24,6 +24,7 @@ toolchain_checksums() {
     linux-arm64) node_sha256='@@NODE_SHA256_LINUX_ARM64@@' pnpm_sha256='@@PNPM_SHA256_LINUX_ARM64@@' ;;
     darwin-x64) node_sha256='@@NODE_SHA256_DARWIN_X64@@' pnpm_sha256='@@PNPM_SHA256_DARWIN_X64@@' ;;
     darwin-arm64) node_sha256='@@NODE_SHA256_DARWIN_ARM64@@' pnpm_sha256='@@PNPM_SHA256_DARWIN_ARM64@@' ;;
+    *) fail "no checksums for $platform." ;;
   esac
 }
 
@@ -46,6 +47,7 @@ $1
 EOF
   case "$found_major:${found_minor:-0}" in
     *[!0-9:]* | :*) return 1 ;;
+    *) ;;
   esac
   [ "$found_major" -gt "$2" ] || { [ "$found_major" -eq "$2" ] && [ "${found_minor:-0}" -ge "$3" ]; }
 }

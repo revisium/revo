@@ -212,6 +212,7 @@ process = subprocess.Popen(
 os.close(follower)
 screen = b""
 connected = False
+next_quit = 0.0
 deadline = time.monotonic() + 60
 while process.poll() is None and time.monotonic() < deadline:
     ready, _, _ = select.select([leader], [], [], 0.5)
@@ -225,8 +226,15 @@ while process.poll() is None and time.monotonic() < deadline:
     # the subscription status is a short word that is written whole once updates connect.
     if not connected and b"Live" in text:
         connected = True
-        os.write(leader, b"q")
         deadline = time.monotonic() + 30
+        next_quit = time.monotonic() + 1
+    # A key sent while the screen is still settling can be lost, so repeat it until the TUI exits.
+    if connected and time.monotonic() >= next_quit:
+        try:
+            os.write(leader, b"q")
+        except OSError:
+            break
+        next_quit = time.monotonic() + 3
 def report(reason):
     tail = text.decode("utf-8", "replace")[-600:]
     sys.exit(f"{reason}; connected={connected}; last screen text: {tail}")

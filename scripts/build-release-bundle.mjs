@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// oxlint-disable no-await-in-loop -- release inputs are downloaded and written in a fixed order.
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -171,11 +170,8 @@ async function packPackage(destination) {
       fail('pnpm pack must produce exactly one tarball');
     }
     const tarball = join(stage, tarballs[0]);
-    const entries = (await run('tar', ['-tzf', tarball])).split('\n');
-    if (
-      !entries.includes('package/package.json') ||
-      !entries.includes('package/dist/bin/revo.js')
-    ) {
+    const entries = new Set((await run('tar', ['-tzf', tarball])).split('\n'));
+    if (!entries.has('package/package.json') || !entries.has('package/dist/bin/revo.js')) {
       fail('the package tarball has no built CLI; run pnpm build first');
     }
     // The temporary directory may be on another file system (tmpfs /tmp), so copy instead of rename.
@@ -206,13 +202,14 @@ async function nodeChecksums(version) {
 }
 
 async function pnpmChecksums(version) {
-  const checksums = {};
-  for (const platform of INSTALL_PLATFORMS) {
-    checksums[platform] = sha256(
-      await download(`${PNPM_RELEASES}/v${version}/${pnpmArchiveName(platform)}`),
-    );
-  }
-  return checksums;
+  const archives = await Promise.all(
+    INSTALL_PLATFORMS.map((platform) =>
+      download(`${PNPM_RELEASES}/v${version}/${pnpmArchiveName(platform)}`),
+    ),
+  );
+  return Object.fromEntries(
+    INSTALL_PLATFORMS.map((platform, index) => [platform, sha256(archives[index])]),
+  );
 }
 
 async function download(url) {
@@ -224,11 +221,11 @@ async function download(url) {
 }
 
 async function writeChecksums(output) {
-  const files = (await readdir(output)).sort();
-  const lines = [];
-  for (const name of files) {
-    lines.push(`${sha256(await readFile(join(output, name)))}  ${name}`);
-  }
+  const files = (await readdir(output)).sort((left, right) =>
+    left < right ? -1 : Number(left > right),
+  );
+  const contents = await Promise.all(files.map((name) => readFile(join(output, name))));
+  const lines = files.map((name, index) => `${sha256(contents[index])}  ${name}`);
   await writeFile(join(output, 'SHA256SUMS'), `${lines.join('\n')}\n`);
   return [...files, 'SHA256SUMS'];
 }
@@ -257,7 +254,9 @@ function run(command, args) {
   });
 }
 
-main().catch((error) => {
+try {
+  await main();
+} catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;
-});
+}
