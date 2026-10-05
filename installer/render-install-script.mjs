@@ -13,8 +13,9 @@ const CHANNELS = Object.freeze({
 });
 const TEMPLATE = new URL('./install.sh', import.meta.url);
 const PLACEHOLDER = /@@([A-Z0-9_]+)@@/gu;
-const VERSION =
-  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+const NUMBER = String.raw`(?:0|[1-9]\d*)`;
+const PRERELEASE = String.raw`(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?`;
+const VERSION = new RegExp(`^${NUMBER}\\.${NUMBER}\\.${NUMBER}${PRERELEASE}$`, 'u');
 const SHA256 = /^[0-9a-f]{64}$/u;
 const BASE_URL = /^https:\/\/[A-Za-z0-9.-]+(?::\d+)?(?:\/[A-Za-z0-9._~%+-]+)*$/u;
 const RELEASE_KEYS = ['channel', 'node', 'pnpm', 'releaseUrl', 'sha256', 'version'];
@@ -72,7 +73,7 @@ function scriptValues(release) {
 function toolchainValues(prefix, toolchain) {
   const label = prefix.toLowerCase();
   requireKeys(toolchain, TOOLCHAIN_KEYS, label);
-  requireKeys(toolchain.sha256, [...INSTALL_PLATFORMS].sort(), `${label}.sha256`);
+  requireKeys(toolchain.sha256, [...INSTALL_PLATFORMS].sort(byCodeUnit), `${label}.sha256`);
   const values = {
     [`${prefix}_VERSION`]: matching(toolchain.version, VERSION, `${label}.version`),
     [`${prefix}_URL`]: matching(toolchain.url, BASE_URL, `${label}.url`),
@@ -82,6 +83,10 @@ function toolchainValues(prefix, toolchain) {
     values[name] = matching(toolchain.sha256[platform], SHA256, `${label}.sha256.${platform}`);
   }
   return values;
+}
+
+function byCodeUnit(left, right) {
+  return left < right ? -1 : Number(left > right);
 }
 
 function channelOf(channel) {
@@ -94,7 +99,7 @@ function channelOf(channel) {
 function requireKeys(value, keys, label) {
   const actual =
     typeof value === 'object' && value !== null && !Array.isArray(value)
-      ? Object.keys(value).sort()
+      ? Object.keys(value).sort(byCodeUnit)
       : [];
   if (actual.length !== keys.length || actual.some((key, index) => key !== keys[index])) {
     throw new Error(`install script: ${label} must contain exactly ${keys.join(', ')}`);
