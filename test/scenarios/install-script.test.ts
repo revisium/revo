@@ -389,4 +389,284 @@ describe('install.sh', { timeout: 60_000 }, () => {
     expect(await machine.foreignCommandIntact('revo-alpha')).toBe(true);
     expect(await machine.channelEntries('alpha')).toEqual([]);
   });
+
+  describe('system libraries', () => {
+    const INSTALL = 'apt-get install -y libatomic1';
+    const NEEDS = 'revo-alpha install: Node.js needs libatomic.so.1, which is missing';
+
+    async function machineLackingLibrary() {
+      const machine = await cleanMachine();
+      await machine.lackSystemLibrary();
+      return machine;
+    }
+
+    async function expectNothingChanged(machine: InstallMachine) {
+      expect(await machine.homeEntries()).toEqual([]);
+      expect(machine.downloads()).toEqual([]);
+      expect(await machine.systemCommands()).toEqual([]);
+    }
+
+    it('asks before installing the missing library with sudo, then continues', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      await machine.answerPrompt('y');
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(result.stdout).toContain(`The installer will run: sudo ${INSTALL}\n`);
+      expect(await machine.promptShown()).toBe('Run it now? [Y/n] ');
+      expect(await machine.systemCommands()).toEqual([`sudo ${INSTALL}`]);
+      expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+    });
+
+    it('installs on an empty answer, which accepts the default', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      await machine.answerPrompt('');
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.systemCommands()).toEqual([`sudo ${INSTALL}`]);
+    });
+
+    it('prints the exact command and changes nothing when the answer is no', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      await machine.answerPrompt('n');
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `${NEEDS}; install it with \`sudo ${INSTALL}\` and run the installer again.\n`,
+      );
+      await expectNothingChanged(machine);
+    });
+
+    it('prints the command and the opt-in without a terminal, and changes nothing', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `${NEEDS}; install it with \`sudo ${INSTALL}\` and run the installer again, or run the installer with REVO_INSTALL_SYSTEM_DEPS=1 to let it do that.\n`,
+      );
+      await expectNothingChanged(machine);
+    });
+
+    it('refuses when the terminal ends without an answer, and changes nothing', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      await machine.closeTerminalWithoutAnswer();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `${NEEDS}; install it with \`sudo ${INSTALL}\` and run the installer again.\n`,
+      );
+      await expectNothingChanged(machine);
+    });
+
+    it('does not retry after a failure that is not about the package lists', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { failWith: 'sudo: a terminal is required' });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('sudo: a terminal is required');
+      expect(result.stderr).toContain(`\`sudo ${INSTALL}\` failed`);
+      expect(await machine.systemCommands()).toEqual([`sudo ${INSTALL}`]);
+    });
+
+    it('finds the library in the library directories when ldconfig fails', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.searchLibrariesOnlyIn({ libatomic: true });
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.systemCommands()).toEqual([]);
+    });
+
+    it('reports the library missing when ldconfig fails and the directories lack it', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.searchLibrariesOnlyIn({ libatomic: false });
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(NEEDS);
+    });
+
+    it('installs without a terminal when the user opted in', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.systemCommands()).toEqual([`sudo ${INSTALL}`]);
+      expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+    });
+
+    it('installs without asking when the user opted in at a terminal', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+      await machine.answerPrompt('n');
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.promptShown()).toBe('');
+      expect(await machine.systemCommands()).toEqual([`sudo ${INSTALL}`]);
+    });
+
+    it('refreshes the package lists when the first install fails for lack of them', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { staleLists: true });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.systemCommands()).toEqual([
+        `sudo ${INSTALL}`,
+        'sudo apt-get update',
+        `sudo ${INSTALL}`,
+      ]);
+    });
+
+    it('fails clearly when the library is still missing after the install', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+      await machine.keepLibraryMissingAfterInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `${NEEDS} even after \`sudo ${INSTALL}\`; install it and run the installer again.\n`,
+      );
+      expect(machine.downloads()).toEqual([]);
+    });
+
+    it('installs directly as root, without sudo', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.runAsRoot();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.systemCommands()).toEqual([INSTALL]);
+    });
+
+    it('tells the user to install as root when there is no sudo and the user is not root', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `${NEEDS}; install it as root with \`${INSTALL}\` and run the installer again.\n`,
+      );
+      await expectNothingChanged(machine);
+    });
+
+    it('names the library when no known package manager exists', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.haveSudo();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `${NEEDS}; install the package that provides it and run the installer again.\n`,
+      );
+      await expectNothingChanged(machine);
+    });
+
+    it.each([
+      { manager: 'apt-get', command: 'apt-get install -y libatomic1' },
+      { manager: 'dnf', command: 'dnf install -y libatomic' },
+      { manager: 'yum', command: 'yum install -y libatomic' },
+      { manager: 'zypper', command: 'zypper --non-interactive install libatomic1' },
+      { manager: 'pacman', command: 'pacman -S --noconfirm --needed gcc-libs' },
+    ])('installs the package that $manager names for the library', async ({ command, manager }) => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager(manager);
+      await machine.runAsRoot();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.systemCommands()).toEqual([command]);
+    });
+
+    it('neither asks nor uses sudo when the library is present', async () => {
+      const machine = await cleanMachine();
+      await machine.reportPlatform({ system: 'Linux', machine: 'x86_64', glibc: 'glibc 2.35' });
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      await machine.answerPrompt('n');
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.promptShown()).toBe('');
+      expect(await machine.systemCommands()).toEqual([]);
+    });
+
+    it('does not look for libraries on macOS', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.reportPlatform({ system: 'Darwin', machine: 'arm64', macos: '15.0' });
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+    });
+
+    it.each(['node', 'pnpm'] as const)(
+      'shows the loader error when the unpacked %s does not run',
+      async (tool) => {
+        const machine = await cleanMachine({ brokenToolchain: tool });
+
+        const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(
+          new RegExp(
+            `^revo-alpha install: ${tool === 'node' ? `Node\\.js ${process.versions.node}` : 'pnpm 12\\.8\\.2'} does not run on this machine: \\./${tool}: error while loading shared libraries: libatomic\\.so\\.1: cannot open shared object file: No such file or directory\\n$`,
+            'u',
+          ),
+        );
+        expect(await machine.activeVersion('alpha')).toBeUndefined();
+      },
+    );
+  });
 });

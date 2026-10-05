@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import {
   access,
   appendFile,
@@ -10,6 +11,7 @@ import {
   readFile,
   readlink,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -33,6 +35,24 @@ const run = promisify(execFile);
 const NODE_VERSION = process.versions.node;
 const PNPM_VERSION = '12.8.2';
 const SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+const SYSTEM_BIN_DIRECTORIES = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+const SYSTEM_DEPENDENCY_TOOLS = [
+  'apt-get',
+  'dnf',
+  'yum',
+  'zypper',
+  'pacman',
+  'sudo',
+  'ldconfig',
+  'id',
+];
+const LIBRARY_LOADER_ERROR =
+  'error while loading shared libraries: libatomic.so.1: cannot open shared object file: No such file or directory';
+const MINIMAL_LINUX: ReportedPlatform = {
+  system: 'Linux',
+  machine: 'x86_64',
+  glibc: 'glibc 2.35',
+};
 const FOREIGN_COMMAND = '#!/bin/sh\necho "not Revo"\n';
 const CHANNELS: readonly ReleaseChannel[] = ['stable', 'alpha'];
 const USER_PNPM_CONFIG_DIRS = [join('.config', 'pnpm'), join('Library', 'Preferences', 'pnpm')];
@@ -84,6 +104,15 @@ export interface HeldDependencyInstallation {
 export interface MachineOptions {
   readonly binDirOnPath?: boolean;
   readonly installRoot?: string;
+  /** A private tool that fails to load a shared library, as on a minimal image. */
+  readonly brokenToolchain?: 'node' | 'pnpm';
+}
+
+export interface PackageManagerOptions {
+  /** The install fails until `update` has refreshed the package lists, as on a fresh image. */
+  readonly staleLists?: boolean;
+  /** The install fails with this message, whatever the package lists hold. */
+  readonly failWith?: string;
 }
 
 export type UserPnpmSettingSource = 'configuration file' | 'environment';
@@ -114,6 +143,8 @@ export class InstallMachine {
 
   private readonly userPnpmEnvironment: Record<string, string> = {};
 
+  private systemPath = SYSTEM_PATH;
+
   private constructor(
     private readonly root: string,
     private readonly certificate: FixtureCertificate,
@@ -138,6 +169,7 @@ export class InstallMachine {
       options,
     );
     await machine.installHostNodeAndPnpm();
+    await machine.installLibraryCache();
     return machine;
   }
 
@@ -320,6 +352,87 @@ export class InstallMachine {
     return (await readFile(this.commandPath(command), 'utf8')) === FOREIGN_COMMAND;
   }
 
+  /** A Linux machine without libatomic, and without the host's package managers, sudo and root. */
+  async lackSystemLibrary(): Promise<void> {
+    await this.reportPlatform(MINIMAL_LINUX);
+    await this.isolateSystemTools();
+    await writeFile(this.control('library-missing'), '');
+  }
+
+  async havePackageManager(name: string, options: PackageManagerOptions = {}): Promise<void> {
+    await this.isolateSystemTools();
+    if (options.staleLists === true) {
+      await writeFile(this.control('lists-stale'), '');
+    }
+    await executable(
+      join(this.root, 'platform-bin', name),
+      [
+        `[ -z "\${FIXTURE_SUDO:-}" ] || sudo_prefix='sudo '`,
+        `printf '%s\\n' "\${sudo_prefix:-}${name} $*" >> ${quote(this.control('system-commands.log'))}`,
+        `if [ "\${1:-}" = update ]; then : > ${quote(this.control('lists-updated'))}; exit 0; fi`,
+        ...(options.failWith === undefined
+          ? []
+          : [`echo ${quote(options.failWith)} >&2`, 'exit 1']),
+        `if [ -e ${quote(this.control('lists-stale'))} ] && [ ! -e ${quote(this.control('lists-updated'))} ]; then`,
+        "  echo 'E: Unable to locate package libatomic1' >&2",
+        '  exit 100',
+        'fi',
+        `[ -e ${quote(this.control('install-ineffective'))} ] || : > ${quote(this.control('library-installed'))}`,
+        '',
+      ].join('\n'),
+    );
+  }
+
+  /** The package manager succeeds without providing the library. */
+  async keepLibraryMissingAfterInstall(): Promise<void> {
+    await writeFile(this.control('install-ineffective'), '');
+  }
+
+  /** The terminal closes without any input, as with Ctrl-D. */
+  async closeTerminalWithoutAnswer(): Promise<void> {
+    await writeFile(this.control('tty'), '');
+  }
+
+  /** ldconfig fails, so the installer looks in these directories; they hold libatomic or not. */
+  async searchLibrariesOnlyIn(options: { readonly libatomic: boolean }): Promise<void> {
+    const directory = this.control('libraries');
+    await mkdir(directory, { recursive: true });
+    if (options.libatomic) {
+      await writeFile(join(directory, 'libatomic.so.1'), '');
+    }
+    await executable(join(this.root, 'platform-bin', 'ldconfig'), 'exit 1\n');
+    this.userPnpmEnvironment.REVO_TEST_LIBRARY_DIRS = directory;
+  }
+
+  async haveSudo(): Promise<void> {
+    await this.isolateSystemTools();
+    await executable(join(this.root, 'platform-bin', 'sudo'), 'FIXTURE_SUDO=1 exec "$@"\n');
+  }
+
+  async runAsRoot(): Promise<void> {
+    await this.isolateSystemTools();
+    await writeFile(this.control('root'), '');
+  }
+
+  /** The text the user types at the terminal prompt. */
+  async answerPrompt(answer: string): Promise<void> {
+    await writeFile(this.control('tty'), `${answer}\n`);
+  }
+
+  allowSystemDependencyInstall(): void {
+    this.userPnpmEnvironment.REVO_INSTALL_SYSTEM_DEPS = '1';
+  }
+
+  async systemCommands(): Promise<readonly string[]> {
+    return lines(this.control('system-commands.log'));
+  }
+
+  /** What the installer wrote to the terminal after the answer. */
+  async promptShown(): Promise<string> {
+    const typed = await readFile(this.control('tty'), 'utf8').catch(() => '');
+    return typed.split('\n').slice(1).join('\n');
+  }
+
   downloads(fragment = ''): readonly string[] {
     return this.origin.requests().filter((path) => path.includes(fragment));
   }
@@ -419,7 +532,7 @@ export class InstallMachine {
       join(this.root, 'platform-bin'),
       join(this.root, 'host-bin'),
       ...(this.options.binDirOnPath === true ? [join(this.home, '.local', 'bin')] : []),
-      SYSTEM_PATH,
+      this.systemPath,
     ];
     const environment: NodeJS.ProcessEnv = {
       ...this.userPnpmEnvironment,
@@ -427,6 +540,7 @@ export class InstallMachine {
       HOME: this.home,
       LC_ALL: 'C',
       PATH: path.join(':'),
+      REVO_TEST_TTY: this.control('tty'),
     };
     if (this.options.installRoot !== undefined) {
       environment.REVO_INSTALL_ROOT = this.installRoot();
@@ -470,6 +584,52 @@ export class InstallMachine {
         ),
       ),
     );
+  }
+
+  // ldconfig lists libatomic unless the scenario removed it and no package manager has added it back.
+  private async installLibraryCache(): Promise<void> {
+    await executable(
+      join(this.root, 'platform-bin', 'ldconfig'),
+      [
+        `if [ -e ${quote(this.control('library-missing'))} ] && [ ! -e ${quote(this.control('library-installed'))} ]; then`,
+        "  printf '1 libs found in cache\\n\\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6\\n'",
+        '  exit 0',
+        'fi',
+        "printf '2 libs found in cache\\n\\tlibatomic.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libatomic.so.1\\n'",
+        '',
+      ].join('\n'),
+    );
+  }
+
+  // The installer finds tools through PATH, so a scenario that must not see the host's package
+  // managers or sudo gets a PATH of every other system tool.
+  private async isolateSystemTools(): Promise<void> {
+    if (this.systemPath !== SYSTEM_PATH) {
+      return;
+    }
+    const systemBin = join(this.root, 'system-bin');
+    await mkdir(systemBin);
+    const listings = await Promise.all(
+      SYSTEM_BIN_DIRECTORIES.map((directory) => readdir(directory).catch(() => [])),
+    );
+    const names = new Set(listings.flat());
+    await Promise.all(
+      [...names]
+        .filter((name) => !SYSTEM_DEPENDENCY_TOOLS.includes(name))
+        .map(async (name) => {
+          const directory = SYSTEM_BIN_DIRECTORIES.find((candidate) =>
+            existsSync(join(candidate, name)),
+          );
+          await symlink(join(directory ?? '/usr/bin', name), join(systemBin, name)).catch(
+            () => undefined,
+          );
+        }),
+    );
+    await executable(
+      join(this.root, 'platform-bin', 'id'),
+      `if [ -e ${quote(this.control('root'))} ]; then echo 0; else echo 1000; fi\n`,
+    );
+    this.systemPath = systemBin;
   }
 
   private async publishToolchains(): Promise<Toolchains> {
@@ -520,13 +680,17 @@ export class InstallMachine {
   private async nodeArchive(platform: InstallPlatform): Promise<Buffer> {
     const top = `node-v${NODE_VERSION}-${platform}`;
     return this.archive(`node-${platform}`, top, {
-      [`${top}/bin/node`]: `exec ${quote(process.execPath)} "$@"\n`,
+      [`${top}/bin/node`]:
+        this.options.brokenToolchain === 'node'
+          ? loaderFailure('node')
+          : `exec ${quote(process.execPath)} "$@"\n`,
     });
   }
 
   private async pnpmArchive(): Promise<Buffer> {
     return this.archive('pnpm', '.', {
       pnpm: [
+        ...(this.options.brokenToolchain === 'pnpm' ? [loaderFailure('pnpm')] : []),
         `if grep -q '"packageManager"' package.json 2>/dev/null && ! grep -q '"pnpm@${PNPM_VERSION}"' package.json; then`,
         "  echo 'ERR_PNPM_OTHER_PM_EXPECTED: this project is configured to use another package manager' >&2",
         '  exit 1',
@@ -595,6 +759,10 @@ function byName(left: string, right: string): number {
 
 function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function loaderFailure(tool: string): string {
+  return `echo "./${tool}: ${LIBRARY_LOADER_ERROR}" >&2\nexit 127\n`;
 }
 
 function quote(value: string): string {

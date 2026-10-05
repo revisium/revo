@@ -5,6 +5,7 @@
 # Usage:
 #   scripts/smoke-install.sh <install script URL>
 #   scripts/smoke-install.sh --bundle <directory>
+# REVO_INSTALL_SYSTEM_DEPS=1 in the environment lets the installer install a missing system library.
 # A bundle must be built with --release-url https://127.0.0.1:$REVO_SMOKE_PORT (default 8443);
 # it is served from that origin with a temporary certificate.
 set -eu
@@ -136,7 +137,8 @@ select_command() {
 
 install_revo() {
   (cd "$project" && clean_env curl --fail --silent --show-error --location --proto =https "$script_url" |
-    clean_env pnpm_config_ignore_scripts=true PNPM_CONFIG_OFFLINE=true PNPM_CONFIG_ENGINE_STRICT=true sh)
+    clean_env pnpm_config_ignore_scripts=true PNPM_CONFIG_OFFLINE=true PNPM_CONFIG_ENGINE_STRICT=true \
+      REVO_INSTALL_SYSTEM_DEPS="${REVO_INSTALL_SYSTEM_DEPS:-}" sh)
 }
 
 check_fresh_install() {
