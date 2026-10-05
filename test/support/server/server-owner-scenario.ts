@@ -9,7 +9,11 @@ import { NestFactory } from '@nestjs/core';
 import { CoreHostProcessService } from '../../../src/core-host/core-host-process.service.js';
 import { resolveRevoLayout } from '../../../src/layout.js';
 import { readEmbeddedPostgresCredential } from '../../../src/postgres/embedded-postgres-preparation.service.js';
-import { EmbeddedPostgresError, ExternalPostgresError } from '../../../src/postgres/index.js';
+import {
+  EmbeddedPostgresError,
+  ExternalPostgresError,
+  type StartedDatabase,
+} from '../../../src/postgres/index.js';
 import { ControlClientService } from '../../../src/processes/control-client.service.js';
 import {
   CONTROL_FILE,
@@ -44,6 +48,7 @@ import {
   StartupProgressDiscoveryService,
   StartupProgressJournalWriter,
 } from '../../../src/startup-progress/startup-progress-journal.service.js';
+import { StartupProgressError } from '../../../src/startup-progress/startup-progress.types.js';
 import { CapturedOutput } from '../server-logs/captured-output.js';
 import { ServerLifecycleProbe } from './server-lifecycle-probe.js';
 
@@ -51,6 +56,18 @@ const STARTUP_MILLISECONDS = 120_000;
 const CREDENTIAL_ECHO_CORE = fileURLToPath(
   new URL('../core-host/credential-echo-core.mjs', import.meta.url),
 );
+
+type DatabaseFailureFixture =
+  | 'embedded'
+  | 'embedded-refusal'
+  | 'external'
+  | 'unknown'
+  | 'unusable-credential';
+
+export const EMBEDDED_REFUSAL = {
+  detail: 'the lock file /data/postgres/postmaster.pid names a process that is not this cluster',
+  logPath: '/logs/postgres.log',
+};
 
 export class ServerOwnerScenario {
   private root = '';
@@ -281,6 +298,26 @@ export class ServerOwnerScenario {
     } finally {
       output.restore();
     }
+  }
+
+  async failsToPrepareCoreDirectories() {
+    await writeFile(join(this.dataDir, 'core'), '');
+    return this.failedStart();
+  }
+
+  async failsWhenEmbeddedPostgresRefuses() {
+    return this.failedStart('embedded-refusal');
+  }
+
+  async failsOnUnusableEmbeddedCredential() {
+    await writeFile(join(this.dataDir, 'postgres-password'), 'p'.repeat(32), { mode: 0o644 });
+    return this.failedStart('unusable-credential');
+  }
+
+  async failsWhenReadyJournalIsFull() {
+    const journal = new OwnerJournal();
+    journal.rejectReadyAsFull();
+    return this.failedStart(false, journal);
   }
 
   async startsEmbedded() {
@@ -787,6 +824,23 @@ export class ServerOwnerScenario {
     return result;
   }
 
+  private async failedStart(
+    databaseFailure: false | DatabaseFailureFixture = false,
+    journal = new OwnerJournal(),
+  ) {
+    const output = new CapturedOutput();
+    try {
+      const controlled = await this.controlledOwner(journal, false, false, false, databaseFailure);
+      const start = await controlled.owner.start(new AbortController().signal).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      return { start, coreStarts: controlled.processes.startCalls, log: output.text() };
+    } finally {
+      output.restore();
+    }
+  }
+
   private lifecyclePath(channel: 'stable' | 'alpha' = 'stable') {
     return serverLifecyclePath({
       logDir: join(this.root, 'logs'),
@@ -818,7 +872,7 @@ export class ServerOwnerScenario {
     failFirstStop: boolean,
     failFirstHeldClose = false,
     stopBeforeOwnerAssignment = false,
-    databaseFailure: false | 'embedded' | 'external' | 'unknown' = false,
+    databaseFailure: false | DatabaseFailureFixture = false,
     lifecycle?: ServerLifecycleSink,
     readinessFailure = false,
     channel: 'stable' | 'alpha' = 'stable',
@@ -883,6 +937,7 @@ class OwnerJournal extends StartupProgressJournalWriter {
   private blocked = false;
   private readyOnly = false;
   private readyAbort: AbortController | undefined;
+  private readyFull = false;
 
   blockNext() {
     this.blocked = true;
@@ -901,12 +956,19 @@ class OwnerJournal extends StartupProgressJournalWriter {
     this.readyAbort = controller;
   }
 
+  rejectReadyAsFull() {
+    this.readyFull = true;
+  }
+
   release() {
     this.releaseCompletion?.();
   }
 
   override async write(...parameters: Parameters<StartupProgressJournalWriter['write']>) {
     const ready = parameters[2].at(-1)?.status === 'ready';
+    if (ready && this.readyFull) {
+      throw new StartupProgressError('limit');
+    }
     if (this.blocked && (!this.readyOnly || ready)) {
       this.blocked = false;
       this.notifyEntered?.();
@@ -934,7 +996,7 @@ class RealLeaseControlService extends PublishedControlService {
     journal: StartupProgressJournalWriter,
     private readonly failFirstClose = false,
     private readonly stopBeforeOwnerAssignment = false,
-    private readonly databaseFailure: false | 'embedded' | 'external' | 'unknown' = false,
+    private readonly databaseFailure: false | DatabaseFailureFixture = false,
     private readonly lifecycle: ServerLifecycleSink | undefined,
   ) {
     super(undefined, undefined, undefined, undefined, journal);
@@ -952,22 +1014,7 @@ class RealLeaseControlService extends PublishedControlService {
     }
     return {
       ...held,
-      startDatabase: () =>
-        this.databaseFailure
-          ? Promise.reject(
-              this.databaseFailure === 'embedded'
-                ? Object.assign(
-                    new EmbeddedPostgresError('process', true, {
-                      exitCode: 7,
-                      signal: 'SIGABRT',
-                    }),
-                    { privateDetail: 'secret-database-detail' },
-                  )
-                : this.databaseFailure === 'external'
-                  ? new ExternalPostgresError('connection')
-                  : new Error('secret-database-detail'),
-            )
-          : Promise.resolve({ kind: 'external' as const }),
+      startDatabase: () => this.startDatabase(),
       close: async () => {
         this.closeAttempts += 1;
         if (this.failFirstClose && this.closeAttempts === 1) {
@@ -978,6 +1025,36 @@ class RealLeaseControlService extends PublishedControlService {
       ...(this.lifecycle ? { lifecycle: this.lifecycle } : {}),
     };
   }
+
+  private startDatabase(): Promise<StartedDatabase> {
+    if (this.databaseFailure === 'unusable-credential') {
+      return Promise.resolve({ kind: 'embedded', host: '127.0.0.1', port: 5432, database: 'revo' });
+    }
+    if (this.databaseFailure) {
+      return Promise.reject(databaseFailureFixture(this.databaseFailure));
+    }
+    return Promise.resolve({ kind: 'external' });
+  }
+}
+
+function databaseFailureFixture(
+  kind: Exclude<DatabaseFailureFixture, 'unusable-credential'>,
+): Error {
+  if (kind === 'embedded') {
+    return Object.assign(
+      new EmbeddedPostgresError('process', true, { exitCode: 7, signal: 'SIGABRT' }),
+      {
+        privateDetail: 'secret-database-detail',
+      },
+    );
+  }
+  if (kind === 'embedded-refusal') {
+    return new EmbeddedPostgresError('locked', false, undefined, EMBEDDED_REFUSAL);
+  }
+  if (kind === 'external') {
+    return new ExternalPostgresError('connection');
+  }
+  return new Error('secret-database-detail');
 }
 
 class EarlyStopFailControlService extends PublishedControlService {

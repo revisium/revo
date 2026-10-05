@@ -199,6 +199,24 @@ describe('revo server command line', () => {
     }
   });
 
+  it('explains an embedded PostgreSQL refusal with its reason and the PostgreSQL log', async () => {
+    const dataDir = await mkdtemp(join(await realpath(tmpdir()), 'revo-incomplete-cluster-'));
+    try {
+      await mkdir(join(dataDir, 'postgres'), { mode: 0o700 });
+      await writeFile(join(dataDir, 'postgres', 'PG_VERSION'), '17\n', { mode: 0o600 });
+
+      const result = await CliScenario.runIsolated(['server', 'start', '--data-dir', dataDir]);
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        `the database did not start (embedded PostgreSQL invalid failure: the existing cluster ${dataDir}/postgres is incomplete and was left untouched; PostgreSQL log: `,
+      );
+      expect(result.stderr).toMatch(/; PostgreSQL log: \/\S+\/postgres\.log\)\./u);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('reports an isolated home as stopped without starting a server', async () => {
     const status = await CliScenario.runIsolated(['server', 'status']);
     const stop = await CliScenario.runIsolated(['server', 'stop']);

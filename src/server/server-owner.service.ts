@@ -83,9 +83,11 @@ type ServerOwnerErrorCode =
   | 'revo.server-owner.cancelled'
   | 'revo.server-owner.core'
   | 'revo.server-owner.database'
+  | 'revo.server-owner.filesystem'
   | 'revo.server-owner.invalid-state'
   | 'revo.server-owner.readiness'
-  | 'revo.server-owner.stop';
+  | 'revo.server-owner.stop'
+  | 'revo.server-owner.unexpected';
 
 export class ServerOwnerError extends Error {
   constructor(
@@ -97,6 +99,8 @@ export class ServerOwnerError extends Error {
           readonly reason: EmbeddedPostgresError['reason'];
           readonly progressFailure: boolean;
           readonly observedCompletion?: EmbeddedPostgresError['observedCompletion'];
+          readonly detail?: string;
+          readonly logPath?: string;
         }
       | {
           readonly code: 'revo.postgres.external.lifecycle';
@@ -569,9 +573,23 @@ function normalizeOwnerError(error: unknown, signal: AbortSignal): ServerOwnerEr
   if (error instanceof ServerOwnerError) {
     return error;
   }
-  return new ServerOwnerError(
-    signal.aborted ? 'revo.server-owner.cancelled' : 'revo.server-owner.core',
-  );
+  if (signal.aborted) {
+    return new ServerOwnerError('revo.server-owner.cancelled');
+  }
+  if (error instanceof CoreHostProcessError) {
+    return new ServerOwnerError('revo.server-owner.core');
+  }
+  if (error instanceof EmbeddedPostgresError || error instanceof ExternalPostgresError) {
+    return new ServerOwnerError(
+      'revo.server-owner.database',
+      undefined,
+      safeDatabaseFailure(error),
+    );
+  }
+  if (isFileSystemError(error)) {
+    return new ServerOwnerError('revo.server-owner.filesystem');
+  }
+  return new ServerOwnerError('revo.server-owner.unexpected');
 }
 
 function startFailureReason(primary: ServerOwnerError, cause: unknown): string {
@@ -582,11 +600,17 @@ function startFailureReason(primary: ServerOwnerError, cause: unknown): string {
     const detail = cause instanceof CoreHostProcessError ? cause.code : errorSummary(cause);
     return `Revo Core did not start (${detail}); its own output above has the cause`;
   }
+  if (primary.code === 'revo.server-owner.filesystem') {
+    return `a file system operation failed (${errorMessage(cause)})`;
+  }
   if (primary.code === 'revo.server-owner.readiness') {
     return 'Revo Core did not pass its readiness check';
   }
   if (primary.code === 'revo.server-owner.cancelled') {
     return 'the start was cancelled or exceeded its startup timeout';
+  }
+  if (primary.code === 'revo.server-owner.unexpected') {
+    return `an unexpected error occurred (${errorSummary(cause)})`;
   }
   return `${primary.code} (${errorSummary(cause)})`;
 }
@@ -601,16 +625,20 @@ function databaseFailureDetail(failure: ServerOwnerError['databaseFailure']): st
   const exit = failure.observedCompletion
     ? `, exit code ${String(failure.observedCompletion.exitCode)}, signal ${String(failure.observedCompletion.signal)}`
     : '';
-  return `embedded PostgreSQL ${failure.reason} failure${exit}`;
+  const detail = failure.detail === undefined ? '' : `: ${failure.detail}`;
+  const log = failure.logPath === undefined ? '' : `; PostgreSQL log: ${failure.logPath}`;
+  return `embedded PostgreSQL ${failure.reason} failure${exit}${detail}${log}`;
 }
 
-function errorSummary(error: unknown): string {
-  if (error instanceof Error) {
-    const code = Reflect.get(error, 'code');
-    return typeof code === 'string' ? `${error.name} ${code}` : `${error.name}: ${error.message}`;
-  }
-  return String(error);
-}
+const errorSummary = (error: unknown) =>
+  error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+
+const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+const isFileSystemError = (error: unknown): error is NodeJS.ErrnoException =>
+  error instanceof Error &&
+  typeof Reflect.get(error, 'syscall') === 'string' &&
+  typeof Reflect.get(error, 'path') === 'string';
 
 function safeDatabaseFailure(error: unknown): ServerOwnerError['databaseFailure'] {
   if (error instanceof EmbeddedPostgresError) {
@@ -618,20 +646,35 @@ function safeDatabaseFailure(error: unknown): ServerOwnerError['databaseFailure'
       code: error.code,
       reason: error.reason,
       progressFailure: error.progressFailure,
-      ...(error.observedCompletion
-        ? {
-            observedCompletion: {
-              exitCode: error.observedCompletion.exitCode,
-              signal: error.observedCompletion.signal,
-            },
-          }
-        : {}),
+      ...embeddedDiagnostic(error),
     };
   }
   if (error instanceof ExternalPostgresError) {
     return { code: error.code, reason: error.reason };
   }
   return undefined;
+}
+
+/** Copies only the fields Revo itself composed: exit status, refusal detail, and log path. */
+function embeddedDiagnostic(error: EmbeddedPostgresError) {
+  const diagnostic: {
+    observedCompletion?: EmbeddedPostgresError['observedCompletion'];
+    detail?: string;
+    logPath?: string;
+  } = {};
+  if (error.observedCompletion) {
+    diagnostic.observedCompletion = {
+      exitCode: error.observedCompletion.exitCode,
+      signal: error.observedCompletion.signal,
+    };
+  }
+  if (error.detail !== undefined) {
+    diagnostic.detail = error.detail;
+  }
+  if (error.logPath !== undefined) {
+    diagnostic.logPath = error.logPath;
+  }
+  return diagnostic;
 }
 
 function isReadyGraphql(value: unknown): boolean {
