@@ -15,7 +15,8 @@ export class VersionCommand extends CommandRunner {
     super();
   }
 
-  async run(): Promise<void> {
+  run(): Promise<void> {
     this.output.write(this.metadata.version);
+    return Promise.resolve();
   }
 }

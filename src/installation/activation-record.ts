@@ -1,7 +1,6 @@
 // oxlint-disable curly, no-shadow, no-unsafe-type-assertion -- bounded record parser
 
-import { parseReleaseMetadata } from '../release-metadata.js';
-import type { PreparedPackageReceipt } from './prepared-package.js';
+import { parseReleaseMetadata, type ReleaseMetadata } from '../release-metadata.js';
 
 export const ACTIVATION_SCHEMA = 'revo-activation/v1' as const;
 export const ACTIVATION_LAUNCHER_PROTOCOL = 'revo-activation-launcher/v2' as const;
@@ -23,17 +22,29 @@ export interface ActivationBinding {
   readonly generationId: string;
 }
 
+export interface ActivationComponents {
+  readonly core: { readonly name: string; readonly version: string };
+  readonly admin: { readonly name: string; readonly version: string };
+}
+
+export interface ActivationPackageDigests {
+  readonly package: { readonly sha256: string; readonly integrity: string };
+  readonly packageJson: { readonly sha256: string };
+  readonly pnpmLock: { readonly sha256: string };
+  readonly pnpmWorkspace: { readonly sha256: string };
+}
+
 export interface ActivationRecord {
   readonly schemaVersion: typeof ACTIVATION_SCHEMA;
   readonly launcherProtocol: typeof ACTIVATION_LAUNCHER_PROTOCOL;
   readonly generationId: string;
   readonly channel: 'stable' | 'alpha';
   readonly target: { readonly platform: string; readonly arch: string };
-  readonly release: PreparedPackageReceipt['release'];
-  readonly components: PreparedPackageReceipt['components'];
+  readonly release: ReleaseMetadata;
+  readonly components: ActivationComponents;
   readonly packageRef: string;
   readonly packageBin: string;
-  readonly packageDigests: PreparedPackageReceipt['artifacts'];
+  readonly packageDigests: ActivationPackageDigests;
   readonly toolchain: {
     readonly nodeRef: string;
     readonly pnpmRef: string;
@@ -54,7 +65,7 @@ const exact = (value: Record<string, unknown>, keys: readonly string[]) => {
 const hash = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
 const string = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
-const digests = (value: unknown): value is PreparedPackageReceipt['artifacts'] => {
+const digests = (value: unknown): value is ActivationPackageDigests => {
   if (!record(value) || !exact(value, ['package', 'packageJson', 'pnpmLock', 'pnpmWorkspace']))
     return false;
   for (const [name, item] of Object.entries(value)) {

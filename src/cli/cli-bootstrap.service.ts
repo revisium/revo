@@ -22,7 +22,7 @@ export class CliBootstrapService {
         outputConfiguration: {
           writeErr: () => undefined,
         },
-        serviceErrorHandler: async (error) => {
+        serviceErrorHandler: (error) => {
           throw error;
         },
         version: this.metadata.version,
