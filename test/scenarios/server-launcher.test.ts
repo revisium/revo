@@ -439,7 +439,7 @@ describe('server launcher composition', () => {
       expect(processes.start).toHaveBeenCalledTimes(1);
     });
 
-    it('reports an unreachable owner of the data directory and keeps its record', async () => {
+    it('reports that an unreachable server still owns the data directory and keeps its record', async () => {
       await abandoned.holdOwnership();
       const record = await abandoned.controlRecord();
       const resolved = configuration({
@@ -452,7 +452,7 @@ describe('server launcher composition', () => {
         processes,
       );
 
-      await expect(service.launch(request())).resolves.toEqual({ kind: 'unknown' });
+      await expect(service.launch(request())).resolves.toEqual({ kind: 'owned' });
       expect(processes.start).not.toHaveBeenCalled();
       await expect(abandoned.controlRecord()).resolves.toBe(record);
       expect(record).toBeDefined();

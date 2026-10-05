@@ -45,6 +45,8 @@ const started = async () => STARTED;
 const UNAVAILABLE = 'Server status is unavailable';
 const NO_START = `${UNAVAILABLE}; start was not performed.\n`;
 const NO_STOP = `${UNAVAILABLE}; stop was not performed.\n`;
+const OWNED =
+  'Another Revo server still owns the data directory but does not answer; start was not performed.\n';
 const STOPPED = 'Server stopped.\n';
 const ALREADY_STOPPED = 'Server is already stopped.\n';
 const STOP_CALL = { dataDir: FIXTURE_DATA_DIR, timeoutMs: SERVER_STOP_CONFIRMATION_MS };
@@ -235,6 +237,7 @@ describe('server command presentation', () => {
     { code: 1, err: refused('failed'), out: '', outcome: serverStatus('failed') },
     { code: 1, err: NO_START, out: '', outcome: serverStatus('unknown') },
     { code: 1, err: NO_START, out: '', outcome: serverStatus('missing') },
+    { code: 1, err: OWNED, out: '', outcome: { kind: 'owned' } },
     { code: 1, err: 'Server did not start.\n', out: '', outcome: serverStatus('stopped') },
   ])('presents a $outcome.kind launch outcome', async ({ code, err, out, outcome }) => {
     const result = await run(['server', 'start'], { launch: async () => outcome });

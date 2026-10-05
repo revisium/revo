@@ -69,8 +69,11 @@ manifest remains private during the foundation stage.
 
 A started server appends its own and Revo Core's output to a private `server.log` (mode `0600`)
 next to the lifecycle journal shown by `revo server logs`, in
-`<log directory>/<channel>/<data directory hash>/`. Database credentials are redacted. When a start
-fails, `revo server start` prints the reason, the log path, and the last 40 lines of that start.
+`<log directory>/<channel>/<data directory hash>/`. Embedded PostgreSQL writes to `postgres.log` in
+the same directory. Database credentials are redacted. When a start fails, `revo server start`
+prints the reason, the log path, and the last 40 lines of that start; a PostgreSQL failure also
+names its own reason and `postgres.log`. A start over a server that no longer answers but still owns
+the data directory is refused with that explanation.
 
 Startup progress (`--progress=jsonl`) is best-effort: a slow or failed progress read or write is
 skipped with a warning on stderr, and a server that started still exits with code 0.

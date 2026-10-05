@@ -134,6 +134,11 @@ describe('revo tui command', () => {
       outcome: { kind: 'missing' },
       stderr: 'Server status is unavailable; start was not performed.\n',
     },
+    {
+      outcome: { kind: 'owned' },
+      stderr:
+        'Another Revo server still owns the data directory but does not answer; start was not performed.\n',
+    },
   ] as const satisfies readonly { outcome: ServerLaunchResult; stderr: string }[])(
     'does not launch TUI when the server outcome is $outcome.kind',
     async ({ outcome, stderr }) => {

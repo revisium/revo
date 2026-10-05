@@ -20,6 +20,7 @@ import { SERVER_STOP_CONFIRMATION_MS, ServerStopService } from '../server/server
 import { CliUsageError } from './cli-error.js';
 import { OutputService } from './output.service.js';
 import { PackageMetadataService } from './package-metadata.service.js';
+import { startNotPerformed } from './server-public-origin.js';
 
 const DIAGNOSTICS: Readonly<Record<string, string>> = {
   REVO_ACTIVATION_STATE_INCOMPATIBLE:
@@ -102,12 +103,8 @@ export class ServerCommandService {
       this.output.write(`Server started at ${outcome.url}.`);
     } else if (outcome.kind === 'running') {
       this.output.write('Server is already running.');
-    } else if (outcome.kind === 'stopped') {
-      throw new Error('Server did not start.');
-    } else if (outcome.kind === 'unknown' || outcome.kind === 'missing') {
-      throw new Error(`${UNAVAILABLE}; start was not performed.`);
     } else {
-      throw new Error(`Server is ${outcome.kind}; start was not performed.`);
+      throw startNotPerformed(outcome);
     }
   }
 

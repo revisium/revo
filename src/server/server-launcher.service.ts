@@ -28,7 +28,12 @@ export interface ServerLaunchRequest extends ConfigurationInput {
   readonly onProgress?: ServerProgressSink;
 }
 
-export type ServerLaunchResult = ServerStatus | StartedServer;
+/** An unreachable server that still holds the data directory's ownership lock. */
+export interface OwnedDataDirectory {
+  readonly kind: 'owned';
+}
+
+export type ServerLaunchResult = ServerStatus | StartedServer | OwnedDataDirectory;
 
 export interface ServerLaunchContext {
   readonly configuration: Readonly<RevoConfiguration>;
@@ -67,8 +72,8 @@ export class ServerLauncherService {
     request: Readonly<ServerLaunchRequest>,
   ): Promise<ServerLaunchContext> {
     const resolved = await this.configuration.resolve(request);
-    const current = await this.status.read(resolved.layout.dataDir);
-    if (current.kind !== 'stopped' && !(await this.isAbandoned(current, resolved.layout.dataDir))) {
+    const current = await this.blockingServer(resolved.layout.dataDir);
+    if (current) {
       if (current.kind === 'running' && request.onProgress) {
         await this.observer.reused(
           current.status.publicUrl,
@@ -111,8 +116,22 @@ export class ServerLauncherService {
     return { configuration: resolved, outcome };
   }
 
-  private async isAbandoned(current: ServerStatus, dataDir: string): Promise<boolean> {
-    return current.kind === 'unknown' && (await this.ownership.inspect(dataDir)).kind === 'free';
+  /** An unreachable server blocks a new one until nothing owns its data directory. */
+  private async blockingServer(
+    dataDir: string,
+  ): Promise<ServerStatus | OwnedDataDirectory | undefined> {
+    const current = await this.status.read(dataDir);
+    if (current.kind === 'stopped') {
+      return undefined;
+    }
+    if (current.kind !== 'unknown') {
+      return current;
+    }
+    const ownership = await this.ownership.inspect(dataDir);
+    if (ownership.kind === 'free') {
+      return undefined;
+    }
+    return ownership.kind === 'busy' ? { kind: 'owned' } : current;
   }
 
   private startMessage(
