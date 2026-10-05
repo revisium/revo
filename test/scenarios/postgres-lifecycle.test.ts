@@ -266,6 +266,12 @@ describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () =
       await expect(bystander.receivedSignals()).resolves.toEqual([]);
     });
 
+    it('replaces a lock file whose PID now belongs to another user', async () => {
+      await scenario.lockFileNaming(await scenario.anotherUsersProcess(), 'an hour earlier');
+
+      await expect(scenario.start()).resolves.toMatchObject({ kind: 'started' });
+    });
+
     it('replaces a lock file whose live process works outside the cluster without signalling it', async () => {
       const bystander = await scenario.bystander();
       await scenario.lockFileNaming(bystander.pid, 'an hour later');

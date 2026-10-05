@@ -1,4 +1,4 @@
-import { fork, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, fork, spawn, type ChildProcess } from 'node:child_process';
 import {
   access,
   chmod,
@@ -14,6 +14,7 @@ import {
 } from 'node:fs/promises';
 import { uptime } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import { Client } from 'pg';
 
@@ -171,6 +172,17 @@ export class PostgresRecoveryScenario {
 
   bystanderInsideTheCluster(): Promise<Bystander> {
     return this.spawnBystander(this.clusterDir());
+  }
+
+  async anotherUsersProcess(): Promise<number> {
+    const { stdout } = await promisify(execFile)('ps', ['-A', '-o', 'pid=,uid=']);
+    for (const line of stdout.trim().split('\n')) {
+      const [pid = 0, uid] = line.trim().split(/\s+/u).map(Number);
+      if (pid > 0 && uid !== process.getuid?.()) {
+        return pid;
+      }
+    }
+    throw new Error('no process of another user is running');
   }
 
   async exitedProcess(): Promise<number> {
