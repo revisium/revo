@@ -28,6 +28,18 @@ toolchain_checksums() {
   esac
 }
 
+# Shared libraries the private Node.js loads that minimal images lack, one package per package manager.
+required_libraries='libatomic.so.1'
+
+library_package() {
+  case "$2:$1" in
+    libatomic.so.1:apt-get | libatomic.so.1:zypper) package=libatomic1 ;;
+    libatomic.so.1:dnf | libatomic.so.1:yum) package=libatomic ;;
+    libatomic.so.1:pacman) package=gcc-libs ;;
+    *) package= ;;
+  esac
+}
+
 say() {
   printf '%s\n' "$*"
 }
@@ -81,6 +93,105 @@ require_tools() {
   done
   command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ||
     fail 'sha256sum or shasum is required; install it and run the installer again.'
+}
+
+# ldconfig knows every library the loader finds; the common directories are the fallback when it
+# cannot answer.
+library_present() {
+  case "$ldconfig_cache" in
+    *' => '*) printf '%s\n' "$ldconfig_cache" | awk -v name="$1" '$1 == name { found = 1 } END { exit !found }' ;;
+    *)
+      for directory in /lib /lib64 /usr/lib /usr/lib64 /usr/local/lib /lib/*-linux-gnu /usr/lib/*-linux-gnu; do
+        [ ! -e "$directory/$1" ] || return 0
+      done
+      return 1
+      ;;
+  esac
+}
+
+find_missing_libraries() {
+  ldconfig_cache=$({ ldconfig -p || /sbin/ldconfig -p; } 2>/dev/null) || ldconfig_cache=
+  missing=
+  for library in $required_libraries; do
+    library_present "$library" || missing="${missing:+$missing }$library"
+  done
+}
+
+plan_library_install() {
+  manager=
+  packages=
+  for candidate in apt-get dnf yum zypper pacman; do
+    if [ -z "$manager" ] && command -v "$candidate" >/dev/null 2>&1; then
+      manager=$candidate
+    fi
+  done
+  [ -n "$manager" ] || return 1
+  for library in $missing; do
+    library_package "$manager" "$library"
+    [ -n "$package" ] || return 1
+    packages="${packages:+$packages }$package"
+  done
+  case "$manager" in
+    zypper) install_args="--non-interactive install $packages" ;;
+    pacman) install_args="-S --noconfirm --needed $packages" ;;
+    *) install_args="install -y $packages" ;;
+  esac
+}
+
+# REVO_INSTALL_TTY lets tests stand in for the terminal; under `curl | sh` stdin is the script, so
+# questions go to the controlling terminal.
+has_terminal() {
+  terminal=${REVO_INSTALL_TTY:-/dev/tty}
+  (: <"$terminal") 2>/dev/null && (: >>"$terminal") 2>/dev/null
+}
+
+confirm() {
+  printf 'Run it now? [Y/n] ' >>"$terminal"
+  read -r answer <"$terminal" || answer=
+  case "$answer" in '' | [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+run_as_admin() {
+  if [ -n "$sudo_prefix" ]; then sudo "$@"; else "$@"; fi
+}
+
+# shellcheck disable=SC2086 # install_args holds several words.
+install_libraries() {
+  run_as_admin "$manager" $install_args && return
+  # A fresh apt image has no package lists yet.
+  if [ "$manager" = apt-get ]; then
+    say 'Refreshing the package lists...'
+    run_as_admin apt-get update && run_as_admin "$manager" $install_args && return
+  fi
+  fail "\`$command_text\` failed; fix that and run the installer again."
+}
+
+# Runs before anything is downloaded or created, so declining leaves the machine unchanged.
+ensure_system_libraries() {
+  [ "$system" = Linux ] || return 0
+  find_missing_libraries
+  [ -n "$missing" ] || return 0
+  needs="Node.js needs $missing, which is missing"
+  plan_library_install || fail "$needs; install the package that provides it and run the installer again."
+  sudo_prefix=
+  if [ "$(id -u)" != 0 ]; then
+    command -v sudo >/dev/null 2>&1 ||
+      fail "$needs; install it as root with \`$manager $install_args\` and run the installer again."
+    sudo_prefix='sudo '
+  fi
+  command_text="$sudo_prefix$manager $install_args"
+  if [ "${REVO_INSTALL_SYSTEM_DEPS:-}" = 1 ] || [ -z "$sudo_prefix" ]; then
+    say "$needs. Running: $command_text"
+  elif has_terminal; then
+    say "$needs."
+    say "The installer will run: $command_text"
+    confirm || fail "$needs; install it with \`$command_text\` and run the installer again."
+  else
+    fail "$needs; install it with \`$command_text\` and run the installer again, or run the installer with REVO_INSTALL_SYSTEM_DEPS=1 to let it do that."
+  fi
+  install_libraries
+  find_missing_libraries
+  [ -z "$missing" ] || fail "$needs even after \`$command_text\`; install it and run the installer again."
 }
 
 locate_installation() {
@@ -172,7 +283,7 @@ sha256_of() {
 }
 
 fetch() {
-  curl_error=$(curl --fail --location --proto '=https' --proto-redir '=https' --retry 3 \
+  curl_error=$(curl --fail --location --proto '=https' --proto-redir '=https' --retry 6 --retry-max-time 120 \
     --connect-timeout 15 --speed-limit 1024 --speed-time 30 --silent --show-error \
     --output "$2" "$1" 2>&1) ||
     fail "download failed: $1 ($(printf '%s\n' "$curl_error" | tail -n 1)); nothing was changed."
@@ -210,17 +321,25 @@ publish() {
   mv "$1" "$2" || fail "cannot install $2."
 }
 
+# Safety net behind the early library check: shows the loader's own error line.
+check_runs() {
+  expected=$1 description=$2
+  shift 2
+  found=$(cd / && "$@" 2>"$staging/probe.err") && [ "$found" = "$expected" ] && return
+  detail=$(tail -n 1 "$staging/probe.err" 2>/dev/null)
+  [ -z "$detail" ] || fail "$description does not run on this machine: $detail"
+  fail "$description does not run on this machine."
+}
+
 install_toolchain() {
   if [ -f "$staging/node.tar.gz" ]; then
     unpack "$staging/node.tar.gz" "$staging/node" --strip-components=1
-    [ "$("$staging/node/bin/node" --version 2>/dev/null)" = "v$node_version" ] ||
-      fail "Node.js $node_version does not run on this machine."
+    check_runs "v$node_version" "Node.js $node_version" "$staging/node/bin/node" --version
     publish "$staging/node" "$node_home"
   fi
   if [ -f "$staging/pnpm.tar.gz" ]; then
     unpack "$staging/pnpm.tar.gz" "$staging/pnpm"
-    [ "$(cd / && "$staging/pnpm/pnpm" --version 2>/dev/null)" = "$pnpm_version" ] ||
-      fail "pnpm $pnpm_version does not run on this machine."
+    check_runs "$pnpm_version" "pnpm $pnpm_version" "$staging/pnpm/pnpm" --version
     publish "$staging/pnpm" "$pnpm_home"
   fi
 }
@@ -307,6 +426,7 @@ main() {
   require_tools
   locate_installation
   check_command_link
+  ensure_system_libraries
   acquire_lock
   read_active_version
   if [ "$previous" = "$version" ] && [ -d "$version_home" ]; then

@@ -26,11 +26,24 @@ The alpha channel's command is `revo-alpha`; the stable channel will use `revo`.
 to start the server and print its URL. The installer does not start the server itself.
 
 Supported platforms are Linux x64 and arm64 with glibc 2.35 or newer (for example Ubuntu 22.04 or
-newer), and macOS 15 or newer on Apple Silicon or Intel. Administrator rights and preinstalled
-Node.js, pnpm, or PostgreSQL are not required: the installer downloads its own Node.js and pnpm,
-verifies every download against SHA-256 checksums embedded in the script, and never uses or changes
-copies already installed on the system. Your pnpm settings do not change what it installs; registry,
-proxy, and credential settings still apply.
+newer), and macOS 15 or newer on Apple Silicon or Intel. Preinstalled Node.js, pnpm, or PostgreSQL
+are not required: the installer downloads its own Node.js and pnpm, verifies every download against
+SHA-256 checksums embedded in the script, and never uses or changes copies already installed on the
+system. Your pnpm settings do not change what it installs; registry, proxy, and credential settings
+still apply.
+
+### System requirements
+
+- `curl`, `tar`, `gzip`, and `ca-certificates`.
+- On Linux, `libatomic1` (`libatomic.so.1`), which Node.js needs and minimal images such as
+  `ubuntu:26.04` lack.
+
+If a required library is missing, the installer shows the package manager command (`apt-get`,
+`dnf`, `yum`, `zypper`, or `pacman`) and offers to run it with `sudo` before it downloads anything;
+answer `n` and nothing changes. Without a terminal, for example in CI, it prints the command and
+stops unless you run it with `REVO_INSTALL_SYSTEM_DEPS=1`, which lets it install the library as
+root or with `sudo`. Without root, `sudo`, or a known package manager it names the library and the
+package to install by hand.
 
 The installer creates `~/.local/bin/revo-alpha`. If `~/.local/bin` is not on your `PATH`, it prints
 the line to add to your shell profile; it never edits shell profiles itself:
