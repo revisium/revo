@@ -31,6 +31,7 @@ export function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
   return {
     HOME: home,
     PATH: process.env.PATH ?? '',
+    REVO_CONTROL_SOCKET_ROOT: process.env.REVO_CONTROL_SOCKET_ROOT,
     XDG_CACHE_HOME: `${home}/cache`,
     XDG_CONFIG_HOME: `${home}/config`,
     XDG_DATA_HOME: `${home}/data`,
