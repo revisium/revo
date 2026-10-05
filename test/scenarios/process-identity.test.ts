@@ -109,7 +109,18 @@ describe('process identity', () => {
       { kind: 'missing' },
       { kind: 'unknown', reason: 'malformed' },
       { kind: 'unknown', reason: 'unavailable' },
+      { kind: 'unknown', reason: 'denied' },
     ]);
+  });
+  it('reads the owner of a Darwin process whose details belong to another user', async () => {
+    await expect(scenario.observesAnotherUsersDarwinProcess()).resolves.toEqual({
+      live: { kind: 'restricted', uid: 0 },
+      flavors: [3, 13],
+      exited: { kind: 'missing' },
+      zombie: { kind: 'missing' },
+      partial: { kind: 'unknown', reason: 'denied' },
+      reused: { kind: 'unknown', reason: 'denied' },
+    });
   });
   it('rejects missing and incomplete Linux Uid status fields', async () => {
     await expect(scenario.observesMalformedLinuxStatus()).resolves.toEqual([

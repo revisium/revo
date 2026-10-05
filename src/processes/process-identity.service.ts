@@ -81,6 +81,9 @@ export class ProcessIdentityService {
     if (!observation) {
       return { kind: 'unknown', reason: 'unavailable' };
     }
+    if (observation.kind === 'restricted') {
+      return { kind: 'unknown', reason: 'denied' };
+    }
     if (observation.kind !== 'captured') {
       return observation;
     }

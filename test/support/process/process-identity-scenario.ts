@@ -199,7 +199,21 @@ export class ProcessIdentityScenario {
       inspect(FixtureDarwinAdapter.buffer(77, 5)),
       inspect(FixtureDarwinAdapter.buffer(78, 2)),
       inspect(new FailingDarwinAdapter()),
+      inspect(new RestrictedDarwinAdapter({})),
     ]);
+  }
+  async observesAnotherUsersDarwinProcess() {
+    const live = new RestrictedDarwinAdapter({});
+    const observe = (shortInfo: Partial<ShortInfo>) =>
+      new RestrictedDarwinAdapter(shortInfo).capture(77);
+    return {
+      live: await live.capture(77),
+      flavors: live.flavors,
+      exited: await observe({ read: 0, errno: 3 }),
+      zombie: await observe({ status: 5 }),
+      partial: await observe({ read: 12 }),
+      reused: await observe({ pid: 78 }),
+    };
   }
   async observesMalformedLinuxStatus() {
     return Promise.all(
@@ -330,6 +344,38 @@ class FixtureDarwinAdapter extends DarwinProcessIdentityAdapter {
       noSuchProcess: [3],
       denied: [1, 13],
     });
+  }
+}
+interface ShortInfo {
+  readonly read: number;
+  readonly errno: number;
+  readonly pid: number;
+  readonly status: number;
+  readonly uid: number;
+}
+class RestrictedDarwinAdapter extends DarwinProcessIdentityAdapter {
+  readonly flavors: number[] = [];
+  private readonly shortInfo: ShortInfo;
+  constructor(shortInfo: Partial<ShortInfo>) {
+    super();
+    this.shortInfo = { read: 64, errno: 0, pid: 77, status: 2, uid: 0, ...shortInfo };
+  }
+  protected override async loadBinding(): Promise<DarwinBinding> {
+    return {
+      pidInfo: (_p, flavor, _a, destination) => {
+        this.flavors.push(flavor);
+        if (flavor !== 13) {
+          return 0;
+        }
+        destination.writeUInt32LE(this.shortInfo.pid, 0);
+        destination.writeUInt32LE(this.shortInfo.status, 12);
+        destination.writeUInt32LE(this.shortInfo.uid, 36);
+        return this.shortInfo.read;
+      },
+      errno: () => (this.flavors.at(-1) === 13 ? this.shortInfo.errno : 1),
+      noSuchProcess: [3],
+      denied: [1, 13],
+    };
   }
 }
 class FailingDarwinAdapter extends DarwinProcessIdentityAdapter {

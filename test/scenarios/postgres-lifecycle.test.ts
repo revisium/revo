@@ -187,6 +187,16 @@ describe('embedded PostgreSQL recovery after a crash', { timeout: 30_000 }, () =
     await expect(scenario.isRunning(supervisor.postmasterPid)).resolves.toBe(false);
   });
 
+  it('starts when the orphaned server finishes its own shutdown before pg_ctl stops it', async () => {
+    const supervisor = await scenario.runningSupervisor();
+    await supervisor.kill();
+
+    const restart = await scenario.startWhileTheOrphanShutsDownOnItsOwn(supervisor.postmasterPid);
+
+    expect(restart).toMatchObject({ kind: 'started' });
+    await expect(scenario.postgresLog()).resolves.toMatch(/PID file "\S+" does not exist/u);
+  });
+
   it('keeps an orphaned server and its lock file when the clock moved after it started', async () => {
     const supervisor = await scenario.runningSupervisor();
     await supervisor.kill();

@@ -6,6 +6,7 @@ import { Inject, Injectable } from '@nestjs/common';
 
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import { ProcessIdentityService } from '../processes/process-identity.service.js';
+import type { IdentityObservation } from '../processes/process-identity.types.js';
 import type { EmbeddedPostgresLog } from './embedded-postgres-log.js';
 import { EmbeddedPostgresError } from './embedded-postgres.types.js';
 
@@ -57,11 +58,7 @@ export class EmbeddedPostgresLockRecovery {
   private async recover(request: ReleaseClusterLockRequest): Promise<LockRecovery> {
     let lock = await this.inspect(request.clusterDir);
     if (lock.kind === 'running') {
-      if (!(await this.stopOrphanedServer(request))) {
-        return refused(
-          `the earlier PostgreSQL server (PID ${String(lock.pid)}) of ${request.clusterDir} did not stop`,
-        );
-      }
+      await this.stopOrphanedServer(request);
       lock = await this.inspect(request.clusterDir);
     }
     if (lock.kind === 'stale') {
@@ -97,14 +94,11 @@ export class EmbeddedPostgresLockRecovery {
   private async identify(server: RecordedServer, clusterDir: string): Promise<ClusterLock> {
     const pid = String(server.pid);
     const observation = await this.identity.observe(server.pid);
-    if (observation.kind === 'missing') {
+    if (observation.kind === 'missing' || ownedByAnotherUser(observation)) {
       return { kind: 'stale' };
     }
     if (observation.kind !== 'captured') {
       return { kind: 'uncertain', reason: `process ${pid} cannot be inspected` };
-    }
-    if (observation.identity.uid !== process.getuid?.()) {
-      return { kind: 'stale' };
     }
     const location = await this.workingLocation(server.pid, clusterDir);
     if (location === 'gone' || location === 'elsewhere') {
@@ -141,7 +135,7 @@ export class EmbeddedPostgresLockRecovery {
     return device === cluster.dev && inode === cluster.ino ? 'cluster' : 'elsewhere';
   }
 
-  private async stopOrphanedServer(request: ReleaseClusterLockRequest): Promise<boolean> {
+  private async stopOrphanedServer(request: ReleaseClusterLockRequest): Promise<void> {
     const seconds = Math.min(
       MAX_STOP_SECONDS,
       Math.max(1, Math.floor((request.deadline - Date.now()) / 1000)),
@@ -160,8 +154,7 @@ export class EmbeddedPostgresLockRecovery {
         },
       }),
     );
-    const completion = await pgCtl.completion;
-    return completion.exitCode === 0;
+    await pgCtl.completion;
   }
 }
 
@@ -205,6 +198,13 @@ async function readLockFile(path: string): Promise<LockFile> {
   }
 }
 
+function ownedByAnotherUser(observation: IdentityObservation): boolean {
+  if (observation.kind === 'captured') {
+    return observation.identity.uid !== process.getuid?.();
+  }
+  return observation.kind === 'restricted' && observation.uid !== process.getuid?.();
+}
+
 function parseRecordedServer(content: string): RecordedServer | undefined {
   const [pid, dataDir, startedAt] = content.split('\n');
   if (
@@ -236,7 +236,7 @@ function refusalDetail(
   lock: Extract<ClusterLock, { readonly kind: 'running' | 'uncertain' }>,
 ) {
   if (lock.kind === 'running') {
-    return `the earlier PostgreSQL server (PID ${String(lock.pid)}) of ${clusterDir} is still running`;
+    return `the earlier PostgreSQL server (PID ${String(lock.pid)}) of ${clusterDir} did not stop`;
   }
   return (
     `the lock file ${join(clusterDir, LOCK_FILE)} was left in place because ${lock.reason}; ` +

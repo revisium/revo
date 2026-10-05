@@ -25,6 +25,7 @@ export type ProcessIdentityInspection =
 export type IdentityObservation =
   | { readonly kind: 'captured'; readonly identity: ProcessIdentity }
   | { readonly kind: 'missing' }
+  | { readonly kind: 'restricted'; readonly uid: number }
   | Exclude<
       ProcessIdentityInspection,
       { readonly kind: 'confirmed' } | { readonly kind: 'mismatch' }

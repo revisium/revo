@@ -197,6 +197,15 @@ export class PostgresRecoveryScenario {
     return server;
   }
 
+  startWhileTheOrphanShutsDownOnItsOwn(postmasterPid: number): Promise<StartOutcome> {
+    return this.start(
+      new BeforePgCtlStop(async () => {
+        process.kill(postmasterPid, 'SIGINT');
+        await eventually(async () => !(await this.isRunning(postmasterPid)));
+      }),
+    );
+  }
+
   async lockFileNaming(pid: number, recordedStart: 'an hour earlier' | 'an hour later') {
     const now = Math.floor(Date.now() / 1000);
     const startedAt = recordedStart === 'an hour earlier' ? now - HOUR_SECONDS : now + HOUR_SECONDS;
@@ -345,7 +354,10 @@ export class PostgresRecoveryScenario {
       undefined,
       undefined,
       undefined,
-      new EmbeddedPostgresResourceService(new EmbeddedPostgresPreparationService(processes)),
+      new EmbeddedPostgresResourceService(
+        new EmbeddedPostgresPreparationService(processes),
+        processes,
+      ),
     ).open({
       dataDir: this.dataDir,
       logDir: this.logDir,
@@ -438,6 +450,19 @@ class InitdbObserver extends ManagedProcessService {
       () => true,
       () => false,
     );
+  }
+}
+
+class BeforePgCtlStop extends ManagedProcessService {
+  constructor(private readonly beforeStop: () => Promise<void>) {
+    super();
+  }
+
+  override async start(request: ManagedProcessRequest): Promise<OwnedProcess> {
+    if (request.args[0] === 'stop') {
+      await this.beforeStop();
+    }
+    return super.start(request);
   }
 }
 

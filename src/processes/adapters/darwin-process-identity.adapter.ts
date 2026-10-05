@@ -8,7 +8,9 @@ import type {
 } from '../process-identity.types.js';
 
 const BSD_INFO_SIZE = 136;
+const SHORT_BSD_INFO_SIZE = 64;
 const PROC_PIDTBSDINFO = 3;
+const PROC_PIDT_SHORTBSDINFO = 13;
 const PROC_PIDVNODEPATHINFO = 9;
 const VNODE_PATH_INFO_SIZE = 2352;
 const SZOMB = 5;
@@ -40,18 +42,8 @@ export class DarwinProcessIdentityAdapter implements ProcessIdentityAdapter {
     }
     const buffer = Buffer.alloc(BSD_INFO_SIZE);
     const read = binding.pidInfo(pid, PROC_PIDTBSDINFO, 0n, buffer, buffer.length);
-    const errorNumber = read === 0 ? binding.errno() : undefined;
     if (read === 0) {
-      if (errorNumber !== undefined && binding.noSuchProcess.includes(errorNumber)) {
-        return { kind: 'missing' };
-      }
-      return {
-        kind: 'unknown',
-        reason:
-          errorNumber !== undefined && binding.denied.includes(errorNumber)
-            ? 'denied'
-            : 'unavailable',
-      };
+      return unreadable(binding, pid);
     }
     if (read !== BSD_INFO_SIZE) {
       return { kind: 'unknown', reason: 'malformed' };
@@ -128,4 +120,32 @@ export class DarwinProcessIdentityAdapter implements ProcessIdentityAdapter {
       denied: [koffi.default.os.errno.EACCES ?? 13, koffi.default.os.errno.EPERM ?? 1],
     };
   }
+}
+
+function unreadable(binding: DarwinBinding, pid: number): IdentityObservation {
+  const errorNumber = binding.errno();
+  if (binding.noSuchProcess.includes(errorNumber)) {
+    return { kind: 'missing' };
+  }
+  if (!binding.denied.includes(errorNumber)) {
+    return { kind: 'unknown', reason: 'unavailable' };
+  }
+  return restricted(binding, pid);
+}
+
+/** Full BSD info covers only the caller's own processes; the short form names any owner. */
+function restricted(binding: DarwinBinding, pid: number): IdentityObservation {
+  const buffer = Buffer.alloc(SHORT_BSD_INFO_SIZE);
+  const read = binding.pidInfo(pid, PROC_PIDT_SHORTBSDINFO, 0n, buffer, buffer.length);
+  if (read === 0 && binding.noSuchProcess.includes(binding.errno())) {
+    return { kind: 'missing' };
+  }
+  const uid = buffer.readUInt32LE(36);
+  if (read !== SHORT_BSD_INFO_SIZE || buffer.readUInt32LE(0) !== pid || !validUid(uid)) {
+    return { kind: 'unknown', reason: 'denied' };
+  }
+  if (buffer.readUInt32LE(12) === SZOMB) {
+    return { kind: 'missing' };
+  }
+  return { kind: 'restricted', uid };
 }
