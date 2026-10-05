@@ -101,7 +101,8 @@ library_present() {
   case "$ldconfig_cache" in
     *' => '*) printf '%s\n' "$ldconfig_cache" | awk -v name="$1" '$1 == name { found = 1 } END { exit !found }' ;;
     *)
-      for directory in /lib /lib64 /usr/lib /usr/lib64 /usr/local/lib /lib/*-linux-gnu /usr/lib/*-linux-gnu; do
+      # REVO_TEST_LIBRARY_DIRS (test-only) replaces the directories.
+      for directory in ${REVO_TEST_LIBRARY_DIRS:-/lib /lib64 /usr/lib /usr/lib64 /usr/local/lib /lib/*-linux-gnu /usr/lib/*-linux-gnu}; do
         [ ! -e "$directory/$1" ] || return 0
       done
       return 1
@@ -110,7 +111,12 @@ library_present() {
 }
 
 find_missing_libraries() {
-  ldconfig_cache=$({ ldconfig -p || /sbin/ldconfig -p; } 2>/dev/null) || ldconfig_cache=
+  ldconfig_cache=
+  if command -v ldconfig >/dev/null 2>&1; then
+    ldconfig_cache=$(ldconfig -p 2>/dev/null) || ldconfig_cache=
+  elif [ -x /sbin/ldconfig ]; then
+    ldconfig_cache=$(/sbin/ldconfig -p 2>/dev/null) || ldconfig_cache=
+  fi
   missing=
   for library in $required_libraries; do
     library_present "$library" || missing="${missing:+$missing }$library"
@@ -138,16 +144,17 @@ plan_library_install() {
   esac
 }
 
-# REVO_INSTALL_TTY lets tests stand in for the terminal; under `curl | sh` stdin is the script, so
+# REVO_TEST_TTY (test-only) lets tests stand in for the terminal; under `curl | sh` stdin is the script, so
 # questions go to the controlling terminal.
 has_terminal() {
-  terminal=${REVO_INSTALL_TTY:-/dev/tty}
+  terminal=${REVO_TEST_TTY:-/dev/tty}
   (: <"$terminal") 2>/dev/null && (: >>"$terminal") 2>/dev/null
 }
 
 confirm() {
   printf 'Run it now? [Y/n] ' >>"$terminal"
-  read -r answer <"$terminal" || answer=
+  # End of input (Ctrl-D, a closed terminal) is a refusal; only a typed empty line means yes.
+  read -r answer <"$terminal" || return 1
   case "$answer" in '' | [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
@@ -157,12 +164,19 @@ run_as_admin() {
 
 # shellcheck disable=SC2086 # install_args holds several words.
 install_libraries() {
-  run_as_admin "$manager" $install_args && return
-  # A fresh apt image has no package lists yet.
-  if [ "$manager" = apt-get ]; then
-    say 'Refreshing the package lists...'
-    run_as_admin apt-get update && run_as_admin "$manager" $install_args && return
+  if [ "$manager" != apt-get ]; then
+    run_as_admin "$manager" $install_args && return
+    fail "\`$command_text\` failed; fix that and run the installer again."
   fi
+  output=$(run_as_admin "$manager" $install_args 2>&1) && return
+  # Refresh the lists only when that is the failure: a fresh apt image has none.
+  case "$output" in
+    *'Unable to locate package'* | *'has no installation candidate'*)
+      say 'Refreshing the package lists...'
+      run_as_admin apt-get update && run_as_admin "$manager" $install_args && return
+      ;;
+    *) printf '%s\n' "$output" >&2 ;;
+  esac
   fail "\`$command_text\` failed; fix that and run the installer again."
 }
 

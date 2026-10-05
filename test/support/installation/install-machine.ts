@@ -111,6 +111,8 @@ export interface MachineOptions {
 export interface PackageManagerOptions {
   /** The install fails until `update` has refreshed the package lists, as on a fresh image. */
   readonly staleLists?: boolean;
+  /** The install fails with this message, whatever the package lists hold. */
+  readonly failWith?: string;
 }
 
 export type UserPnpmSettingSource = 'configuration file' | 'environment';
@@ -368,6 +370,9 @@ export class InstallMachine {
         `[ -z "\${FIXTURE_SUDO:-}" ] || sudo_prefix='sudo '`,
         `printf '%s\\n' "\${sudo_prefix:-}${name} $*" >> ${quote(this.control('system-commands.log'))}`,
         `if [ "\${1:-}" = update ]; then : > ${quote(this.control('lists-updated'))}; exit 0; fi`,
+        ...(options.failWith === undefined
+          ? []
+          : [`echo ${quote(options.failWith)} >&2`, 'exit 1']),
         `if [ -e ${quote(this.control('lists-stale'))} ] && [ ! -e ${quote(this.control('lists-updated'))} ]; then`,
         "  echo 'E: Unable to locate package libatomic1' >&2",
         '  exit 100',
@@ -381,6 +386,22 @@ export class InstallMachine {
   /** The package manager succeeds without providing the library. */
   async keepLibraryMissingAfterInstall(): Promise<void> {
     await writeFile(this.control('install-ineffective'), '');
+  }
+
+  /** The terminal closes without any input, as with Ctrl-D. */
+  async closeTerminalWithoutAnswer(): Promise<void> {
+    await writeFile(this.control('tty'), '');
+  }
+
+  /** ldconfig fails, so the installer looks in these directories; they hold libatomic or not. */
+  async searchLibrariesOnlyIn(options: { readonly libatomic: boolean }): Promise<void> {
+    const directory = this.control('libraries');
+    await mkdir(directory, { recursive: true });
+    if (options.libatomic) {
+      await writeFile(join(directory, 'libatomic.so.1'), '');
+    }
+    await executable(join(this.root, 'platform-bin', 'ldconfig'), 'exit 1\n');
+    this.userPnpmEnvironment.REVO_TEST_LIBRARY_DIRS = directory;
   }
 
   async haveSudo(): Promise<void> {
@@ -519,7 +540,7 @@ export class InstallMachine {
       HOME: this.home,
       LC_ALL: 'C',
       PATH: path.join(':'),
-      REVO_INSTALL_TTY: this.control('tty'),
+      REVO_TEST_TTY: this.control('tty'),
     };
     if (this.options.installRoot !== undefined) {
       environment.REVO_INSTALL_ROOT = this.installRoot();

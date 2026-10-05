@@ -462,6 +462,59 @@ describe('install.sh', { timeout: 60_000 }, () => {
       await expectNothingChanged(machine);
     });
 
+    it('refuses when the terminal ends without an answer, and changes nothing', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+      await machine.closeTerminalWithoutAnswer();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `${NEEDS}; install it with \`sudo ${INSTALL}\` and run the installer again.\n`,
+      );
+      await expectNothingChanged(machine);
+    });
+
+    it('does not retry after a failure that is not about the package lists', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { failWith: 'sudo: a terminal is required' });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('sudo: a terminal is required');
+      expect(result.stderr).toContain(`\`sudo ${INSTALL}\` failed`);
+      expect(await machine.systemCommands()).toEqual([`sudo ${INSTALL}`]);
+    });
+
+    it('finds the library in the library directories when ldconfig fails', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.searchLibrariesOnlyIn({ libatomic: true });
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(await machine.systemCommands()).toEqual([]);
+    });
+
+    it('reports the library missing when ldconfig fails and the directories lack it', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.searchLibrariesOnlyIn({ libatomic: false });
+      await machine.havePackageManager('apt-get');
+      await machine.haveSudo();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(NEEDS);
+    });
+
     it('installs without a terminal when the user opted in', async () => {
       const machine = await machineLackingLibrary();
       await machine.havePackageManager('apt-get');
@@ -532,7 +585,7 @@ describe('install.sh', { timeout: 60_000 }, () => {
       expect(await machine.systemCommands()).toEqual([INSTALL]);
     });
 
-    it('prints the command for root when there is neither root nor sudo', async () => {
+    it('tells the user to install as root when there is no sudo and the user is not root', async () => {
       const machine = await machineLackingLibrary();
       await machine.havePackageManager('apt-get');
 

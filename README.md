@@ -34,13 +34,13 @@ still apply.
 
 ### System requirements
 
-- `curl`, `tar`, `gzip`, and `ca-certificates`.
+- `curl`, `tar`, `gzip`, `awk`, `sed`, `sha256sum` (or `shasum`), and `ca-certificates`.
 - On Linux, `libatomic1` (`libatomic.so.1`), which Node.js needs and minimal images such as
   `ubuntu:26.04` lack.
 
 If a required library is missing, the installer shows the package manager command (`apt-get`,
 `dnf`, `yum`, `zypper`, or `pacman`) and offers to run it with `sudo` before it downloads anything;
-answer `n` and nothing changes. Without a terminal, for example in CI, it prints the command and
+answer `n` and nothing changes. Run as root, it installs the library without asking. Without a terminal, for example in CI, it prints the command and
 stops unless you run it with `REVO_INSTALL_SYSTEM_DEPS=1`, which lets it install the library as
 root or with `sudo`. Without root, `sudo`, or a known package manager it names the library and the
 package to install by hand.
