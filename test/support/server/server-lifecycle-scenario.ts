@@ -30,7 +30,7 @@ export class ServerLifecycleScenario {
   ) {}
 
   static async create(): Promise<ServerLifecycleScenario> {
-    const root = await fs.mkdtemp(join(tmpdir(), 'revo-lifecycle-'));
+    const root = await fs.mkdtemp(join(await fs.realpath(tmpdir()), 'revo-lifecycle-'));
     const dataDir = join(root, 'data');
     const otherDataDir = join(root, 'other-data');
     const logDir = join(root, 'logs');
