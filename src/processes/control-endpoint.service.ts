@@ -57,102 +57,26 @@ export class ControlEndpointService {
     });
     const record = this.record(request, endpoint);
     const server = createServer();
-    const sockets = new Set<Socket>();
-    const stop = stopOutcome();
-    const delivery = deferred<ControlStopDeliveryResult>();
-    let phase: 'accepting' | 'stopping' | 'terminal' = 'accepting';
-    let stopAccepted = false;
-    let responder: Socket | undefined;
-    let closeRequested = false;
-    let drainPromise: Promise<void> | undefined;
-    const drain = () =>
-      (drainPromise ??= closeEndpoint(server, sockets, responder).then(() => {
-        if (!stopAccepted) {
-          stop.resolve({ kind: 'not-requested' });
-        }
-      }));
+    const session = new ControlEndpointSession(server, request.onStop);
     server.on('connection', (socket) => {
-      if (phase !== 'accepting') {
-        socket.destroy();
+      if (!session.admit(socket)) {
         return;
       }
-      sockets.add(socket);
-      socket.once('close', () => sockets.delete(socket));
       void this.serve(socket, record, {
         limits,
         onStatus: request.onStatus,
-        acceptStop: () => {
-          if (phase !== 'accepting') {
-            return undefined;
-          }
-          phase = 'stopping';
-          stopAccepted = true;
-          responder = socket;
-          for (const other of sockets) {
-            if (other !== responder) {
-              other.destroy();
-            }
-          }
-          return async (): Promise<ControlStopCompletion> => {
-            let completion: ControlStopCompletion;
-            try {
-              completion = (await request.onStop()) ?? { kind: 'completed' };
-            } catch {
-              completion = { kind: 'failed', ownership: 'unconfirmed' };
-            }
-            return completion;
-          };
-        },
-        releaseResponder: () => {
-          responder = undefined;
-        },
-        completeStop: async (completion) => {
-          responder = undefined;
-          if (
-            completion.kind === 'failed' &&
-            completion.ownership === 'retained' &&
-            !closeRequested
-          ) {
-            phase = 'accepting';
-            return;
-          }
-          phase = 'terminal';
-          await drain();
-        },
-        observeStop: (completion, sent) => {
-          delivery.resolve({ kind: sent ? 'sent' : 'failed' });
-          stop.resolve(
-            completion.kind === 'completed'
-              ? { kind: 'completed' }
-              : {
-                  kind: 'failed',
-                  error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
-                },
-          );
-        },
+        acceptStop: () => session.acceptStop(socket),
+        releaseResponder: () => session.releaseResponder(),
+        completeStop: (completion) => session.completeStop(completion),
+        observeStop: (completion, sent) => session.observeStop(completion, sent),
       });
     });
     await openServer(server, record.endpoint);
-    let closePromise: Promise<void> | undefined;
-    const close = (): Promise<void> => {
-      closeRequested = true;
-      if (phase === 'stopping') {
-        for (const socket of sockets) {
-          if (socket !== responder) {
-            socket.destroy();
-          }
-        }
-        return Promise.resolve();
-      }
-      phase = 'terminal';
-      closePromise ??= drain();
-      return closePromise;
-    };
     return {
       endpoint: record.endpoint,
-      stopResult: stop.promise,
-      stopDelivery: delivery.promise,
-      close,
+      stopResult: session.stopResult,
+      stopDelivery: session.stopDelivery,
+      close: () => session.close(),
     };
   }
 
@@ -195,65 +119,183 @@ export class ControlEndpointService {
         await writeFrame(socket, { schemaVersion: 1, ok: true, status }, options.limits, deadline);
         return;
       }
-      const waitForCompletion = request.action === 'stop-and-wait';
-      const runStop = options.acceptStop();
-      if (!runStop) {
-        socket.destroy();
-        return;
-      }
-      let acceptedSent = false;
-      try {
-        await writeFrame(
-          socket,
-          { schemaVersion: 1, ok: true, accepted: true },
-          options.limits,
-          deadline,
-          !waitForCompletion,
-        );
-        acceptedSent = true;
-      } catch {
-        // Acceptance delivery is not a cancellation boundary for cleanup.
-      }
-      if (!waitForCompletion) {
-        options.releaseResponder();
-      }
-      const completion = await runStop();
-      if (!waitForCompletion) {
-        try {
-          await options.completeStop(completion);
-        } finally {
-          options.observeStop(completion, acceptedSent);
-        }
-        return;
-      }
-      const response =
-        completion.kind === 'completed'
-          ? { schemaVersion: 1, ok: true, completed: true }
-          : {
-              schemaVersion: 1,
-              ok: false,
-              completed: true,
-              code: 'CONTROL_STOP_FAILED',
-              message: 'Control stop callback failed',
-              ownership: completion.ownership,
-            };
-      let sent = false;
-      try {
-        await writeFrame(socket, response, options.limits, Date.now() + options.limits.timeoutMs);
-        sent = true;
-      } catch {
-        socket.destroy();
-      } finally {
-        try {
-          await options.completeStop(completion);
-        } catch {
-          sent = false;
-        }
-        options.observeStop(completion, sent);
-      }
+      await serveStop(socket, request.action === 'stop-and-wait', options, deadline);
     } catch {
       socket.destroy();
     }
+  }
+}
+
+async function serveStop(
+  socket: Socket,
+  waitForCompletion: boolean,
+  options: ServeOptions,
+  deadline: number,
+): Promise<void> {
+  const runStop = options.acceptStop();
+  if (!runStop) {
+    socket.destroy();
+    return;
+  }
+  let acceptedSent = false;
+  try {
+    await writeFrame(
+      socket,
+      { schemaVersion: 1, ok: true, accepted: true },
+      options.limits,
+      deadline,
+      !waitForCompletion,
+    );
+    acceptedSent = true;
+  } catch {
+    // Acceptance delivery is not a cancellation boundary for cleanup.
+  }
+  if (!waitForCompletion) {
+    options.releaseResponder();
+  }
+  const completion = await runStop();
+  if (!waitForCompletion) {
+    try {
+      await options.completeStop(completion);
+    } finally {
+      options.observeStop(completion, acceptedSent);
+    }
+    return;
+  }
+  const response =
+    completion.kind === 'completed'
+      ? { schemaVersion: 1, ok: true, completed: true }
+      : {
+          schemaVersion: 1,
+          ok: false,
+          completed: true,
+          code: 'CONTROL_STOP_FAILED',
+          message: 'Control stop callback failed',
+          ownership: completion.ownership,
+        };
+  let sent = false;
+  try {
+    await writeFrame(socket, response, options.limits, Date.now() + options.limits.timeoutMs);
+    sent = true;
+  } catch {
+    socket.destroy();
+  } finally {
+    try {
+      await options.completeStop(completion);
+    } catch {
+      sent = false;
+    }
+    options.observeStop(completion, sent);
+  }
+}
+
+class ControlEndpointSession {
+  readonly stopResult: Promise<ControlStopResult>;
+  readonly stopDelivery: Promise<ControlStopDeliveryResult>;
+  private readonly stop = stopOutcome();
+  private readonly delivery = deferred<ControlStopDeliveryResult>();
+  private readonly sockets = new Set<Socket>();
+  private phase: 'accepting' | 'stopping' | 'terminal' = 'accepting';
+  private stopAccepted = false;
+  private responder: Socket | undefined;
+  private closeRequested = false;
+  private drainPromise: Promise<void> | undefined;
+  private closePromise: Promise<void> | undefined;
+
+  constructor(
+    private readonly server: Server,
+    private readonly onStop: ListenControlEndpointRequest['onStop'],
+  ) {
+    this.stopResult = this.stop.promise;
+    this.stopDelivery = this.delivery.promise;
+  }
+
+  admit(socket: Socket): boolean {
+    if (this.phase !== 'accepting') {
+      socket.destroy();
+      return false;
+    }
+    this.sockets.add(socket);
+    socket.once('close', () => this.sockets.delete(socket));
+    return true;
+  }
+
+  acceptStop(socket: Socket): (() => Promise<ControlStopCompletion>) | undefined {
+    if (this.phase !== 'accepting') {
+      return undefined;
+    }
+    this.phase = 'stopping';
+    this.stopAccepted = true;
+    this.responder = socket;
+    for (const other of this.sockets) {
+      if (other !== this.responder) {
+        other.destroy();
+      }
+    }
+    return async (): Promise<ControlStopCompletion> => {
+      let completion: ControlStopCompletion;
+      try {
+        completion = (await this.onStop()) ?? { kind: 'completed' };
+      } catch {
+        completion = { kind: 'failed', ownership: 'unconfirmed' };
+      }
+      return completion;
+    };
+  }
+
+  releaseResponder(): void {
+    this.responder = undefined;
+  }
+
+  async completeStop(completion: ControlStopCompletion): Promise<void> {
+    this.responder = undefined;
+    if (
+      completion.kind === 'failed' &&
+      completion.ownership === 'retained' &&
+      !this.closeRequested
+    ) {
+      this.phase = 'accepting';
+      return;
+    }
+    this.phase = 'terminal';
+    await this.drain();
+  }
+
+  observeStop(completion: ControlStopCompletion, sent: boolean): void {
+    this.delivery.resolve({ kind: sent ? 'sent' : 'failed' });
+    this.stop.resolve(
+      completion.kind === 'completed'
+        ? { kind: 'completed' }
+        : {
+            kind: 'failed',
+            error: { code: 'CONTROL_STOP_FAILED', message: 'Control stop callback failed' },
+          },
+    );
+  }
+
+  close(): Promise<void> {
+    this.closeRequested = true;
+    if (this.phase === 'stopping') {
+      for (const socket of this.sockets) {
+        if (socket !== this.responder) {
+          socket.destroy();
+        }
+      }
+      return Promise.resolve();
+    }
+    this.phase = 'terminal';
+    this.closePromise ??= this.drain();
+    return this.closePromise;
+  }
+
+  private drain(): Promise<void> {
+    return (this.drainPromise ??= closeEndpoint(this.server, this.sockets, this.responder).then(
+      () => {
+        if (!this.stopAccepted) {
+          this.stop.resolve({ kind: 'not-requested' });
+        }
+      },
+    ));
   }
 }
 
