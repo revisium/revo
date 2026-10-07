@@ -1,7 +1,7 @@
 import type { ReleaseChannel, RevoLayout } from '../layout.js';
 
 /** Largest startup budget a launch deadline and the server host protocol can represent. */
-export const MAX_STARTUP_TIMEOUT_MILLISECONDS = 2_147_483_647;
+export { MAX_TIMER_MILLISECONDS as MAX_STARTUP_TIMEOUT_MILLISECONDS } from '../timers.js';
 
 export interface ConfigurationFlags {
   readonly channel?: string;

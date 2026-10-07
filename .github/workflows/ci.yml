@@ -45,19 +45,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build process services
+      - name: Build
         run: |
           node -p "'process platform=' + process.platform + ' arch=' + process.arch"
           pnpm build
 
-      - name: Verify installer scenarios
-        run: pnpm exec vitest run test/scenarios/install-script.test.ts test/scenarios/install-script-release.test.ts test/release-bundle.test.ts
-
-      - name: Verify remaining process services
-        run: |
-          pnpm exec vitest run test/scenarios/ownership.test.ts test/scenarios/managed-process.test.ts test/scenarios/process-identity.test.ts test/scenarios/control-endpoint.test.ts test/scenarios/control-discovery.test.ts test/scenarios/startup-progress.test.ts test/scenarios/postgres-provision.test.ts
-          pnpm exec vitest run test/scenarios/postgres-readiness.test.ts test/scenarios/postgres-lifecycle.test.ts test/scenarios/external-postgres-client-config.test.ts test/scenarios/external-postgres-lifecycle.test.ts
-          pnpm exec vitest run test/scenarios/core-host.test.ts test/scenarios/core-host-runtime.test.ts test/scenarios/core-host-process.test.ts test/scenarios/server-owner.test.ts test/scenarios/server-status-stop.test.ts test/scenarios/core-database-handoff.test.ts test/scenarios/admin-spa.test.ts test/scenarios/server-startup-observer.test.ts test/scenarios/server-launch-attempt.test.ts test/scenarios/server-launcher.test.ts test/scenarios/server-command.test.ts
+      - name: Verify behavior scenarios
+        run: pnpm exec vitest run
 
   install-e2e:
     name: Install end to end (${{ matrix.os }})

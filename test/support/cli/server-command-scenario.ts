@@ -120,7 +120,7 @@ export class ServerCommandScenario {
   }
 }
 
-export type ServerCommandResult = ReturnType<CommandRecorder['result']>;
+type ServerCommandResult = ReturnType<CommandRecorder['result']>;
 
 /** Replaces every launcher, status, stop, metadata, and output port of the real command wiring. */
 class CommandRecorder {

@@ -17,7 +17,7 @@ export interface PreparedEmbeddedPostgres {
   readonly postgres: string;
 }
 
-export type EmbeddedPostgresFailureReason =
+type EmbeddedPostgresFailureReason =
   | 'backup'
   | 'cancelled'
   | 'incompatible'
@@ -26,7 +26,7 @@ export type EmbeddedPostgresFailureReason =
   | 'process'
   | 'unsupported';
 
-export interface EmbeddedPostgresDiagnostic {
+interface EmbeddedPostgresDiagnostic {
   readonly detail?: string;
   readonly logPath?: string;
 }

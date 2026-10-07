@@ -19,7 +19,7 @@ export interface CoreChildRunnerLike {
   receive(message: unknown): void;
 }
 
-export type CoreChildRunnerLoader = () => Promise<
+type CoreChildRunnerLoader = () => Promise<
   new (transport: CoreChildTransport) => CoreChildRunnerLike
 >;
 

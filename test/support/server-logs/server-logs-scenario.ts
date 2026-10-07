@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,7 +21,7 @@ export class ServerLogsScenario {
   ) {}
 
   static async open(): Promise<ServerLogsScenario> {
-    const root = await mkdtemp(join(tmpdir(), 'revo-logs-'));
+    const root = await mkdtemp(join(await realpath(tmpdir()), 'revo-logs-'));
     const dataDir = join(root, 'data');
     const logDir = join(root, 'logs');
     await mkdir(dataDir, { mode: 0o700 });

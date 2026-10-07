@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import { Inject, Injectable, Optional } from '@nestjs/common';
 
+import { errorCode } from '../../errors.js';
 import { parseLinuxStat, parseLinuxUid, validPid } from '../process-identity.parser.js';
 import type {
   IdentityObservation,
@@ -11,8 +12,6 @@ import type {
 } from '../process-identity.types.js';
 
 const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const code = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
 const PROC_ROOT = Symbol('PROC_ROOT');
 type BootIdResult =
   | { readonly kind: 'valid'; readonly bootId: string }
@@ -42,8 +41,8 @@ export class LinuxProcessIdentityAdapter implements ProcessIdentityAdapter {
       const directory = await stat(join(this.procRoot, String(pid), 'cwd'), { bigint: true });
       return { kind: 'captured', directory: { device: directory.dev, inode: directory.ino } };
     } catch (error) {
-      const errorCode = code(error);
-      return errorCode === 'ENOENT' || errorCode === 'ESRCH'
+      const failure = errorCode(error);
+      return failure === 'ENOENT' || failure === 'ESRCH'
         ? { kind: 'missing' }
         : { kind: 'unknown' };
     }
@@ -58,7 +57,7 @@ export class LinuxProcessIdentityAdapter implements ProcessIdentityAdapter {
         ? { kind: 'valid', bootId }
         : { kind: 'unknown', reason: 'malformed' };
     } catch (error) {
-      return { kind: 'unknown', reason: code(error) === 'EACCES' ? 'denied' : 'unavailable' };
+      return { kind: 'unknown', reason: errorCode(error) === 'EACCES' ? 'denied' : 'unavailable' };
     }
   }
 
@@ -94,13 +93,13 @@ export class LinuxProcessIdentityAdapter implements ProcessIdentityAdapter {
         identity: { platform: 'linux', pid, uid, birth: { bootId, startTicks: first.startTicks } },
       };
     } catch (error) {
-      const errorCode = code(error);
-      if (errorCode === 'ENOENT' || errorCode === 'ESRCH') {
+      const failure = errorCode(error);
+      if (failure === 'ENOENT' || failure === 'ESRCH') {
         return { kind: 'missing' };
       }
       return {
         kind: 'unknown',
-        reason: errorCode === 'EACCES' || errorCode === 'EPERM' ? 'denied' : 'unavailable',
+        reason: failure === 'EACCES' || failure === 'EPERM' ? 'denied' : 'unavailable',
       };
     }
   }

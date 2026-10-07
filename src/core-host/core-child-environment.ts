@@ -18,7 +18,7 @@ const forbiddenName = (name: string) =>
   name === 'CHECKPOINT_DISABLE' ||
   name === 'NODE_TLS_REJECT_UNAUTHORIZED';
 
-export interface CoreChildEnvironment {
+interface CoreChildEnvironment {
   readonly env: Readonly<Record<string, string>>;
   readonly inheritedEnvironmentNames: readonly string[];
 }

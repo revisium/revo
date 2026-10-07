@@ -10,9 +10,10 @@
 
 ## Status
 
-Alpha. The `revo` binary starts the configured server and prints its verified public URL through a
-thin NestJS application context. Cross-platform channel layout resolution, release metadata
-validation, server lifecycle commands, and the alpha installer are implemented.
+Alpha. The command starts or reuses the local server (embedded or external PostgreSQL, Revo Core,
+and Revo Admin behind one HTTP listener) and prints its verified public URL. The terminal client,
+`doctor`, the `server` lifecycle and log commands, the pre-upgrade database backup, and the alpha
+installer are implemented. Windows is not supported yet.
 
 ## Install
 
@@ -40,10 +41,10 @@ still apply.
 
 If a required library is missing, the installer shows the package manager command (`apt-get`,
 `dnf`, `yum`, `zypper`, or `pacman`) and offers to run it with `sudo` before it downloads anything;
-answer `n` and nothing changes. Run as root, it installs the library without asking. Without a terminal, for example in CI, it prints the command and
-stops unless you run it with `REVO_INSTALL_SYSTEM_DEPS=1`, which lets it install the library as
-root or with `sudo`. Without root, `sudo`, or a known package manager it names the library and the
-package to install by hand.
+answer `n` and nothing changes. Run as root, it installs the library without asking. Without a
+terminal, for example in CI, it prints the command and stops unless you run it with
+`REVO_INSTALL_SYSTEM_DEPS=1`, which lets it install the library as root or with `sudo`. Without
+root, `sudo`, or a known package manager it names the library and the package to install by hand.
 
 The installer creates `~/.local/bin/revo-alpha`. If `~/.local/bin` is not on your `PATH`, it prints
 the line to add to your shell profile; it never edits shell profiles itself:
@@ -134,8 +135,7 @@ stdin/stdout and is supported on Linux and macOS only; other platforms fail befo
 started. Exiting the TUI leaves the server running. `--channel`, `--config`, `--data-dir`, and
 `--startup-timeout` select the same Revo configuration used by the server commands. Other server
 settings, including host, port, public URL, database URL, and log directory, come from the selected
-configuration file or environment. Unknown arguments and options fail with exit code 2. The package
-manifest remains private during the foundation stage.
+configuration file or environment. Unknown arguments and options fail with exit code 2.
 
 Each installed command belongs to one channel: `revo-alpha` always runs the alpha channel and
 `revo` the stable one, and the commands in Revo's messages name the channel in use. A command
@@ -143,6 +143,23 @@ refuses `--channel` or `REVO_CHANNEL` naming another channel. If a server is alr
 you start a different installed version, `revo-alpha` prints a notice that the server keeps its
 version until you run `revo-alpha server stop` and then `revo-alpha`. The examples above run the
 built package directly and stay on the channel that its version selects.
+
+## Configuration
+
+Where a setting also has a command-line option or a configuration-file field, the option wins, then
+the environment variable below, then the file (`--config` or `REVO_CONFIG`).
+
+| Variable               | Meaning                                                       |
+| ---------------------- | ------------------------------------------------------------- |
+| `REVO_CHANNEL`         | Channel to run; it must match the installed command's channel |
+| `REVO_CONFIG`          | Path of the configuration file                                |
+| `REVO_DATA_DIR`        | Data directory                                                |
+| `REVO_LOG_DIR`         | Log directory                                                 |
+| `REVO_HOST`            | Listen host (default `127.0.0.1`)                             |
+| `REVO_PORT`            | Listen port (default `3210` stable, `3211` alpha)             |
+| `REVO_PUBLIC_URL`      | Public URL printed and used for links                         |
+| `REVO_DATABASE_URL`    | External PostgreSQL URL; unset uses the embedded database     |
+| `REVO_STARTUP_TIMEOUT` | Startup timeout in milliseconds (default `180000`)            |
 
 ## Server logs
 

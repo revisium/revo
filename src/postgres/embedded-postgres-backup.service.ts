@@ -18,6 +18,7 @@ import { basename, join } from 'node:path';
 
 import { Injectable } from '@nestjs/common';
 
+import { errorCode, errorMessage } from '../errors.js';
 import { syncDirectory } from './directory-sync.js';
 import { EmbeddedPostgresError } from './embedded-postgres.types.js';
 
@@ -30,14 +31,14 @@ const BATCH = 32;
 const BLOCK_BYTES = 512;
 const MIB = 1024 * 1024;
 
-export interface DatabaseBackupRequest {
+interface DatabaseBackupRequest {
   readonly dataDir: string;
   readonly clusterDir: string;
   readonly dataVersionFile: string;
   readonly signal: AbortSignal;
 }
 
-export interface SavedDatabaseBackup {
+interface SavedDatabaseBackup {
   readonly path: string;
   readonly bytes: number;
   readonly elapsedMs: number;
@@ -271,7 +272,7 @@ function backupFailure(error: unknown, layout: BackupLayout): EmbeddedPostgresEr
     });
   }
   return new EmbeddedPostgresError('backup', false, undefined, {
-    detail: `the database backup ${layout.link} could not be saved (${errorSummary(error)}); the database was not changed`,
+    detail: `the database backup ${layout.link} could not be saved (${errorMessage(error)}); the database was not changed`,
   });
 }
 
@@ -288,8 +289,3 @@ async function inBatches<T, R>(
 }
 
 const entryPath = (entry: Dirent) => join(entry.parentPath, entry.name);
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
-
-const errorSummary = (error: unknown) => (error instanceof Error ? error.message : String(error));

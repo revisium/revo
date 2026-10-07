@@ -3,7 +3,7 @@ import {
   ExternalPostgresConfigurationError,
 } from '../postgres/external-postgres-client-config.js';
 
-export interface CoreDatabaseHandoff {
+interface CoreDatabaseHandoff {
   readonly databaseUrl: string;
 }
 

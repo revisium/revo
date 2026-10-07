@@ -18,7 +18,7 @@ import {
 import type { ServerHostParentMessage } from './server-host-protocol.js';
 import type { ServerLaunchProcessPort } from './server-launch-attempt.js';
 
-export interface ServerLaunchBinding {
+interface ServerLaunchBinding {
   readonly cwd: string;
   readonly entry: string;
   readonly env: Readonly<Record<string, string>>;
@@ -26,7 +26,7 @@ export interface ServerLaunchBinding {
   readonly log?: ServerLogLocation;
 }
 
-export interface ServerLaunchStartOptions {
+interface ServerLaunchStartOptions {
   readonly graceMs: number;
   readonly killWaitMs: number;
   readonly signal: AbortSignal;

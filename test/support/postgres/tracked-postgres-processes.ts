@@ -5,7 +5,7 @@ import type {
   ProcessCompletion,
 } from '../../../src/processes/managed-process.types.js';
 
-export interface TrackedPostgresProcessesOptions {
+interface TrackedPostgresProcessesOptions {
   readonly failFirstPostgresStop?: boolean;
 }
 

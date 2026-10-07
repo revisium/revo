@@ -4,6 +4,7 @@ import type { Readable, Writable } from 'node:stream';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { MAX_TIMER_MILLISECONDS } from '../timers.js';
 import { ManagedProcessError } from './managed-process-error.js';
 import type {
   ManagedProcessRequest,
@@ -17,7 +18,6 @@ import type {
 } from './managed-process.types.js';
 import { ProcessExitWaiter } from './process-exit-waiter.js';
 
-const MAX_TIMER_MILLISECONDS = 2_147_483_647;
 const TERMINATE_THEN_KILL: StopSignals = { graceful: 'SIGTERM', escalation: 'SIGKILL' };
 
 @Injectable()

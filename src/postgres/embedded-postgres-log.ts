@@ -1,12 +1,13 @@
-import { constants, type Stats } from 'node:fs';
+import { constants } from 'node:fs';
 import { type FileHandle, lstat, mkdir, open } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
+import { ownedPrivate } from '../private-files.js';
 import { EmbeddedPostgresError } from './embedded-postgres.types.js';
 
 const DIAGNOSTIC_BYTES = 16 * 1024;
 
-export interface PostgresLogOutput {
+interface PostgresLogOutput {
   readonly descriptor: number;
   readonly offset: number;
 }
@@ -50,7 +51,7 @@ export class EmbeddedPostgresLog {
     });
     try {
       const metadata = await file.stat();
-      if (!metadata.isFile() || metadata.nlink !== 1 || !privateOwned(metadata)) {
+      if (!metadata.isFile() || metadata.nlink !== 1 || !ownedPrivate(metadata)) {
         throw this.unsafe();
       }
       return await use(file, metadata.size);
@@ -64,7 +65,7 @@ export class EmbeddedPostgresLog {
     try {
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const metadata = await lstat(directory);
-      if (metadata.isDirectory() && privateOwned(metadata)) {
+      if (metadata.isDirectory() && ownedPrivate(metadata)) {
         return;
       }
     } catch {
@@ -79,6 +80,3 @@ export class EmbeddedPostgresLog {
     });
   }
 }
-
-const privateOwned = (metadata: Stats) =>
-  metadata.uid === process.getuid?.() && (metadata.mode & 0o077) === 0;

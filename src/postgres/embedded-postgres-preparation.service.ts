@@ -1,6 +1,5 @@
 import { randomBytes } from 'node:crypto';
 import {
-  constants,
   type FileHandle,
   lstat,
   mkdtemp,
@@ -14,9 +13,13 @@ import { join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { errorCode } from '../errors.js';
+import { ownedPrivate, READ_NOFOLLOW_FLAGS, readBoundedUtf8 } from '../private-files.js';
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
+import { CANCELLATION_TIMING } from '../stop-timing.js';
+import { isTimerTimeout } from '../timers.js';
 import { syncDirectory } from './directory-sync.js';
 import { loadEmbeddedPostgresBinaries } from './embedded-postgres-binaries.js';
 import type { EmbeddedPostgresLog } from './embedded-postgres-log.js';
@@ -29,8 +32,6 @@ import {
 
 const FILE_MODE = 0o600;
 const MAX_SMALL_FILE = 4096;
-const CANCEL_GRACE_MS = 1000;
-const CANCEL_KILL_WAIT_MS = 5000;
 const CREDENTIAL_FORMAT = /^[A-Za-z0-9_-]{32}$/u;
 const STAGED_CLUSTER_PREFIX = '.postgres-initdb';
 
@@ -194,7 +195,7 @@ export class OwnedEmbeddedPostgresPreparation {
         cwd: this.canonicalDataDir,
         env: { LC_ALL: 'C' },
         stdio: { stdin: 'ignore', stdout: descriptor, stderr: descriptor },
-        cancellation: { signal, graceMs: CANCEL_GRACE_MS, killWaitMs: CANCEL_KILL_WAIT_MS },
+        cancellation: { signal, ...CANCELLATION_TIMING },
       }),
     );
     this.observeChild(child);
@@ -255,12 +256,7 @@ const clusterLayout = (dataDir: string): ClusterLayout => ({
 });
 
 function validateRequest(request: PrepareEmbeddedPostgresRequest) {
-  if (
-    request.signal.aborted ||
-    !Number.isInteger(request.timeoutMs) ||
-    request.timeoutMs <= 0 ||
-    request.timeoutMs > 2_147_483_647
-  ) {
+  if (request.signal.aborted || !isTimerTimeout(request.timeoutMs)) {
     throw new EmbeddedPostgresError(request.signal.aborted ? 'cancelled' : 'invalid');
   }
 }
@@ -393,7 +389,7 @@ async function pathKind(path: string) {
 
 async function validateDirectory(path: string) {
   const stat = await lstat(path);
-  if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+  if (!stat.isDirectory() || !ownedPrivate(stat)) {
     throw new EmbeddedPostgresError('invalid');
   }
 }
@@ -401,22 +397,16 @@ async function validateDirectory(path: string) {
 async function readPrivateFile(path: string) {
   let file: FileHandle | undefined;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
     const stat = await file.stat();
-    if (
-      !stat.isFile() ||
-      stat.uid !== process.getuid?.() ||
-      (stat.mode & 0o077) !== 0 ||
-      stat.size > MAX_SMALL_FILE
-    ) {
+    if (!stat.isFile() || !ownedPrivate(stat) || stat.size > MAX_SMALL_FILE) {
       throw new EmbeddedPostgresError('invalid');
     }
-    const content = Buffer.alloc(MAX_SMALL_FILE + 1);
-    const { bytesRead } = await file.read(content, 0, content.length, 0);
-    if (bytesRead > MAX_SMALL_FILE) {
+    const content = await readBoundedUtf8(file, MAX_SMALL_FILE);
+    if (content === undefined) {
       throw new EmbeddedPostgresError('invalid');
     }
-    return content.subarray(0, bytesRead).toString('utf8');
+    return content;
   } finally {
     await file?.close();
   }
@@ -428,9 +418,9 @@ export const readEmbeddedPostgresCredential = (canonicalDataDir: string) =>
 async function validatePrivateFile(path: string) {
   let file: FileHandle | undefined;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
     const stat = await file.stat();
-    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+    if (!stat.isFile() || !ownedPrivate(stat)) {
       throw new EmbeddedPostgresError('invalid');
     }
   } finally {
@@ -452,6 +442,3 @@ function rejectCancellation(signal: AbortSignal) {
     throw new EmbeddedPostgresError('cancelled');
   }
 }
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

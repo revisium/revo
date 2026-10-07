@@ -2,9 +2,9 @@ import { invalidConfiguration } from './configuration/configuration-error.js';
 import type { ReleaseChannel } from './layout.js';
 
 /** Set by the installer's launcher so one command can never run another channel. */
-export const LAUNCHER_CHANNEL_VARIABLE = 'REVO_LAUNCHER_CHANNEL';
+const LAUNCHER_CHANNEL_VARIABLE = 'REVO_LAUNCHER_CHANNEL';
 
-export interface ChannelSelection {
+interface ChannelSelection {
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly flags: { readonly channel?: string };
   readonly packageVersion: string;
@@ -54,6 +54,6 @@ function launcherChannel(env: ChannelSelection['env']): ReleaseChannel | undefin
 const isChannel = (value: string | undefined): value is ReleaseChannel =>
   value === 'stable' || value === 'alpha';
 
-export function channelOfVersion(version: string): ReleaseChannel {
+function channelOfVersion(version: string): ReleaseChannel {
   return /^\d+\.\d+\.\d+-/u.test(version) ? 'alpha' : 'stable';
 }

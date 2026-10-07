@@ -19,9 +19,9 @@ export interface ServerLogsFlags extends ConfigurationFlags {
   readonly follow?: boolean;
 }
 
-export type ServerLogsWait = (signal: AbortSignal) => Promise<void>;
+type ServerLogsWait = (signal: AbortSignal) => Promise<void>;
 
-export class ServerLogsError extends Error {
+class ServerLogsError extends Error {
   readonly code = 'revo.server-logs.invalid';
 
   constructor() {

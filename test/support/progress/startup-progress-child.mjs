@@ -14,12 +14,12 @@ const held = await new PublishedControlService().open({
   },
 });
 if (held.kind === 'held' && held.progress) {
-  await held.progress.start('runtime-download');
-  await held.progress.progress('runtime-download', { counters: { bytesReceived: 1 } });
-  await held.progress.progress('runtime-download', { counters: { bytesReceived: 2 } });
-  await held.progress.complete('runtime-download');
-  await held.progress.start('runtime-extract');
-  await held.progress.progress('runtime-extract', { stageElapsedMs: 1 });
+  await held.progress.start('postgres-binary-prepare');
+  await held.progress.progress('postgres-binary-prepare', { stageElapsedMs: 1 });
+  await held.progress.progress('postgres-binary-prepare', { stageElapsedMs: 2 });
+  await held.progress.complete('postgres-binary-prepare');
+  await held.progress.start('postgres-initialization');
+  await held.progress.progress('postgres-initialization', { stageElapsedMs: 1 });
 }
 process.send?.({ kind: held.kind });
 const closeAndExit = async () => {

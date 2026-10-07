@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto';
 import { lstat, mkdir, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 
+import { errorCode } from '../errors.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import { ControlTransportError, controlEndpointByteLimit } from './control-protocol.js';
 
 export const CONTROL_SOCKET_ROOT = Symbol('CONTROL_SOCKET_ROOT');
-export const DEFAULT_CONTROL_SOCKET_ROOT = '/tmp';
-export const CONTROL_SOCKET_ROOT_VARIABLE = 'REVO_CONTROL_SOCKET_ROOT';
+const DEFAULT_CONTROL_SOCKET_ROOT = '/tmp';
+const CONTROL_SOCKET_ROOT_VARIABLE = 'REVO_CONTROL_SOCKET_ROOT';
 
 /** The socket root of this process: the override when set, otherwise `/tmp`. */
 export function controlSocketRoot(env: NodeJS.ProcessEnv = process.env): string {
@@ -21,7 +22,7 @@ export function controlSocketRoot(env: NodeJS.ProcessEnv = process.env): string 
   return override;
 }
 
-export interface ControlEndpointScope {
+interface ControlEndpointScope {
   readonly runtimeDir: string;
   readonly instanceId: string;
   readonly channel: string;
@@ -178,6 +179,3 @@ const socketPath = (directory: string, instanceId: string) =>
 const fits = (endpoint: string) => Buffer.byteLength(endpoint) <= controlEndpointByteLimit();
 
 const overlong = () => `socket path exceeds ${String(controlEndpointByteLimit())} bytes`;
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

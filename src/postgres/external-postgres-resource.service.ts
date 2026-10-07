@@ -3,6 +3,7 @@ import { Client, type ClientConfig } from 'pg';
 
 import { protectDatabaseUrl } from '../server-logs/log-redaction.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
+import { isTimerTimeout } from '../timers.js';
 import type {
   StartDatabaseRequest,
   StartedExternalDatabase,
@@ -58,13 +59,7 @@ export class OwnedExternalPostgresResource {
   ) {}
 
   start(request: StartDatabaseRequest): Promise<StartedExternalDatabase> {
-    if (
-      this.closing ||
-      request.signal.aborted ||
-      !Number.isInteger(request.timeoutMs) ||
-      request.timeoutMs <= 0 ||
-      request.timeoutMs > 2_147_483_647
-    ) {
+    if (this.closing || request.signal.aborted || !isTimerTimeout(request.timeoutMs)) {
       return Promise.reject(new ExternalPostgresError('cancelled'));
     }
     if (this.active) {

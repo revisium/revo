@@ -10,7 +10,6 @@ import { ManagedProcessError } from '../../src/processes/managed-process-error.j
 import { ProgressOperation, parseProgressEvent } from '../../src/progress/index.js';
 import type { ServerLaunchResult } from '../../src/server/server-launcher.service.js';
 import type { ServerStatus } from '../../src/server/server-status.service.js';
-import { SERVER_STOP_CONFIRMATION_MS } from '../../src/server/server-stop.service.js';
 import { STARTUP_PROGRESS_FILE } from '../../src/startup-progress/startup-progress.types.js';
 import { CliScenario } from '../support/cli/cli-scenario.js';
 import { IsolatedServerScenario } from '../support/cli/isolated-server-scenario.js';
@@ -51,7 +50,7 @@ const OWNED =
   'Another Revo server still owns the data directory but does not answer; start was not performed.\n';
 const STOPPED = 'Server stopped.\n';
 const ALREADY_STOPPED = 'Server is already stopped.\n';
-const STOP_CALL = { dataDir: FIXTURE_DATA_DIR, timeoutMs: SERVER_STOP_CONFIRMATION_MS };
+const STOP_CALL = { dataDir: FIXTURE_DATA_DIR, timeoutMs: 35_000 };
 const CANCELLED = 'Server start was cancelled.\n';
 const FAILED = 'Server start failed.\n';
 const OUTCOME = 'Server start outcome is unknown.\n';

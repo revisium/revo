@@ -1,11 +1,12 @@
 import { randomBytes } from 'node:crypto';
-import { constants } from 'node:fs';
-import { open, realpath, rename, stat, unlink, type FileHandle } from 'node:fs/promises';
+import { open, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { Injectable } from '@nestjs/common';
 
+import { readPrivateDataFile } from '../private-files.js';
 import { parseProgressEvent, type ProgressEvent } from '../progress/index.js';
+import { isRecord } from '../record.js';
 import {
   MAX_NONTERMINAL_TRANSITIONS,
   MAX_STARTUP_PROGRESS_BYTES,
@@ -97,51 +98,26 @@ export class StartupProgressDiscoveryService {
     ) {
       return { kind: 'invalid' };
     }
-    let canonicalDataDir: string;
-    try {
-      canonicalDataDir = await realpath(dataDir);
-      const directory = await stat(canonicalDataDir);
-      if (!directory.isDirectory() || !ownedPrivate(directory.uid, directory.mode)) {
-        return { kind: 'unavailable' };
-      }
-    } catch (error) {
-      return errorCode(error) === 'ENOENT' ? { kind: 'missing' } : { kind: 'unavailable' };
+    const file = await readPrivateDataFile(
+      dataDir,
+      STARTUP_PROGRESS_FILE,
+      MAX_STARTUP_PROGRESS_BYTES,
+    );
+    if (file.kind !== 'read') {
+      return { kind: file.kind };
     }
-    let file: FileHandle;
-    try {
-      file = await open(
-        join(canonicalDataDir, STARTUP_PROGRESS_FILE),
-        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-      );
-    } catch (error) {
-      return errorCode(error) === 'ENOENT' ? { kind: 'missing' } : { kind: 'unavailable' };
-    }
-    try {
-      const metadata = await file.stat();
-      if (
-        !metadata.isFile() ||
-        !ownedPrivate(metadata.uid, metadata.mode) ||
-        metadata.size > MAX_STARTUP_PROGRESS_BYTES
-      ) {
-        return { kind: 'invalid' };
-      }
-      const document = parseDocument(await readBounded(file));
-      if (!document) {
-        return { kind: 'invalid' };
-      }
-      if (document.operationId !== cursor.operationId) {
-        return { kind: 'operation-changed', operationId: document.operationId };
-      }
-      return {
-        kind: 'events',
-        operationId: document.operationId,
-        events: Object.freeze(document.events.filter((event) => event.sequence > cursor.sequence)),
-      };
-    } catch {
+    const document = parseDocument(file.content);
+    if (!document) {
       return { kind: 'invalid' };
-    } finally {
-      await file.close().catch(() => undefined);
     }
+    if (document.operationId !== cursor.operationId) {
+      return { kind: 'operation-changed', operationId: document.operationId };
+    }
+    return {
+      kind: 'events',
+      operationId: document.operationId,
+      events: Object.freeze(document.events.filter((event) => event.sequence > cursor.sequence)),
+    };
   }
 }
 
@@ -152,7 +128,7 @@ function parseDocument(content: string | undefined): ProgressDocument | undefine
   try {
     const value: unknown = JSON.parse(content);
     if (
-      !record(value) ||
+      !isRecord(value) ||
       Object.keys(value)
         .sort((left, right) => left.localeCompare(right, 'en'))
         .join(',') !== 'events,operationId,schemaVersion' ||
@@ -209,25 +185,3 @@ function validOrder(events: readonly ProgressEvent[], operationId: string) {
         : MAX_NONTERMINAL_TRANSITIONS)
   );
 }
-
-async function readBounded(file: FileHandle): Promise<string | undefined> {
-  const buffer = Buffer.alloc(MAX_STARTUP_PROGRESS_BYTES + 1);
-  const readAt = async (offset: number): Promise<number> => {
-    if (offset >= buffer.length) {
-      return offset;
-    }
-    const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
-    return bytesRead === 0 ? offset : readAt(offset + bytesRead);
-  };
-  const offset = await readAt(0);
-  return offset <= MAX_STARTUP_PROGRESS_BYTES
-    ? buffer.subarray(0, offset).toString('utf8')
-    : undefined;
-}
-
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-const ownedPrivate = (uid: number, mode: number) =>
-  typeof process.getuid === 'function' && uid === process.getuid() && (mode & 0o077) === 0;
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

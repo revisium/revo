@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { ConfigurationError } from '../../src/configuration/configuration-error.js';
 import { MAX_STARTUP_TIMEOUT_MILLISECONDS } from '../../src/configuration/configuration.types.js';
-import { ConfigurationError } from '../../src/configuration/index.js';
 import {
   ConfigurationScenario,
   configFile,

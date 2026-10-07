@@ -19,8 +19,8 @@ describe('startup journal observation of a real launch attempt', () => {
   it('replays bursts once, preserves cursor gaps, and gates ready on ACK and detach', async () => {
     scenario = await new ServerStartupObserverScenario().open();
     scenario.operation.start('postgres-start');
-    scenario.operation.progress('postgres-start', { counters: { bytesReceived: 1 } });
-    scenario.operation.progress('postgres-start', { counters: { bytesReceived: 2 } });
+    scenario.operation.progress('postgres-start', { stageElapsedMs: 1 });
+    scenario.operation.progress('postgres-start', { stageElapsedMs: 2 });
     scenario.operation.complete('postgres-start');
     await scenario.publish();
     const result = scenario.start();

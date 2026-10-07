@@ -28,7 +28,7 @@ export interface ServerLaunchRequest extends ConfigurationInput {
 }
 
 /** An unreachable server that still holds the data directory's ownership lock. */
-export interface OwnedDataDirectory {
+interface OwnedDataDirectory {
   readonly kind: 'owned';
 }
 

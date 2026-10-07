@@ -9,6 +9,8 @@ import type {
   StopProcessRequest,
 } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
+import { POSTGRES_SHUTDOWN_TIMING } from '../stop-timing.js';
+import { isTimerTimeout } from '../timers.js';
 import { EmbeddedDataVersion } from './embedded-data-version.js';
 import { EmbeddedPostgresBackupService } from './embedded-postgres-backup.service.js';
 import { EmbeddedPostgresLockRecovery } from './embedded-postgres-lock.js';
@@ -35,8 +37,7 @@ const HOST = '127.0.0.1' as const;
 const DATABASE = 'revo' as const;
 const ATTEMPTS = 3;
 const SHUTDOWN: StopProcessRequest = {
-  graceMs: 15_000,
-  killWaitMs: 10_000,
+  ...POSTGRES_SHUTDOWN_TIMING,
   signals: { graceful: 'SIGINT', escalation: 'SIGQUIT' },
 };
 const LOOPBACK_BIND_CONFLICT = 'could not bind IPv4 address "127.0.0.1": Address already in use';
@@ -76,7 +77,7 @@ export class EmbeddedPostgresResourceService {
   }
 }
 
-export class OwnedEmbeddedPostgresResource {
+class OwnedEmbeddedPostgresResource {
   private active: Promise<StartedEmbeddedDatabase> | undefined;
   private readonly readiness = new EmbeddedPostgresReadiness();
   private closing = false;
@@ -466,12 +467,7 @@ interface TrackedAttempt {
 }
 
 const validateRequest = (request: StartDatabaseRequest) => {
-  if (
-    request.signal.aborted ||
-    !Number.isInteger(request.timeoutMs) ||
-    request.timeoutMs <= 0 ||
-    request.timeoutMs > 2_147_483_647
-  ) {
+  if (request.signal.aborted || !isTimerTimeout(request.timeoutMs)) {
     throw new EmbeddedPostgresError(request.signal.aborted ? 'cancelled' : 'invalid');
   }
 };

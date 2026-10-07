@@ -9,6 +9,7 @@ import type {
 } from '../processes/control-endpoint.types.js';
 import { DEFAULT_CONTROL_LIMITS } from '../processes/control-endpoint.types.js';
 import { ServerOwnershipService } from '../processes/server-ownership.service.js';
+import { isRecord } from '../record.js';
 
 export type ServerStatus =
   | { readonly kind: 'missing' }
@@ -148,14 +149,12 @@ function formatHost(host: string): string {
 }
 
 function isReadyGraphql(value: unknown): boolean {
-  if (!record(value) || !exact(value, ['data']) || !record(value.data)) {
+  if (!isRecord(value) || !exact(value, ['data']) || !isRecord(value.data)) {
     return false;
   }
   return exact(value.data, ['__typename']) && value.data['__typename'] === 'Query';
 }
 
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 const exact = (value: Record<string, unknown>, keys: readonly string[]) =>
   Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 const remaining = (deadline: number) => {

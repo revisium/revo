@@ -86,7 +86,7 @@ class MissingCapabilityManagedProcessService extends ManagedProcessService {
   }
 }
 
-export interface MissingCapabilityOutcome {
+interface MissingCapabilityOutcome {
   readonly completion: ProcessCompletion;
   readonly error: unknown;
   readonly stopRequests: readonly StopProcessRequest[];

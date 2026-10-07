@@ -96,7 +96,7 @@ class ControlledProcesses extends ManagedProcessService {
   }
 }
 
-export class CapturedStreams {
+class CapturedStreams {
   private readonly chunks: string[] = [];
   readonly stdout = this.capture();
   readonly stderr = this.capture();

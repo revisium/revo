@@ -2,10 +2,12 @@ import { constants } from 'node:fs';
 import { open, realpath, type FileHandle } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
+import { errorCode } from '../errors.js';
+import { ownedPrivate, READ_NOFOLLOW_FLAGS } from '../private-files.js';
 import type { ServerLifecycleConfiguration } from './server-lifecycle.types.js';
 import { ensurePrivateLogDirectory, serverLogDirectory } from './store.service.js';
 
-export const SERVER_LOG_FILE = 'server.log';
+const SERVER_LOG_FILE = 'server.log';
 export const SERVER_LOG_TAIL_LINES = 40;
 
 const ATTEMPT_MARKER = '--- Revo server start';
@@ -28,7 +30,7 @@ export interface OpenedServerLog {
   readonly handle: FileHandle;
 }
 
-export interface ServerLogTail {
+interface ServerLogTail {
   readonly path: string;
   readonly lines: readonly string[];
 }
@@ -75,7 +77,7 @@ export async function readServerLogTail(
   let handle: FileHandle;
   try {
     path = await serverLogPath(location);
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    handle = await open(path, READ_NOFOLLOW_FLAGS);
   } catch {
     return undefined;
   }
@@ -128,12 +130,7 @@ async function canonicalPath(path: string): Promise<string> {
 
 async function requirePrivateFile(handle: FileHandle): Promise<number> {
   const metadata = await handle.stat();
-  if (
-    !metadata.isFile() ||
-    metadata.nlink !== 1 ||
-    metadata.uid !== process.getuid?.() ||
-    (metadata.mode & 0o077) !== 0
-  ) {
+  if (!metadata.isFile() || metadata.nlink !== 1 || !ownedPrivate(metadata)) {
     throw new Error('Server log is not a private file');
   }
   return metadata.size;
@@ -162,6 +159,3 @@ function controlCharacter(character: string): boolean {
   const code = character.codePointAt(0) ?? 0;
   return (code < 0x20 && code !== 0x09) || (code >= 0x7f && code <= 0x9f);
 }
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

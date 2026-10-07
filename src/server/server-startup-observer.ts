@@ -12,7 +12,7 @@ import { StartupProgressDiscoveryService } from '../startup-progress/index.js';
 import type { StartedServer } from './server-launch-attempt.js';
 
 export type ServerProgressSink = (event: ProgressEvent) => void | Promise<void>;
-export type StartupProgressWarning = (message: string) => void;
+type StartupProgressWarning = (message: string) => void;
 
 export interface StartupObserverTiming {
   readonly deliveryMs: number;
@@ -20,8 +20,8 @@ export interface StartupObserverTiming {
   readonly pollMs: number;
 }
 
-export const STARTUP_PROGRESS_WARNING = Symbol('STARTUP_PROGRESS_WARNING');
-export const STARTUP_OBSERVER_TIMING = Symbol('STARTUP_OBSERVER_TIMING');
+const STARTUP_PROGRESS_WARNING = Symbol('STARTUP_PROGRESS_WARNING');
+const STARTUP_OBSERVER_TIMING = Symbol('STARTUP_OBSERVER_TIMING');
 
 const DEFAULT_TIMING: StartupObserverTiming = { deliveryMs: 2_000, drainMs: 5_000, pollMs: 25 };
 const SKIPPED = 'Warning: skipped startup progress because';

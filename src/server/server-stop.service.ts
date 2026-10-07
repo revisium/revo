@@ -3,12 +3,16 @@ import { Inject, Injectable } from '@nestjs/common';
 import { ControlClientService } from '../processes/control-client.service.js';
 import { ControlDiscoveryService } from '../processes/control-discovery.service.js';
 import type { ControlLimits } from '../processes/control-endpoint.types.js';
+import { CORE_CLOSE_MILLISECONDS, POSTGRES_SHUTDOWN_TIMING } from '../stop-timing.js';
 
-/**
- * Spans the server's bounded stop: Core close (5 s), then PostgreSQL fast shutdown (15 s) and its
- * escalation (10 s).
- */
-export const SERVER_STOP_CONFIRMATION_MS = 35_000;
+const STOP_CONFIRMATION_MARGIN_MS = 5_000;
+
+/** Spans the server's bounded stop (Core close, PostgreSQL shutdown and escalation) plus a margin for the control exchange. */
+export const SERVER_STOP_CONFIRMATION_MS =
+  CORE_CLOSE_MILLISECONDS +
+  POSTGRES_SHUTDOWN_TIMING.graceMs +
+  POSTGRES_SHUTDOWN_TIMING.killWaitMs +
+  STOP_CONFIRMATION_MARGIN_MS;
 
 export type ServerStopResult =
   | { readonly kind: 'completed' }

@@ -10,12 +10,12 @@ export class ProgressScenario {
   readonly operation = new ProgressOperation({ operationId: ID, now: () => this.now });
 
   transitionsAndCursors() {
-    this.operation.start('runtime-download');
+    this.operation.start('postgres-binary-prepare');
     this.now = 110;
-    this.operation.progress('runtime-download', { counters: { bytesReceived: 7 } });
+    this.operation.progress('postgres-binary-prepare', { stageElapsedMs: 7 });
     const first = this.operation.eventsAfter(0);
     this.now = 120;
-    this.operation.complete('runtime-download');
+    this.operation.complete('postgres-binary-prepare');
     return {
       first,
       after: this.operation.eventsAfter(2),
@@ -24,12 +24,12 @@ export class ProgressScenario {
   }
 
   singleCurrentProgressRemainsOrdered() {
-    this.operation.start('runtime-download');
-    this.operation.progress('runtime-download', { counters: { bytesReceived: 1 } });
-    this.operation.complete('runtime-download');
-    this.operation.progress('runtime-download', { counters: { bytesReceived: 2 } });
-    this.operation.start('runtime-extract');
-    this.operation.progress('runtime-extract', { stageElapsedMs: 1 });
+    this.operation.start('postgres-binary-prepare');
+    this.operation.progress('postgres-binary-prepare', { stageElapsedMs: 1 });
+    this.operation.complete('postgres-binary-prepare');
+    this.operation.progress('postgres-binary-prepare', { stageElapsedMs: 2 });
+    this.operation.start('postgres-initialization');
+    this.operation.progress('postgres-initialization', { stageElapsedMs: 1 });
     return this.operation.eventsAfter(0);
   }
 
@@ -37,7 +37,6 @@ export class ProgressScenario {
     const started = this.operation.start('postgres-start');
     this.now = 150;
     this.operation.progress('postgres-start', {
-      counters: { pnpmResolved: 2 },
       stageElapsedMs: 60,
     });
     this.now = 90;
@@ -52,24 +51,23 @@ export class ProgressScenario {
   }
 
   invalidProgressLeavesOperationUsable() {
-    this.operation.start('runtime-extract');
+    this.operation.start('postgres-initialization');
     const invalid = [
       { stageElapsedMs: Number.NaN },
       { stageElapsedMs: Number.POSITIVE_INFINITY },
       { stageElapsedMs: -1 },
-      { stageElapsedMs: 999, counters: {} },
     ];
     let rejected = 0;
     for (const details of invalid) {
       try {
-        this.operation.progress('runtime-extract', details);
+        this.operation.progress('postgres-initialization', details);
       } catch {
         rejected += 1;
       }
     }
     this.now = 120;
-    const progress = this.operation.progress('runtime-extract', { stageElapsedMs: 10 });
-    const completed = this.operation.complete('runtime-extract');
+    const progress = this.operation.progress('postgres-initialization', { stageElapsedMs: 10 });
+    const completed = this.operation.complete('postgres-initialization');
     return {
       rejected,
       invalid: invalid.length,
@@ -103,10 +101,10 @@ export class ProgressScenario {
       { ...valid, extra: true },
       { ...valid, elapsedMs: Number.NaN },
       { ...valid, phase: 'Bad phase' },
-      { ...valid, status: 'progress', counters: { bytesReceived: -1 } },
-      { ...valid, status: 'progress', counters: { imaginaryPercent: 50 } },
+      { ...valid, status: 'progress', stageElapsedMs: -1 },
+      { ...valid, status: 'progress', imaginaryPercent: 50 },
       { ...valid, sequence: Number.MAX_SAFE_INTEGER + 1 },
-      { ...valid, status: 'progress', counters: { bytesReceived: 1.5 } },
+      { ...valid, status: 'progress', counters: { bytesReceived: 1 } },
       { ...valid, status: 'failed', code: 'bad\ncode' },
       { ...valid, status: 'failed', code: 'FAILED', logPath: 'log\nforged' },
       { ...valid, status: 'ready', url: 'https://user:secret@example.com/' },
@@ -128,11 +126,11 @@ export class ProgressScenario {
       stdout: (text) => stdout.push(text),
       stderr: (text) => stderr.push(text),
     });
-    const started = this.operation.start('runtime-download');
-    const progress = this.operation.progress('runtime-download', {
-      counters: { bytesReceived: 12 },
+    const started = this.operation.start('postgres-binary-prepare');
+    const progress = this.operation.progress('postgres-binary-prepare', {
+      stageElapsedMs: 12,
     });
-    const failed = this.operation.fail('runtime-download', { code: 'DOWNLOAD_FAILED' });
+    const failed = this.operation.fail('postgres-binary-prepare', { code: 'DOWNLOAD_FAILED' });
     for (const event of [started, progress, failed]) {
       if (event) {
         renderer.render(event);
@@ -157,11 +155,11 @@ export class ProgressScenario {
       stdout: () => undefined,
       stderr: (text) => stderr.push(text),
     });
-    const started = this.operation.start('dependencies-install');
-    const long = this.operation.progress('dependencies-install', {
-      counters: { pnpmResolved: 123_456, pnpmDownloaded: 123_456 },
+    const started = this.operation.start('postgres-start');
+    const long = this.operation.progress('postgres-start', {
+      stageElapsedMs: 123_456,
     });
-    const short = this.operation.progress('dependencies-install');
+    const short = this.operation.progress('postgres-start');
     for (const event of [started, long, short]) {
       if (event) {
         renderer.render(event);

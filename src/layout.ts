@@ -1,7 +1,7 @@
 import path from 'node:path';
 
 export type ReleaseChannel = 'stable' | 'alpha';
-export type SupportedPlatform = 'darwin' | 'linux' | 'win32';
+type SupportedPlatform = 'darwin' | 'linux' | 'win32';
 
 export interface LayoutInput {
   channel: ReleaseChannel;

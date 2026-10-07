@@ -9,7 +9,7 @@ describe('persisted startup progress', () => {
     scenario = new StartupProgressScenario();
   });
 
-  it('replays cross-process progress with latest counters and cursor deduplication', async () => {
+  it('replays cross-process progress with the latest progress and cursor deduplication', async () => {
     const result = await scenario.crossProcessReplay();
     expect(result.initial).toMatchObject({
       kind: 'events',
