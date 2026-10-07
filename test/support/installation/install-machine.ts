@@ -118,6 +118,8 @@ interface PackageManagerOptions {
   readonly listsStayStale?: boolean;
   /** The install fails with this message, whatever the package lists hold. */
   readonly failWith?: string;
+  /** A mirror drops the download: the install fails once, or on every attempt, with apt's fetch error. */
+  readonly mirrorFailures?: 'once' | 'always';
 }
 
 type UserPnpmSettingSource = 'configuration file' | 'environment';
@@ -378,8 +380,22 @@ export class InstallMachine {
       join(this.root, 'platform-bin', name),
       [
         `[ -z "\${FIXTURE_SUDO:-}" ] || sudo_prefix='sudo '`,
-        `printf '%s\\n' "\${sudo_prefix:-}${name} $*" >> ${quote(this.control('system-commands.log'))}`,
+        `printf '%s\\n' "${name} $*" >> ${quote(this.control('package-manager-arguments.log'))}`,
+        `printf '%s\\n' "\${sudo_prefix:-}${name} $*" | sed 's/ -o Acquire::Retries=3//' >> ${quote(this.control('system-commands.log'))}`,
+        '[ "${1:-}" != -o ] || shift 2',
         `if [ "\${1:-}" = update ]; then ${options.listsStayStale === true ? '' : `: > ${quote(this.control('lists-updated'))}; `}exit 0; fi`,
+        ...(options.mirrorFailures === undefined
+          ? []
+          : [
+              `if [ ! -e ${quote(this.control('mirror-dropped'))} ] || [ ${quote(options.mirrorFailures)} = always ]; then`,
+              `  : > ${quote(this.control('mirror-dropped'))}`,
+              "  echo 'Err:1 http://security.ubuntu.com/ubuntu noble-security/main amd64 libatomic1 amd64 14.2.0-4ubuntu2~24.04.1' >&2",
+              "  echo '  Connection failed [IP: 91.189.91.83 80]' >&2",
+              "  echo 'E: Failed to fetch http://security.ubuntu.com/ubuntu/pool/main/g/gcc-14/libatomic1.deb  Connection failed' >&2",
+              "  echo 'E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?' >&2",
+              '  exit 100',
+              'fi',
+            ]),
         ...(options.failWith === undefined
           ? []
           : [`echo ${quote(options.failWith)} >&2`, 'exit 1']),
@@ -478,6 +494,11 @@ export class InstallMachine {
 
   allowSystemDependencyInstall(): void {
     this.userPnpmEnvironment.REVO_INSTALL_SYSTEM_DEPS = '1';
+  }
+
+  /** Every package manager call exactly as made, including options the installer hides from the user. */
+  async packageManagerArguments(): Promise<readonly string[]> {
+    return lines(this.control('package-manager-arguments.log'));
   }
 
   async systemCommands(): Promise<readonly string[]> {

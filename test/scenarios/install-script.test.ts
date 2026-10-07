@@ -663,6 +663,52 @@ describe('install.sh', { timeout: 60_000 }, () => {
       ]);
     });
 
+    it('asks apt to retry every download, without changing the command shown to the user', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { staleLists: true });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.packageManagerArguments()).toEqual([
+        'apt-get -o Acquire::Retries=3 install -y libatomic1',
+        'apt-get -o Acquire::Retries=3 update',
+        'apt-get -o Acquire::Retries=3 install -y libatomic1',
+      ]);
+    });
+
+    it('refreshes the package lists and installs again when a mirror dropped a download', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { mirrorFailures: 'once' });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.systemCommands()).toEqual([
+        `sudo ${INSTALL}`,
+        'sudo apt-get update',
+        `sudo ${INSTALL}`,
+      ]);
+    });
+
+    it('shows what apt said when the mirror keeps failing after one retry', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { mirrorFailures: 'always' });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('E: Unable to fetch some archives');
+      expect(result.stderr).toContain(`\`sudo ${INSTALL}\` failed`);
+      expect(await machine.systemCommands()).toHaveLength(3);
+    });
+
     it('refreshes the package lists under a localized session, because apt runs in English', async () => {
       const machine = await machineLackingLibrary();
       await machine.havePackageManager('apt-get', { staleLists: true, localized: true });
