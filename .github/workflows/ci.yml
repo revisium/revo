@@ -122,7 +122,7 @@ jobs:
           - debian:13
           - fedora:44
           - rockylinux/rockylinux:9
-          - opensuse/leap:15.6
+          - opensuse/leap:16.0
           - archlinux:latest
           - amazonlinux:2023
 

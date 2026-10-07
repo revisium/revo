@@ -111,8 +111,10 @@ export interface MachineOptions {
 interface PackageManagerOptions {
   /** The install fails until `update` has refreshed the package lists, as on a fresh image. */
   readonly staleLists?: boolean;
-  /** apt speaks English only under LC_ALL=C and German otherwise, as in a localized session. */
+  /** apt speaks English only when the effective locale (LC_ALL, then LANG) is C, and German otherwise. */
   readonly localized?: boolean;
+  /** `update` succeeds without refreshing the lists, so the retry fails too. */
+  readonly listsStayStale?: boolean;
   /** The install fails with this message, whatever the package lists hold. */
   readonly failWith?: string;
 }
@@ -143,6 +145,8 @@ export class InstallMachine {
 
   private workingDirectory: string;
 
+  private lackedTools: readonly string[] = [];
+  private locale = 'C';
   private readonly userPnpmEnvironment: Record<string, string> = {};
 
   private systemPath = SYSTEM_PATH;
@@ -355,7 +359,10 @@ export class InstallMachine {
   }
 
   /** A Linux machine without libatomic, and without the host's package managers, sudo and root. */
-  async lackSystemLibrary(): Promise<void> {
+  async lackSystemLibrary(
+    options: { readonly alsoLacking?: readonly string[] } = {},
+  ): Promise<void> {
+    this.lackedTools = options.alsoLacking ?? [];
     await this.reportPlatform(MINIMAL_LINUX);
     await this.isolateSystemTools();
     await writeFile(this.control('library-missing'), '');
@@ -371,14 +378,14 @@ export class InstallMachine {
       [
         `[ -z "\${FIXTURE_SUDO:-}" ] || sudo_prefix='sudo '`,
         `printf '%s\\n' "\${sudo_prefix:-}${name} $*" >> ${quote(this.control('system-commands.log'))}`,
-        `if [ "\${1:-}" = update ]; then : > ${quote(this.control('lists-updated'))}; exit 0; fi`,
+        `if [ "\${1:-}" = update ]; then ${options.listsStayStale === true ? '' : `: > ${quote(this.control('lists-updated'))}; `}exit 0; fi`,
         ...(options.failWith === undefined
           ? []
           : [`echo ${quote(options.failWith)} >&2`, 'exit 1']),
         `if [ -e ${quote(this.control('lists-stale'))} ] && [ ! -e ${quote(this.control('lists-updated'))} ]; then`,
         ...(options.localized === true
           ? [
-              '  if [ "${LC_ALL:-}" = C ] && [ "${LANG:-}" = C ]; then',
+              '  if [ "${LC_ALL:-${LANG:-}}" = C ]; then',
               "    echo 'E: Unable to locate package libatomic1' >&2",
               '  else',
               "    echo 'E: Paket libatomic1 kann nicht gefunden werden' >&2",
@@ -388,9 +395,18 @@ export class InstallMachine {
         '  exit 100',
         'fi',
         `[ -e ${quote(this.control('install-ineffective'))} ] || : > ${quote(this.control('library-installed'))}`,
+        ...this.lackedTools.map(
+          (tool) =>
+            `[ -e ${quote(this.control('install-ineffective'))} ] || ln -sf ${quote(this.systemToolPath(tool))} ${quote(join(this.root, 'platform-bin', tool))}`,
+        ),
         '',
       ].join('\n'),
     );
+  }
+
+  /** The session runs under this locale, which sets LC_ALL. */
+  speakLocale(locale: string): void {
+    this.locale = locale;
   }
 
   /** The package manager succeeds without providing the library. */
@@ -548,7 +564,7 @@ export class InstallMachine {
       ...this.userPnpmEnvironment,
       CURL_CA_BUNDLE: this.certificate.certPath,
       HOME: this.home,
-      LC_ALL: 'C',
+      LC_ALL: this.locale,
       PATH: path.join(':'),
       REVO_TEST_TTY: this.control('tty'),
     };
@@ -613,6 +629,11 @@ export class InstallMachine {
 
   // The installer finds tools through PATH, so a scenario that must not see the host's package
   // managers or sudo gets a PATH of every other system tool.
+  private systemToolPath(name: string): string {
+    const directory = SYSTEM_BIN_DIRECTORIES.find((candidate) => existsSync(join(candidate, name)));
+    return join(directory ?? '/usr/bin', name);
+  }
+
   private async isolateSystemTools(): Promise<void> {
     if (this.systemPath !== SYSTEM_PATH) {
       return;
@@ -625,7 +646,7 @@ export class InstallMachine {
     const names = new Set(listings.flat());
     await Promise.all(
       [...names]
-        .filter((name) => !SYSTEM_DEPENDENCY_TOOLS.includes(name))
+        .filter((name) => ![...SYSTEM_DEPENDENCY_TOOLS, ...this.lackedTools].includes(name))
         .map(async (name) => {
           const directory = SYSTEM_BIN_DIRECTORIES.find((candidate) =>
             existsSync(join(candidate, name)),
