@@ -28,14 +28,17 @@ toolchain_checksums() {
   esac
 }
 
-# Shared libraries the private Node.js loads that minimal images lack, one package per package manager.
+# What minimal Linux images can lack: shared libraries the private Node.js loads and the tools that unpack
+# the downloads. Both are installed through the package manager, with one package per package manager.
 required_libraries='libatomic.so.1'
+installable_tools='tar gzip'
 
 library_package() {
   case "$2:$1" in
     libatomic.so.1:apt-get | libatomic.so.1:zypper) package=libatomic1 ;;
     libatomic.so.1:dnf | libatomic.so.1:yum) package=libatomic ;;
     libatomic.so.1:pacman) package=gcc-libs ;;
+    tar:* | gzip:*) package=$2 ;;
     *) package= ;;
   esac
 }
@@ -88,7 +91,10 @@ detect_platform() {
 }
 
 require_tools() {
-  for tool in curl tar gzip awk sed; do
+  # On Linux a missing tar or gzip is installed together with the system libraries.
+  tools='curl awk sed'
+  [ "$system" = Linux ] || tools="$tools $installable_tools"
+  for tool in $tools; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required; install it and run the installer again."
   done
   command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ||
@@ -118,6 +124,9 @@ find_missing_libraries() {
     ldconfig_cache=$(/sbin/ldconfig -p 2>/dev/null) || ldconfig_cache=
   fi
   missing=
+  for tool in $installable_tools; do
+    command -v "$tool" >/dev/null 2>&1 || missing="${missing:+$missing }$tool"
+  done
   for library in $required_libraries; do
     library_present "$library" || missing="${missing:+$missing }$library"
   done
@@ -168,12 +177,17 @@ install_libraries() {
     run_as_admin "$manager" $install_args && return
     fail "\`$command_text\` failed; fix that and run the installer again."
   fi
-  output=$(run_as_admin "$manager" $install_args 2>&1) && return
+  # The messages are matched below, so apt must speak English whatever the user's locale is.
+  output=$(run_as_admin env LC_ALL=C LANG=C "$manager" $install_args 2>&1) && return
   # Refresh the lists only when that is the failure: a fresh apt image has none.
   case "$output" in
     *'Unable to locate package'* | *'has no installation candidate'*)
       say 'Refreshing the package lists...'
-      run_as_admin apt-get update && run_as_admin "$manager" $install_args && return
+      output=$(
+        run_as_admin env LC_ALL=C LANG=C apt-get update 2>&1 &&
+          run_as_admin env LC_ALL=C LANG=C "$manager" $install_args 2>&1
+      ) && return
+      printf '%s\n' "$output" >&2
       ;;
     *) printf '%s\n' "$output" >&2 ;;
   esac
@@ -181,11 +195,22 @@ install_libraries() {
 }
 
 # Runs before anything is downloaded or created, so declining leaves the machine unchanged.
+describe_missing() {
+  case "$missing" in
+    *' '*) verb=are ;;
+    *) verb=is ;;
+  esac
+  case "$missing" in
+    'libatomic.so.1') needs="Node.js needs $missing, which is missing" ;;
+    *) needs="The installer needs $(printf '%s' "$missing" | sed 's/ /, /g'), which $verb missing" ;;
+  esac
+}
+
 ensure_system_libraries() {
   [ "$system" = Linux ] || return 0
   find_missing_libraries
   [ -n "$missing" ] || return 0
-  needs="Node.js needs $missing, which is missing"
+  describe_missing
   plan_library_install || fail "$needs; install the package that provides it and run the installer again."
   sudo_prefix=
   if [ "$(id -u)" != 0 ]; then

@@ -85,7 +85,7 @@ server.socket = context.wrap_socket(server.socket, server_side=True)
 server.serve_forever()
 PY
   server_pid=$!
-  for trusted in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+  for trusted in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem /etc/pki/tls/certs/ca-bundle.crt; do
     if [ -f "$trusted" ]; then
       cat "$trusted" >"$work/ca-bundle.pem"
       break

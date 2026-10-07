@@ -558,6 +558,73 @@ describe('install.sh', { timeout: 60_000 }, () => {
       ]);
     });
 
+    it('refreshes the package lists under a localized session, because apt runs in English', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { staleLists: true, localized: true });
+      machine.speakLocale('de_DE.UTF-8');
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.systemCommands()).toEqual([
+        `sudo ${INSTALL}`,
+        'sudo apt-get update',
+        `sudo ${INSTALL}`,
+      ]);
+    });
+
+    it('shows what apt said when the retry after refreshing the lists fails too', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { staleLists: true, listsStayStale: true });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('E: Unable to locate package libatomic1');
+      expect(result.stderr).toContain(`\`sudo ${INSTALL}\` failed`);
+    });
+
+    describe('with tar and gzip missing too', () => {
+      const COMBINED = 'apt-get install -y tar gzip libatomic1';
+      const NEEDS_ALL =
+        'revo-alpha install: The installer needs tar, gzip, libatomic.so.1, which are missing';
+
+      async function minimalMachine() {
+        const machine = await cleanMachine();
+        await machine.lackSystemLibrary({ alsoLacking: ['tar', 'gzip'] });
+        await machine.havePackageManager('apt-get');
+        await machine.haveSudo();
+        return machine;
+      }
+
+      it('shows one command for everything missing and changes nothing without consent', async () => {
+        const machine = await minimalMachine();
+
+        const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toBe(
+          `${NEEDS_ALL}; install it with \`sudo ${COMBINED}\` and run the installer again, or run the installer with REVO_INSTALL_SYSTEM_DEPS=1 to let it do that.\n`,
+        );
+        await expectNothingChanged(machine);
+      });
+
+      it('installs everything missing with one command when the user opted in', async () => {
+        const machine = await minimalMachine();
+        machine.allowSystemDependencyInstall();
+
+        const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+        expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+        expect(await machine.systemCommands()).toEqual([`sudo ${COMBINED}`]);
+        expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+      });
+    });
+
     it('fails clearly when the library is still missing after the install', async () => {
       const machine = await machineLackingLibrary();
       await machine.havePackageManager('apt-get');
