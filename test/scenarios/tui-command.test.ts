@@ -27,7 +27,12 @@ describe('revo tui command', () => {
       },
     );
 
-    expect(result).toMatchObject({ exitCode: 0, stderr: '', stdout: '' });
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: '',
+      stdout:
+        'Revo keeps running at https://revo.example; stop it with `revo-alpha server stop`.\n',
+    });
     expect(result.events).toEqual(['ensure', 'launch']);
     expect(result.ensures).toEqual([
       {
@@ -50,7 +55,11 @@ describe('revo tui command', () => {
       },
     });
 
-    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: '',
+      stdout: 'Revo keeps running at http://127.0.0.1:3210; stop it with `revo server stop`.\n',
+    });
     expect(result.events).toEqual(['ensure', 'launch']);
     expect(result.launches).toEqual([
       { apiUrl: 'http://127.0.0.1:3210/graphql', dataDir: '/fixture/stable-data/tui' },
@@ -112,7 +121,7 @@ describe('revo tui command', () => {
     async (platform) => {
       const result = await run([], { platform });
 
-      expect(result).toMatchObject({ exitCode: 0, stderr: '', stdout: '' });
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
       expect(result.events).toEqual(['ensure', 'launch']);
     },
   );
@@ -185,7 +194,7 @@ describe('revo tui command', () => {
     },
   );
 
-  it('preserves the launcher exit code and does not stop the server', async () => {
+  it('preserves the launcher exit code, prints no hint and does not stop the server', async () => {
     const result = await run([], { exitCode: 37 });
 
     expect(result).toMatchObject({ exitCode: 37, stderr: '', stdout: '' });

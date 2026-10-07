@@ -8,6 +8,7 @@ import { DoctorCommand } from './commands/doctor.command.js';
 import { ServerCommand } from './commands/server.command.js';
 import { TuiCommand } from './commands/tui.command.js';
 import { VersionCommand } from './commands/version.command.js';
+import { WebCommand } from './commands/web.command.js';
 import { BrowserOpenerService } from './diagnostics/browser-opener.service.js';
 import { DoctorComponentProbe } from './diagnostics/doctor-component-probe.js';
 import { DoctorPathProbe } from './diagnostics/doctor-path-probe.js';
@@ -46,6 +47,7 @@ import { WebCommandService } from './web-command.service.js';
     DoctorCommand,
     VersionCommand,
     TuiCommand,
+    WebCommand,
     ...ServerCommand.registerWithSubCommands(),
   ],
 })

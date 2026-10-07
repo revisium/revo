@@ -53,6 +53,7 @@ const MINIMAL_LINUX: ReportedPlatform = {
   machine: 'x86_64',
   glibc: 'glibc 2.35',
 };
+const COMMAND_STARTED = 'fixture revo started\n';
 const FOREIGN_COMMAND = '#!/bin/sh\necho "not Revo"\n';
 const CHANNELS: readonly ReleaseChannel[] = ['stable', 'alpha'];
 const USER_PNPM_CONFIG_DIRS = [join('.config', 'pnpm'), join('Library', 'Preferences', 'pnpm')];
@@ -419,6 +420,17 @@ export class InstallMachine {
     await writeFile(this.control('tty'), '');
   }
 
+  /** A usable terminal: the installer can read it and write to it. */
+  async attachTerminal(): Promise<void> {
+    await writeFile(this.control('tty'), '');
+  }
+
+  /** What the installed command wrote to its stdout when the installer attached it to the terminal. */
+  async terminalOutput(): Promise<string> {
+    const written = await readFile(this.control('tty'), 'utf8').catch(() => '');
+    return written.includes(COMMAND_STARTED) ? COMMAND_STARTED : '';
+  }
+
   /** ldconfig fails, so the installer looks in these directories; they hold libatomic or not. */
   async searchLibrariesOnlyIn(options: { readonly libatomic: boolean }): Promise<void> {
     const directory = this.control('libraries');
@@ -456,7 +468,7 @@ export class InstallMachine {
   /** What the installer wrote to the terminal after the answer. */
   async promptShown(): Promise<string> {
     const typed = await readFile(this.control('tty'), 'utf8').catch(() => '');
-    return typed.split('\n').slice(1).join('\n');
+    return typed.replace(COMMAND_STARTED, '').split('\n').slice(1).join('\n');
   }
 
   downloads(fragment = ''): readonly string[] {
@@ -757,6 +769,7 @@ export class InstallMachine {
         '  process.exit(1);',
         '}',
         `if (process.argv[2] === '--version') console.log(${JSON.stringify(version)});`,
+        `if (process.argv.length === 2) process.stdout.write(${JSON.stringify(COMMAND_STARTED)});`,
         "if (process.argv[2] === '--launcher-channel') console.log(process.env.REVO_LAUNCHER_CHANNEL);",
         '',
       ].join('\n'),

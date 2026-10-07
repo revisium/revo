@@ -6,9 +6,16 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { cliFailure } from '../../src/cli/cli-error.js';
 import { DefaultCommand } from '../../src/cli/commands/default.command.js';
+import { WebCommand } from '../../src/cli/commands/web.command.js';
 import { BrowserOpenerService } from '../../src/cli/diagnostics/browser-opener.service.js';
 import { OutputService } from '../../src/cli/output.service.js';
+import { PackageMetadataService } from '../../src/cli/package-metadata.service.js';
 import { ServerCommandService } from '../../src/cli/server-command.service.js';
+import {
+  TUI_LAUNCHER,
+  TUI_TERMINAL,
+  TuiCommandService,
+} from '../../src/cli/tui-command.service.js';
 import { WebCommandService } from '../../src/cli/web-command.service.js';
 
 type Outcome =
@@ -37,6 +44,60 @@ describe('revo default command', () => {
 
     expect(fixture).toMatchObject({ exitCode: 0, stderr: '', stdout: output });
     expect(fixture.ensure).toHaveBeenCalledOnce();
+  });
+
+  it('opens the TUI instead of printing the URL when stdin and stdout are terminals', async () => {
+    const fixture = await run([], { kind: 'started', url: 'http://revo.example' }, undefined, true);
+
+    expect(fixture).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(fixture.launches).toEqual(['http://revo.example/graphql']);
+    expect(fixture.stdout).toBe(
+      'Revo keeps running at http://revo.example; stop it with `revo server stop`.\n',
+    );
+  });
+
+  it('prints the URL and opens no TUI without a terminal', async () => {
+    const fixture = await run([], { kind: 'started', url: 'http://revo.example' });
+
+    expect(fixture.launches).toEqual([]);
+    expect(fixture.stdout).toBe('http://revo.example\n');
+  });
+
+  it('keeps --web as an explicit browser request even at a terminal', async () => {
+    const opener = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
+    const fixture = await run(
+      ['--web'],
+      { kind: 'started', url: 'http://revo.example' },
+      opener,
+      true,
+    );
+
+    expect(fixture.launches).toEqual([]);
+    expect(opener).toHaveBeenCalledWith('http://revo.example');
+  });
+
+  it.each([true, false])(
+    'web prints the URL and opens no TUI or browser (terminal: %s)',
+    async (tty) => {
+      const opener = vi.fn<() => Promise<boolean>>().mockResolvedValue(true);
+      const fixture = await run(
+        ['web'],
+        { kind: 'started', url: 'http://revo.example' },
+        opener,
+        tty,
+      );
+
+      expect(fixture).toMatchObject({ exitCode: 0, stderr: '', stdout: 'http://revo.example\n' });
+      expect(fixture.launches).toEqual([]);
+      expect(opener).not.toHaveBeenCalled();
+    },
+  );
+
+  it('web rejects extra arguments without launching', async () => {
+    const fixture = await run(['web', 'extra'], { kind: 'started', url: 'http://revo.example' });
+
+    expect(fixture.exitCode).toBe(2);
+    expect(fixture.ensure).not.toHaveBeenCalled();
   });
 
   it('uses the running advertised URL and fails when it is unavailable', async () => {
@@ -104,7 +165,9 @@ async function run(
   args: readonly string[],
   outcome: Outcome,
   open = vi.fn<(url: string) => Promise<boolean>>().mockResolvedValue(true),
+  tty = false,
 ): Promise<{
+  readonly launches: string[];
   readonly ensure: ReturnType<typeof vi.fn>;
   readonly events: string[];
   readonly exitCode: number;
@@ -114,6 +177,7 @@ async function run(
   const output: string[] = [];
   const errors: string[] = [];
   const events: string[] = [];
+  const launches: string[] = [];
   const ensure = vi.fn<() => Promise<Outcome>>().mockResolvedValue(outcome);
   const outputService = {
     write: (message: string) => {
@@ -135,8 +199,34 @@ async function run(
   @Module({
     providers: [
       DefaultCommand,
+      WebCommand,
       WebCommandService,
-      { provide: ServerCommandService, useValue: { ensureRunning: ensure } },
+      TuiCommandService,
+      {
+        provide: ServerCommandService,
+        useValue: {
+          ensureRunning: ensure,
+          ensureRunningWithConfiguration: async () => {
+            const launched = await ensure();
+            return {
+              configuration: { channel: 'stable', layout: { dataDir: '/fixture' } },
+              outcome: launched,
+            };
+          },
+        },
+      },
+      { provide: PackageMetadataService, useValue: { version: '1.0.0' } },
+      {
+        provide: TUI_LAUNCHER,
+        useValue: async (options: { readonly apiUrl: string }) => {
+          launches.push(options.apiUrl);
+          return 0;
+        },
+      },
+      {
+        provide: TUI_TERMINAL,
+        useValue: () => ({ platform: 'linux', stdin: tty, stdout: tty }),
+      },
       { provide: BrowserOpenerService, useValue: browser },
       { provide: OutputService, useValue: outputService },
     ],
@@ -168,5 +258,5 @@ async function run(
   } finally {
     process.argv = previousArgv;
   }
-  return { ensure, events, exitCode, stderr: errors.join(''), stdout: output.join('') };
+  return { ensure, events, exitCode, launches, stderr: errors.join(''), stdout: output.join('') };
 }
