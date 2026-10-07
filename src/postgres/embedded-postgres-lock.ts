@@ -1,10 +1,10 @@
-import { constants } from 'node:fs';
 import { type FileHandle, open, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
 import { errorCode } from '../errors.js';
+import { ownedPrivate, READ_NOFOLLOW_FLAGS } from '../private-files.js';
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import { ProcessIdentityService } from '../processes/process-identity.service.js';
 import type { IdentityObservation } from '../processes/process-identity.types.js';
@@ -171,18 +171,13 @@ type LockFile =
 async function readLockFile(path: string): Promise<LockFile> {
   let file: FileHandle;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
   } catch (error) {
     return errorCode(error) === 'ENOENT' ? { kind: 'missing' } : { kind: 'unsafe' };
   }
   try {
     const metadata = await file.stat();
-    if (
-      !metadata.isFile() ||
-      metadata.uid !== process.getuid?.() ||
-      (metadata.mode & 0o077) !== 0 ||
-      metadata.size > MAX_LOCK_FILE_BYTES
-    ) {
+    if (!metadata.isFile() || !ownedPrivate(metadata) || metadata.size > MAX_LOCK_FILE_BYTES) {
       return { kind: 'unsafe' };
     }
     const buffer = Buffer.alloc(MAX_LOCK_FILE_BYTES);

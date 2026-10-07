@@ -1,7 +1,8 @@
-import { constants, type FileHandle, lstat, open, rename, rm } from 'node:fs/promises';
+import { type FileHandle, lstat, open, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { errorCode, errorMessage } from '../errors.js';
+import { READ_NOFOLLOW_FLAGS } from '../private-files.js';
 import { compareSemVer, isSemVerString } from '../release-metadata.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import { syncDirectory } from './directory-sync.js';
@@ -156,7 +157,7 @@ export class EmbeddedDataVersion {
 async function readSmallFile(path: string): Promise<string> {
   let file: FileHandle | undefined;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
     const metadata = await file.stat();
     if (!metadata.isFile() || metadata.size > MAX_DATA_VERSION_BYTES) {
       throw new Error('not a small regular file');

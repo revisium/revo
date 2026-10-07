@@ -5,6 +5,12 @@ import { dirname, join } from 'node:path';
 
 import { errorCode } from '../errors.js';
 import {
+  isSingleLinkedPrivateFile,
+  ownedPrivate,
+  READ_NOFOLLOW_FLAGS,
+  readBoundedUtf8,
+} from '../private-files.js';
+import {
   createLifecycleEvent,
   parseLifecycleDocument,
   serializeLifecycleDocument,
@@ -13,7 +19,6 @@ import {
   MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES,
   SERVER_LIFECYCLE_FILE,
   SERVER_LIFECYCLE_MAX_PENDING_WRITES,
-  SERVER_LIFECYCLE_READER_BYTES,
   SERVER_LIFECYCLE_RETAIN,
   SERVER_LIFECYCLE_TEMP_FILE,
   ServerLifecycleError,
@@ -197,7 +202,7 @@ async function ensurePrivateDirectory(path: string): Promise<void> {
   await validateParents(path);
   await mkdir(path, { recursive: true, mode: 0o700 });
   const metadata = await lstat(path);
-  if (!metadata.isDirectory() || !privateOwned(metadata.uid, metadata.mode)) {
+  if (!metadata.isDirectory() || !ownedPrivate(metadata)) {
     throw new ServerLifecycleError('unsafe');
   }
 }
@@ -220,7 +225,7 @@ async function validateParents(path: string): Promise<void> {
 async function readFile(path: string): Promise<FileRead> {
   let file: FileHandle;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
   } catch (error) {
     return errorCode(error) === 'ENOENT' ? { kind: 'missing' } : { kind: 'invalid' };
   }
@@ -228,18 +233,12 @@ async function readFile(path: string): Promise<FileRead> {
     const descriptor = await file.stat();
     const pathname = await lstat(path);
     if (
-      !descriptor.isFile() ||
-      !privateOwned(descriptor.uid, descriptor.mode) ||
-      descriptor.nlink !== 1 ||
-      !pathname.isFile() ||
-      pathname.nlink !== 1 ||
-      descriptor.dev !== pathname.dev ||
-      descriptor.ino !== pathname.ino ||
+      !isSingleLinkedPrivateFile(descriptor, pathname) ||
       descriptor.size > MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES
     ) {
       return { kind: 'invalid' };
     }
-    const content = await readBounded(file);
+    const content = await readBoundedUtf8(file, MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES);
     const document = parseLifecycleDocument(content);
     return document ? { kind: 'valid', events: document.events } : { kind: 'invalid' };
   } catch {
@@ -247,12 +246,6 @@ async function readFile(path: string): Promise<FileRead> {
   } finally {
     await file.close().catch(() => undefined);
   }
-}
-
-async function readBounded(file: FileHandle): Promise<string | undefined> {
-  const buffer = Buffer.alloc(SERVER_LIFECYCLE_READER_BYTES);
-  const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-  return bytesRead === buffer.length ? undefined : buffer.subarray(0, bytesRead).toString('utf8');
 }
 
 function validateConfiguration(configuration: ServerLifecycleConfiguration): void {
@@ -272,6 +265,3 @@ function absolute(path: unknown): path is string {
 
 const lastSequence = (events: readonly ServerLifecycleEvent[] | undefined): number =>
   events?.at(-1)?.sequence ?? 0;
-
-const privateOwned = (uid: number, mode: number) =>
-  typeof process.getuid === 'function' && uid === process.getuid() && (mode & 0o077) === 0;

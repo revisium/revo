@@ -1,6 +1,5 @@
 import { randomBytes } from 'node:crypto';
 import {
-  constants,
   type FileHandle,
   lstat,
   mkdtemp,
@@ -15,6 +14,7 @@ import { join } from 'node:path';
 import { Inject, Injectable } from '@nestjs/common';
 
 import { errorCode } from '../errors.js';
+import { ownedPrivate, READ_NOFOLLOW_FLAGS, readBoundedUtf8 } from '../private-files.js';
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
@@ -389,7 +389,7 @@ async function pathKind(path: string) {
 
 async function validateDirectory(path: string) {
   const stat = await lstat(path);
-  if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+  if (!stat.isDirectory() || !ownedPrivate(stat)) {
     throw new EmbeddedPostgresError('invalid');
   }
 }
@@ -397,22 +397,16 @@ async function validateDirectory(path: string) {
 async function readPrivateFile(path: string) {
   let file: FileHandle | undefined;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
     const stat = await file.stat();
-    if (
-      !stat.isFile() ||
-      stat.uid !== process.getuid?.() ||
-      (stat.mode & 0o077) !== 0 ||
-      stat.size > MAX_SMALL_FILE
-    ) {
+    if (!stat.isFile() || !ownedPrivate(stat) || stat.size > MAX_SMALL_FILE) {
       throw new EmbeddedPostgresError('invalid');
     }
-    const content = Buffer.alloc(MAX_SMALL_FILE + 1);
-    const { bytesRead } = await file.read(content, 0, content.length, 0);
-    if (bytesRead > MAX_SMALL_FILE) {
+    const content = await readBoundedUtf8(file, MAX_SMALL_FILE);
+    if (content === undefined) {
       throw new EmbeddedPostgresError('invalid');
     }
-    return content.subarray(0, bytesRead).toString('utf8');
+    return content;
   } finally {
     await file?.close();
   }
@@ -424,9 +418,9 @@ export const readEmbeddedPostgresCredential = (canonicalDataDir: string) =>
 async function validatePrivateFile(path: string) {
   let file: FileHandle | undefined;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
     const stat = await file.stat();
-    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+    if (!stat.isFile() || !ownedPrivate(stat)) {
       throw new EmbeddedPostgresError('invalid');
     }
   } finally {

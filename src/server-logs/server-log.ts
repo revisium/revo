@@ -3,6 +3,7 @@ import { open, realpath, type FileHandle } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
 import { errorCode } from '../errors.js';
+import { ownedPrivate, READ_NOFOLLOW_FLAGS } from '../private-files.js';
 import type { ServerLifecycleConfiguration } from './server-lifecycle.types.js';
 import { ensurePrivateLogDirectory, serverLogDirectory } from './store.service.js';
 
@@ -76,7 +77,7 @@ export async function readServerLogTail(
   let handle: FileHandle;
   try {
     path = await serverLogPath(location);
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    handle = await open(path, READ_NOFOLLOW_FLAGS);
   } catch {
     return undefined;
   }
@@ -129,12 +130,7 @@ async function canonicalPath(path: string): Promise<string> {
 
 async function requirePrivateFile(handle: FileHandle): Promise<number> {
   const metadata = await handle.stat();
-  if (
-    !metadata.isFile() ||
-    metadata.nlink !== 1 ||
-    metadata.uid !== process.getuid?.() ||
-    (metadata.mode & 0o077) !== 0
-  ) {
+  if (!metadata.isFile() || metadata.nlink !== 1 || !ownedPrivate(metadata)) {
     throw new Error('Server log is not a private file');
   }
   return metadata.size;

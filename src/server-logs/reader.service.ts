@@ -1,15 +1,17 @@
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
-import type { Stats } from 'node:fs';
 import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { errorCode } from '../errors.js';
+import {
+  isSingleLinkedPrivateFile,
+  READ_NOFOLLOW_FLAGS,
+  readBoundedUtf8,
+} from '../private-files.js';
 import { parseLifecycleDocument } from './document.js';
 import {
   MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES,
   SERVER_LIFECYCLE_FILE,
-  SERVER_LIFECYCLE_READER_BYTES,
   type ServerLifecycleConfiguration,
   type ServerLifecycleEvent,
 } from './server-lifecycle.types.js';
@@ -93,7 +95,7 @@ async function readDocument(path: string): Promise<DocumentRead> {
   }
   let file: FileHandle;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    file = await open(path, READ_NOFOLLOW_FLAGS);
   } catch (error) {
     return errorCode(error) === 'ENOENT' ? { kind: 'missing' } : { kind: 'invalid' };
   }
@@ -101,12 +103,12 @@ async function readDocument(path: string): Promise<DocumentRead> {
     const descriptor = await file.stat();
     const pathname = await lstat(path);
     if (
-      !safeDocumentFile(descriptor, pathname) ||
+      !isSingleLinkedPrivateFile(descriptor, pathname) ||
       descriptor.size > MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES
     ) {
       return { kind: 'invalid' };
     }
-    const content = await readBounded(file);
+    const content = await readBoundedUtf8(file, MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES);
     const document = content === undefined ? undefined : parseLifecycleDocument(content);
     return document ? { kind: 'ready', events: document.events } : { kind: 'invalid' };
   } catch {
@@ -130,20 +132,3 @@ async function validateParents(path: string): Promise<'ready' | 'missing' | 'inv
   }
   return missing ? 'missing' : 'ready';
 }
-
-async function readBounded(file: FileHandle): Promise<string | undefined> {
-  const buffer = Buffer.alloc(SERVER_LIFECYCLE_READER_BYTES);
-  const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-  return bytesRead === buffer.length ? undefined : buffer.subarray(0, bytesRead).toString('utf8');
-}
-
-const privateOwned = (uid: number, mode: number) =>
-  typeof process.getuid === 'function' && uid === process.getuid() && (mode & 0o077) === 0;
-const safeDocumentFile = (descriptor: Stats, pathname: Stats) =>
-  descriptor.isFile() &&
-  pathname.isFile() &&
-  privateOwned(descriptor.uid, descriptor.mode) &&
-  descriptor.nlink === 1 &&
-  pathname.nlink === 1 &&
-  descriptor.dev === pathname.dev &&
-  descriptor.ino === pathname.ino;
