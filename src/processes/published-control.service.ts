@@ -60,7 +60,7 @@ export class PublishedControlService {
     emitLifecycle(lifecycle, 'SERVER_STARTING');
     const instanceId = randomBytes(16).toString('hex');
     const token = randomBytes(32).toString('hex');
-    let endpoint: Awaited<ReturnType<ControlEndpointService['listen']>> | undefined;
+    let endpoint: ListeningEndpoint | undefined;
     let temporaryPath: string | undefined;
     try {
       const process = await this.identity.capture(globalThis.process.pid);
@@ -77,22 +77,9 @@ export class PublishedControlService {
       const progress = request.startupProgress
         ? new OwnedStartupProgress(this.progressJournal, canonicalDataDir, request.startupProgress)
         : undefined;
-      let postgres:
-        | ReturnType<ExternalPostgresResourceService['bind']>
-        | ReturnType<EmbeddedPostgresResourceService['bind']>
-        | undefined;
-      if (progress) {
-        if (request.databaseUrl !== undefined) {
-          postgres = this.externalPostgres.bind(request.databaseUrl, progress);
-        } else {
-          postgres = this.postgres.bind(
-            canonicalDataDir,
-            progress,
-            postgresLogPath(request, canonicalDataDir),
-            request.version,
-          );
-        }
-      }
+      const postgres = progress
+        ? this.bindPostgres(request, canonicalDataDir, progress)
+        : undefined;
       await progress?.initialize();
       const record = {
         schemaVersion: 1 as const,
@@ -106,71 +93,18 @@ export class PublishedControlService {
       };
       temporaryPath = join(canonicalDataDir, `.revo-control.${instanceId}.tmp`);
       await publishRecord(temporaryPath, join(canonicalDataDir, CONTROL_FILE), record);
-      let finalClose: Promise<void> | undefined;
-      let progressClose: Promise<void> | undefined;
       const lifecycleStop = new LifecycleStop(lifecycle);
-      let finalState: 'pending' | 'released' | 'failed' = 'pending';
-      let resolveOwnershipReleased!: () => void;
-      const ownershipReleased = new Promise<void>((resolve) => {
-        resolveOwnershipReleased = resolve;
-      });
-      const isReleased = () => finalState === 'released';
-      const finalize = () => {
-        progressClose ??= progress?.close();
-        if (!finalClose) {
-          finalClose = (async () => {
-            await postgres?.settled();
-            await progressClose;
-            await this.closeOwned(
-              createdEndpoint,
-              canonicalDataDir,
-              instanceId,
-              token,
-              lease,
-              lifecycleStop,
-              resolveOwnershipReleased,
-            );
-          })();
-          void finalClose.then(
-            () => {
-              finalState = 'released';
-            },
-            () => {
-              finalState = 'failed';
-            },
-          );
-        }
-        return finalClose;
-      };
-      const close = async () => {
-        if (isReleased()) {
-          await finalClose;
-          return;
-        }
-        lifecycleStop.begin();
-        const postgresClose = postgres?.close();
-        progressClose ??= progress?.close();
-        let postgresFailed = false;
-        try {
-          await postgresClose;
-        } catch {
-          postgresFailed = true;
-          lifecycleStop.resourcesFailed();
-        }
-        if (postgresFailed) {
-          if (!finalClose) {
-            void finalize().catch(() => undefined);
-          }
-          if (isReleased()) {
-            throw new PublishedControlError('close', [], 'released');
-          }
-          if (finalState === 'failed') {
-            await finalClose;
-          }
-          throw new PublishedControlError('close', [], 'retained');
-        }
-        await finalize();
-      };
+      const shutdown = new HeldControlShutdown(progress, postgres, lifecycleStop, (onReleased) =>
+        this.closeOwned(
+          createdEndpoint,
+          canonicalDataDir,
+          instanceId,
+          token,
+          lease,
+          lifecycleStop,
+          onReleased,
+        ),
+      );
       const common = {
         kind: 'held' as const,
         canonicalDataDir,
@@ -180,8 +114,8 @@ export class PublishedControlService {
         ...(progress ? { progress } : {}),
         ...(lifecycle ? { lifecycle } : {}),
         ...(postgres ? { startDatabase: postgres.start.bind(postgres) } : {}),
-        close,
-        ownershipReleased: () => ownershipReleased,
+        close: () => shutdown.close(),
+        ownershipReleased: () => shutdown.ownershipReleased,
       };
       if (request.databaseUrl !== undefined) {
         return { ...common, databaseKind: 'external' };
@@ -203,8 +137,24 @@ export class PublishedControlService {
     }
   }
 
+  private bindPostgres(
+    request: OpenPublishedControlRequest,
+    canonicalDataDir: string,
+    progress: OwnedStartupProgress,
+  ): BoundPostgres {
+    if (request.databaseUrl !== undefined) {
+      return this.externalPostgres.bind(request.databaseUrl, progress);
+    }
+    return this.postgres.bind(
+      canonicalDataDir,
+      progress,
+      postgresLogPath(request, canonicalDataDir),
+      request.version,
+    );
+  }
+
   private async closeOwned(
-    endpoint: Awaited<ReturnType<ControlEndpointService['listen']>>,
+    endpoint: ListeningEndpoint,
     canonicalDataDir: string,
     instanceId: string,
     token: string,
@@ -250,7 +200,7 @@ export class PublishedControlService {
 }
 
 async function cleanupStartup(
-  endpoint: Awaited<ReturnType<ControlEndpointService['listen']>> | undefined,
+  endpoint: ListeningEndpoint | undefined,
   temporaryPath: string | undefined,
   lease: Extract<Awaited<ReturnType<ServerOwnershipService['acquire']>>, { kind: 'held' }>,
   lifecycle: ServerLifecycleSink | undefined,
@@ -350,4 +300,84 @@ function emitLifecycle(
   code: Parameters<ServerLifecycleSink['emit']>[0],
 ): void {
   void sink?.emit(code).catch(() => undefined);
+}
+
+type ListeningEndpoint = Awaited<ReturnType<ControlEndpointService['listen']>>;
+
+type BoundPostgres =
+  | ReturnType<ExternalPostgresResourceService['bind']>
+  | ReturnType<EmbeddedPostgresResourceService['bind']>;
+
+class HeldControlShutdown {
+  readonly ownershipReleased: Promise<void>;
+  private resolveOwnershipReleased!: () => void;
+  private finalClose: Promise<void> | undefined;
+  private progressClose: Promise<void> | undefined;
+  private finalState: 'pending' | 'released' | 'failed' = 'pending';
+
+  constructor(
+    private readonly progress: OwnedStartupProgress | undefined,
+    private readonly postgres: BoundPostgres | undefined,
+    private readonly lifecycleStop: LifecycleStop,
+    private readonly closeOwned: (onOwnershipReleased: () => void) => Promise<void>,
+  ) {
+    this.ownershipReleased = new Promise<void>((resolve) => {
+      this.resolveOwnershipReleased = resolve;
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.isReleased()) {
+      await this.finalClose;
+      return;
+    }
+    this.lifecycleStop.begin();
+    const postgresClose = this.postgres?.close();
+    this.progressClose ??= this.progress?.close();
+    let postgresFailed = false;
+    try {
+      await postgresClose;
+    } catch {
+      postgresFailed = true;
+      this.lifecycleStop.resourcesFailed();
+    }
+    if (postgresFailed) {
+      if (!this.finalClose) {
+        void this.finalize().catch(() => undefined);
+      }
+      if (this.isReleased()) {
+        throw new PublishedControlError('close', [], 'released');
+      }
+      if (this.finalState === 'failed') {
+        await this.finalClose;
+      }
+      throw new PublishedControlError('close', [], 'retained');
+    }
+    await this.finalize();
+  }
+
+  private isReleased(): boolean {
+    return this.finalState === 'released';
+  }
+
+  private finalize(): Promise<void> {
+    this.progressClose ??= this.progress?.close();
+    if (!this.finalClose) {
+      const finalClose = (async () => {
+        await this.postgres?.settled();
+        await this.progressClose;
+        await this.closeOwned(this.resolveOwnershipReleased);
+      })();
+      this.finalClose = finalClose;
+      void finalClose.then(
+        () => {
+          this.finalState = 'released';
+        },
+        () => {
+          this.finalState = 'failed';
+        },
+      );
+    }
+    return this.finalClose;
+  }
 }
