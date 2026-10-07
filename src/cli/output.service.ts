@@ -24,7 +24,7 @@ export class OutputService {
   }
 }
 
-export class JsonlProgressOutput {
+class JsonlProgressOutput {
   private broken = false;
   private errorObserved = false;
   private closed = false;

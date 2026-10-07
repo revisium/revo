@@ -57,7 +57,7 @@ export type ControlStopResult =
   | { readonly kind: 'completed' }
   | { readonly kind: 'failed'; readonly error: SafeControlStopError };
 
-export interface SafeControlStopError {
+interface SafeControlStopError {
   readonly code: 'CONTROL_STOP_FAILED';
   readonly message: 'Control stop callback failed';
 }

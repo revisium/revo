@@ -1,7 +1,6 @@
 import {
   PROGRESS_SCHEMA_VERSION,
   ProgressOperation,
-  type ProgressCounters,
   type ProgressEvent,
 } from '../progress/index.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
@@ -47,10 +46,7 @@ export class OwnedStartupProgress implements StartupProgressFacade {
   start(phase: string) {
     return this.enqueue(() => this.operation.start(phase));
   }
-  progress(
-    phase: string,
-    details: { readonly counters?: ProgressCounters; readonly stageElapsedMs?: number } = {},
-  ) {
+  progress(phase: string, details: { readonly stageElapsedMs?: number } = {}) {
     return this.enqueue(() => this.operation.progress(phase, details));
   }
   complete(phase: string) {

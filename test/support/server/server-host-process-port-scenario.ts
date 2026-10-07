@@ -1,7 +1,7 @@
 import type { MessageOptions, SendHandle } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 
-export class FakeHostProcess extends EventEmitter {
+class FakeHostProcess extends EventEmitter {
   connected = true;
   exitCode: number | undefined = undefined;
   disconnectCalls = 0;

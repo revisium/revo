@@ -34,7 +34,7 @@ const LIFECYCLE_CODES = new Set<string>([
   'CORE_STAGE_FAILED',
 ]);
 const CORE_PHASES = new Set<string>(SERVER_LIFECYCLE_CORE_PHASES);
-export function lifecycleCodeFacts(
+function lifecycleCodeFacts(
   code: string,
   corePhase?: ServerLifecyclePhase,
 ): { readonly phase: ServerLifecyclePhase; readonly state: ServerLifecycleState } | undefined {
@@ -69,7 +69,7 @@ export function createLifecycleEvent(
   return validLifecycleEvent(event) ? event : undefined;
 }
 
-export function validLifecycleEvent(value: unknown): value is ServerLifecycleEvent {
+function validLifecycleEvent(value: unknown): value is ServerLifecycleEvent {
   const candidate = record(value) && exactKeys(value, EVENT_FIELDS) ? value : undefined;
   if (!candidate) {
     return false;

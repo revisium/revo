@@ -20,8 +20,7 @@ Generated `dist/`, coverage output, and package tarballs are never source files.
 - Revo Admin owns the static browser application; Revo TUI owns terminal UI behavior.
 - Revo composes pinned released components without copying their source or domain behavior.
 
-The foundation intentionally contains no component dependency, server, database, Docker, or
-installer implementation. Add each production capability only in its assigned change.
+Add each production capability only in its assigned change, behind the boundaries above.
 
 ## Composition contract
 

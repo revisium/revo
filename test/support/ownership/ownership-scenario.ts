@@ -67,7 +67,7 @@ function bindingFor(call: (descriptor: number, operation: number) => number): Fl
   };
 }
 
-export class OwnerProcess {
+class OwnerProcess {
   private failPending: ((error: Error) => void) | undefined;
 
   private constructor(private readonly child: ChildProcess) {}

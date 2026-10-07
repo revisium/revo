@@ -76,7 +76,7 @@ export class EmbeddedPostgresResourceService {
   }
 }
 
-export class OwnedEmbeddedPostgresResource {
+class OwnedEmbeddedPostgresResource {
   private active: Promise<StartedEmbeddedDatabase> | undefined;
   private readonly readiness = new EmbeddedPostgresReadiness();
   private closing = false;

@@ -8,7 +8,7 @@ const APPLICATION_DATABASE = 'revo' as const;
 const MAX_TIMER_MILLISECONDS = 2_147_483_647;
 const CLEANUP_RESERVE_MILLISECONDS = 100;
 
-export interface EmbeddedPostgresReadinessRequest {
+interface EmbeddedPostgresReadinessRequest {
   readonly port: number;
   readonly password: string;
   readonly startupNonce: string;

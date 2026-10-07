@@ -69,9 +69,9 @@ const ENGINE_STRICT: FixturePnpmSetting = {
   flag: 'engine-strict',
 };
 
-export type ReleaseAsset = 'package' | 'lockfile' | 'workspace';
+type ReleaseAsset = 'package' | 'lockfile' | 'workspace';
 
-export interface FixtureRelease {
+interface FixtureRelease {
   readonly channel: ReleaseChannel;
   readonly version: string;
   readonly script: string;
@@ -79,24 +79,24 @@ export interface FixtureRelease {
   assetPath(asset: ReleaseAsset): string;
 }
 
-export interface InstallResult {
+interface InstallResult {
   readonly exitCode: number | null;
   readonly stdout: string;
   readonly stderr: string;
 }
 
-export interface RunningInstall {
+interface RunningInstall {
   readonly finished: Promise<InstallResult>;
   interrupt(): void;
   kill(): void;
 }
 
-export interface InstallRace {
+interface InstallRace {
   readonly firstToFinish: Promise<InstallResult>;
   readonly lastToFinish: Promise<InstallResult>;
 }
 
-export interface HeldDependencyInstallation {
+interface HeldDependencyInstallation {
   readonly started: Promise<void>;
   release(): void;
 }
@@ -108,16 +108,16 @@ export interface MachineOptions {
   readonly brokenToolchain?: 'node' | 'pnpm';
 }
 
-export interface PackageManagerOptions {
+interface PackageManagerOptions {
   /** The install fails until `update` has refreshed the package lists, as on a fresh image. */
   readonly staleLists?: boolean;
   /** The install fails with this message, whatever the package lists hold. */
   readonly failWith?: string;
 }
 
-export type UserPnpmSettingSource = 'configuration file' | 'environment';
+type UserPnpmSettingSource = 'configuration file' | 'environment';
 
-export interface ReportedPlatform {
+interface ReportedPlatform {
   readonly system: string;
   readonly machine: string;
   readonly glibc?: string;

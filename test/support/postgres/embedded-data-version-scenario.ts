@@ -34,17 +34,17 @@ const SUPERVISOR = new URL('./embedded-postgres-supervisor.mjs', import.meta.url
 const OPERATION = 'dadadadadadadadadadadadadadadada';
 const START_TIMEOUT_MS = 60_000;
 
-export type DataVersionStart =
+type DataVersionStart =
   | { readonly kind: 'started' }
   | { readonly kind: 'rejected'; readonly reason: string; readonly message: string };
 
-export interface StoredBackup {
+interface StoredBackup {
   readonly target: string;
   readonly version: string | undefined;
   readonly files: Readonly<Record<string, string>>;
 }
 
-export interface DataWhenPostgresStarted {
+interface DataWhenPostgresStarted {
   readonly recordedVersion: string | undefined;
   readonly backupVersion: string | undefined;
 }

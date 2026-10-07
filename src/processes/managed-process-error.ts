@@ -1,4 +1,4 @@
-export type ManagedProcessErrorCode =
+type ManagedProcessErrorCode =
   | 'revo.process.cancelled'
   | 'revo.process.invalid'
   | 'revo.process.spawn'

@@ -17,7 +17,7 @@ export interface ServerHostOwnerPort {
   ownershipReleased(): Promise<void>;
 }
 
-export interface ServerHostOwnerServicePort {
+interface ServerHostOwnerServicePort {
   open(request: OpenServerOwnerRequest): Promise<'busy' | ServerHostOwnerPort>;
 }
 

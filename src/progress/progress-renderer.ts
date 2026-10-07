@@ -37,11 +37,10 @@ export class ProgressRenderer {
       this.finished = true;
       return;
     }
-    const counters = renderCounters(event);
     const stageTiming =
       event.stageElapsedMs === undefined ? '' : ` (stage ${event.stageElapsedMs}ms)`;
     const timing = ` ${event.elapsedMs}ms${stageTiming}`;
-    const line = `${event.phase}: ${event.status}${timing}${counters}`;
+    const line = `${event.phase}: ${event.status}${timing}`;
     if (this.options.isTty && (event.status === 'started' || event.status === 'progress')) {
       const padding = ' '.repeat(Math.max(0, this.lineWidth - line.length));
       this.options.stderr(`\r${line}${padding}`);
@@ -68,20 +67,4 @@ export class ProgressRenderer {
     this.lineOpen = false;
     this.lineWidth = 0;
   }
-}
-
-function renderCounters(event: ProgressEvent) {
-  const counters = event.counters;
-  if (!counters) {
-    return '';
-  }
-  const values = [
-    counters.bytesReceived === undefined ? undefined : `${counters.bytesReceived} bytes`,
-    counters.bytesTotal === undefined ? undefined : `of ${counters.bytesTotal}`,
-    counters.pnpmResolved === undefined ? undefined : `resolved ${counters.pnpmResolved}`,
-    counters.pnpmReused === undefined ? undefined : `reused ${counters.pnpmReused}`,
-    counters.pnpmDownloaded === undefined ? undefined : `downloaded ${counters.pnpmDownloaded}`,
-    counters.pnpmAdded === undefined ? undefined : `added ${counters.pnpmAdded}`,
-  ].filter((value): value is string => value !== undefined);
-  return values.length ? ` (${values.join(', ')})` : '';
 }

@@ -9,7 +9,7 @@ import { protectDatabaseUrl } from '../server-logs/log-redaction.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import type { CoreHostStartMessage } from './core-child-protocol.js';
 
-export interface StartedCoreRuntime {
+interface StartedCoreRuntime {
   readonly runtime: RevoCoreRuntime;
   readonly listening: { readonly host: string; readonly port: number; readonly url: string };
 }

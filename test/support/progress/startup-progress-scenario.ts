@@ -187,9 +187,9 @@ export class StartupProgressScenario {
     let now = 0;
     const operation = new ProgressOperation({ operationId: FIRST, now: () => now });
     now = 10;
-    const first = operation.start('runtime-download');
+    const first = operation.start('postgres-binary-prepare');
     now = 20;
-    const second = operation.complete('runtime-download');
+    const second = operation.complete('postgres-binary-prepare');
     if (!first || !second) {
       throw new Error('fixture did not emit');
     }
@@ -280,10 +280,10 @@ export class StartupProgressScenario {
     if (held.kind !== 'held' || !held.progress) {
       return undefined;
     }
-    const accepted = held.progress.start('runtime-extract');
+    const accepted = held.progress.start('postgres-initialization');
     await journal.entered;
     const closing = held.close();
-    const late = await Promise.allSettled([held.progress.progress('runtime-extract')]);
+    const late = await Promise.allSettled([held.progress.progress('postgres-initialization')]);
     const busy = await new PublishedControlService().open(fixture);
     journal.release();
     await Promise.all([accepted, closing]);

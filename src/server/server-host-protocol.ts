@@ -6,7 +6,7 @@ import type { ServerOwnerConfiguration } from './server-owner.service.js';
 
 export const SERVER_HOST_PROTOCOL = 'revo-server-host/v1' as const;
 
-export type ServerHostMode = 'detached' | 'foreground';
+type ServerHostMode = 'detached' | 'foreground';
 
 export interface ServerHostStartMessage {
   readonly protocol: typeof SERVER_HOST_PROTOCOL;
@@ -17,13 +17,13 @@ export interface ServerHostStartMessage {
   readonly environment: Readonly<Record<string, string>>;
 }
 
-export interface ServerHostCommitMessage {
+interface ServerHostCommitMessage {
   readonly protocol: typeof SERVER_HOST_PROTOCOL;
   readonly type: 'commit';
   readonly operationId: string;
 }
 
-export interface ServerHostCancelMessage {
+interface ServerHostCancelMessage {
   readonly protocol: typeof SERVER_HOST_PROTOCOL;
   readonly type: 'cancel';
   readonly operationId: string;

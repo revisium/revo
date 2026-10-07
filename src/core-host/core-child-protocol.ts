@@ -1,19 +1,19 @@
 export const CORE_HOST_PROTOCOL = 'revo-core-host/v1' as const;
 
-export type CoreHostLifecycleStage =
+type CoreHostLifecycleStage =
   | 'application-database-migrations'
   | 'dbos-system-migrations'
   | 'application-bootstrap'
   | 'api-readiness';
 
-export type CoreHostStageStatus = 'started' | 'completed' | 'failed';
+type CoreHostStageStatus = 'started' | 'completed' | 'failed';
 
-export interface CoreHostHelloMessage {
+interface CoreHostHelloMessage {
   readonly protocol: typeof CORE_HOST_PROTOCOL;
   readonly type: 'hello';
 }
 
-export interface CoreHostBootedMessage {
+interface CoreHostBootedMessage {
   readonly protocol: typeof CORE_HOST_PROTOCOL;
   readonly type: 'booted';
 }
@@ -28,7 +28,7 @@ export interface CoreHostStartMessage {
   readonly port: number;
 }
 
-export interface CoreHostShutdownMessage {
+interface CoreHostShutdownMessage {
   readonly protocol: typeof CORE_HOST_PROTOCOL;
   readonly type: 'shutdown';
 }

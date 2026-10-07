@@ -1,21 +1,12 @@
 import {
   PROGRESS_SCHEMA_VERSION,
-  type ProgressCounters,
   type ProgressEvent,
   type ProgressStatus,
 } from './progress-event.js';
 
 const OPERATION_ID = /^[0-9a-f]{32}$/u;
 const PHASE = /^[a-z][a-z0-9-]{0,63}$/u;
-const COUNTERS = [
-  'bytesReceived',
-  'bytesTotal',
-  'pnpmResolved',
-  'pnpmReused',
-  'pnpmDownloaded',
-  'pnpmAdded',
-] as const;
-const OPTIONAL = ['counters', 'stageElapsedMs', 'code', 'logPath', 'url', 'reused'] as const;
+const OPTIONAL = ['stageElapsedMs', 'code', 'logPath', 'url', 'reused'] as const;
 const BASE = ['schemaVersion', 'operationId', 'sequence', 'phase', 'status', 'elapsedMs'] as const;
 const CODE = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -45,10 +36,6 @@ export function parseProgressEvent(value: unknown): ProgressEvent | undefined {
   ) {
     return undefined;
   }
-  const counters = parseCounters(value.counters);
-  if (value.counters !== undefined && !counters) {
-    return undefined;
-  }
   if (value.stageElapsedMs !== undefined && !nonnegative(value.stageElapsedMs)) {
     return undefined;
   }
@@ -62,7 +49,6 @@ export function parseProgressEvent(value: unknown): ProgressEvent | undefined {
     phase: value.phase,
     status: value.status,
     elapsedMs: value.elapsedMs,
-    ...(counters ? { counters } : {}),
     ...(typeof value.stageElapsedMs === 'number' ? { stageElapsedMs: value.stageElapsedMs } : {}),
     ...(typeof value.code === 'string' ? { code: value.code } : {}),
     ...(typeof value.logPath === 'string' ? { logPath: value.logPath } : {}),
@@ -71,20 +57,6 @@ export function parseProgressEvent(value: unknown): ProgressEvent | undefined {
   };
 }
 
-function parseCounters(value: unknown): ProgressCounters | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (!record(value) || !exactKnown(value, COUNTERS) || Object.keys(value).length === 0) {
-    return undefined;
-  }
-  if (
-    !Object.values(value).every((counter) => nonnegative(counter) && Number.isSafeInteger(counter))
-  ) {
-    return undefined;
-  }
-  return Object.freeze({ ...value });
-}
 function validShape(value: Record<string, unknown>): boolean {
   if (value.status === 'progress') {
     return (
@@ -96,7 +68,6 @@ function validShape(value: Record<string, unknown>): boolean {
   }
   if (value.status === 'completed') {
     return (
-      value.counters === undefined &&
       value.code === undefined &&
       value.logPath === undefined &&
       value.url === undefined &&
@@ -109,7 +80,6 @@ function validShape(value: Record<string, unknown>): boolean {
       CODE.test(value.code) &&
       (value.logPath === undefined ||
         (typeof value.logPath === 'string' && safeText(value.logPath))) &&
-      value.counters === undefined &&
       value.stageElapsedMs === undefined &&
       value.url === undefined &&
       value.reused === undefined
@@ -119,7 +89,6 @@ function validShape(value: Record<string, unknown>): boolean {
     return (
       value.phase === 'server-start' &&
       validOrigin(value.url) &&
-      value.counters === undefined &&
       value.stageElapsedMs === undefined &&
       value.code === undefined &&
       value.logPath === undefined &&

@@ -16,7 +16,7 @@ import type {
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 
 export const PROCESS_IDENTITY_PLATFORM = Symbol('PROCESS_IDENTITY_PLATFORM');
-export type IdentityPlatform = 'linux' | 'darwin' | 'unsupported';
+type IdentityPlatform = 'linux' | 'darwin' | 'unsupported';
 
 export class ProcessIdentityError extends Error {
   readonly code = 'PROCESS_IDENTITY_UNAVAILABLE';

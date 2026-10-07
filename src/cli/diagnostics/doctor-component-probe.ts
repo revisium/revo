@@ -7,8 +7,8 @@ import { resolveAdminClientDirectory } from '../../admin/admin-spa.js';
 import type { RevoConfiguration } from '../../configuration/configuration.types.js';
 import { loadEmbeddedPostgresBinaries } from '../../postgres/embedded-postgres-binaries.js';
 
-export type DoctorAvailability = 'available' | 'unavailable';
-export type DoctorPostgresAvailability = DoctorAvailability | 'external';
+type DoctorAvailability = 'available' | 'unavailable';
+type DoctorPostgresAvailability = DoctorAvailability | 'external';
 
 export interface DoctorComponents {
   readonly core: DoctorAvailability;
@@ -16,7 +16,7 @@ export interface DoctorComponents {
   readonly postgres: DoctorPostgresAvailability;
 }
 
-export interface DoctorComponentProbeDependencies {
+interface DoctorComponentProbeDependencies {
   readonly loadCoreRuntime?: () => Promise<unknown>;
   readonly resolveAdminDirectory?: () => Promise<string>;
   readonly loadPostgresBinaries?: () => Promise<Readonly<{ initdb: string; postgres: string }>>;

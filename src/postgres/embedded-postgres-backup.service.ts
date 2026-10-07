@@ -30,14 +30,14 @@ const BATCH = 32;
 const BLOCK_BYTES = 512;
 const MIB = 1024 * 1024;
 
-export interface DatabaseBackupRequest {
+interface DatabaseBackupRequest {
   readonly dataDir: string;
   readonly clusterDir: string;
   readonly dataVersionFile: string;
   readonly signal: AbortSignal;
 }
 
-export interface SavedDatabaseBackup {
+interface SavedDatabaseBackup {
   readonly path: string;
   readonly bytes: number;
   readonly elapsedMs: number;

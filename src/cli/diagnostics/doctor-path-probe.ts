@@ -2,7 +2,7 @@ import { lstat } from 'node:fs/promises';
 
 import { Injectable } from '@nestjs/common';
 
-export type DoctorPathStatus = 'missing' | 'private' | 'unavailable';
+type DoctorPathStatus = 'missing' | 'private' | 'unavailable';
 
 export interface DoctorPaths {
   readonly data: DoctorPathStatus;

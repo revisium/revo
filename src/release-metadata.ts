@@ -5,7 +5,7 @@ const SEMVER_PATTERN = new RegExp(
   String.raw`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(${SEMVER_IDENTIFIER}(?:\.${SEMVER_IDENTIFIER})*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`,
 );
 
-export interface ReleaseMetadata {
+interface ReleaseMetadata {
   channel: ReleaseChannel;
   npm: {
     distTag: 'latest' | 'alpha';

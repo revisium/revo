@@ -1,11 +1,11 @@
-export interface LinuxProcessIdentity {
+interface LinuxProcessIdentity {
   readonly platform: 'linux';
   readonly pid: number;
   readonly uid: number;
   readonly birth: { readonly bootId: string; readonly startTicks: string };
 }
 
-export interface DarwinProcessIdentity {
+interface DarwinProcessIdentity {
   readonly platform: 'darwin';
   readonly pid: number;
   readonly uid: number;
@@ -31,7 +31,7 @@ export type IdentityObservation =
       { readonly kind: 'confirmed' } | { readonly kind: 'mismatch' }
     >;
 
-export interface DirectoryIdentity {
+interface DirectoryIdentity {
   readonly device: bigint;
   readonly inode: bigint;
 }

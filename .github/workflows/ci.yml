@@ -45,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build process services
+      - name: Build
         run: |
           node -p "'process platform=' + process.platform + ' arch=' + process.arch"
           pnpm build

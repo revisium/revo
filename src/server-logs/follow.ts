@@ -1,4 +1,4 @@
-export interface FollowOptions<T extends { readonly cursor: number }> {
+interface FollowOptions<T extends { readonly cursor: number }> {
   readonly read: (afterSequence: number) => Promise<T>;
   readonly wait: (signal: AbortSignal) => Promise<void>;
   readonly signal: AbortSignal;

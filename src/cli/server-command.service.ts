@@ -43,7 +43,7 @@ const STOPPABLE: ReadonlySet<ServerStatus['kind']> = new Set([
   'failed',
 ]);
 
-export interface ServerStartFlags extends ConfigurationFlags {
+interface ServerStartFlags extends ConfigurationFlags {
   readonly progress?: string;
 }
 

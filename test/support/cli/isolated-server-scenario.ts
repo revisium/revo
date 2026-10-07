@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 
 import { BUILT_CLI, CliScenario, isolatedEnvironment, type CliResult } from './cli-scenario.js';
 
-export type CliExit = Pick<CliResult, 'exitCode' | 'signal'>;
+type CliExit = Pick<CliResult, 'exitCode' | 'signal'>;
 
 const START_MILLISECONDS = 120_000;
 

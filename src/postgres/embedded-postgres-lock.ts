@@ -17,7 +17,7 @@ const MAX_STOP_SECONDS = 60;
 const STOP_CANCEL_GRACE_MS = 1000;
 const STOP_CANCEL_KILL_WAIT_MS = 5000;
 
-export interface ReleaseClusterLockRequest {
+interface ReleaseClusterLockRequest {
   readonly clusterDir: string;
   readonly pgCtl: string;
   readonly log: EmbeddedPostgresLog;

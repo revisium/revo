@@ -6,7 +6,7 @@ import { EmbeddedPostgresError } from './embedded-postgres.types.js';
 
 const DIAGNOSTIC_BYTES = 16 * 1024;
 
-export interface PostgresLogOutput {
+interface PostgresLogOutput {
   readonly descriptor: number;
   readonly offset: number;
 }

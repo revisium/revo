@@ -17,7 +17,7 @@ const restoreRemedy =
 const logger = new RevoConsoleLogger('EmbeddedPostgres');
 
 /** Data this Revo may open: its own, an earlier version's, or data without a recorded version. */
-export type AdmittedData =
+type AdmittedData =
   | { readonly kind: 'current' }
   | { readonly kind: 'earlier'; readonly version: string }
   | { readonly kind: 'unrecorded' };

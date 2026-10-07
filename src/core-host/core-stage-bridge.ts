@@ -2,7 +2,7 @@ import type { RevoCoreLifecycleEvent } from '@revisium/revo-core/runtime';
 
 import { CORE_HOST_PROTOCOL, type CoreHostStageMessage } from './core-child-protocol.js';
 
-export type CoreStageSender = (message: CoreHostStageMessage) => Promise<void>;
+type CoreStageSender = (message: CoreHostStageMessage) => Promise<void>;
 
 export class CoreStageBridge {
   private queue = Promise.resolve();

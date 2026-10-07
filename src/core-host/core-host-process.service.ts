@@ -19,27 +19,27 @@ const CLEANUP_MILLISECONDS = 3_000;
 const GRACE_MILLISECONDS = 500;
 const SEND_MILLISECONDS = 250;
 
-export interface CoreHostProcessBinding {
+interface CoreHostProcessBinding {
   readonly cwd: string;
   readonly entry: string;
   readonly env: Readonly<Record<string, string>>;
   readonly executable: string;
 }
 
-export interface CoreHostOutput {
+interface CoreHostOutput {
   readonly stdout: Writable;
   readonly stderr: Writable;
 }
 
-export const CORE_HOST_OUTPUT = Symbol('CORE_HOST_OUTPUT');
+const CORE_HOST_OUTPUT = Symbol('CORE_HOST_OUTPUT');
 
-export interface CoreHostStartOptions {
+interface CoreHostStartOptions {
   readonly deadline: number;
   readonly onStage: (message: CoreHostStageMessage) => Promise<void>;
   readonly signal: AbortSignal;
 }
 
-export type CoreHostCompletionState =
+type CoreHostCompletionState =
   | { readonly kind: 'not-spawned' }
   | { readonly kind: 'exited'; readonly completion: ProcessCompletion };
 

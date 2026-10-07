@@ -1,4 +1,4 @@
-export type ConfigurationErrorCode = 'revo.configuration.file' | 'revo.configuration.invalid';
+type ConfigurationErrorCode = 'revo.configuration.file' | 'revo.configuration.invalid';
 
 export class ConfigurationError extends Error {
   readonly code: ConfigurationErrorCode;

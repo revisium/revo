@@ -5,7 +5,7 @@ import { basename, dirname, join } from 'node:path';
 import type { ServerLifecycleConfiguration } from './server-lifecycle.types.js';
 import { ensurePrivateLogDirectory, serverLogDirectory } from './store.service.js';
 
-export const SERVER_LOG_FILE = 'server.log';
+const SERVER_LOG_FILE = 'server.log';
 export const SERVER_LOG_TAIL_LINES = 40;
 
 const ATTEMPT_MARKER = '--- Revo server start';
@@ -28,7 +28,7 @@ export interface OpenedServerLog {
   readonly handle: FileHandle;
 }
 
-export interface ServerLogTail {
+interface ServerLogTail {
   readonly path: string;
   readonly lines: readonly string[];
 }

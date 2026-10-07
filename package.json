@@ -17,14 +17,6 @@
     "dist/"
   ],
   "type": "module",
-  "exports": {
-    "./configuration": "./dist/configuration/index.js",
-    "./layout": "./dist/layout.js",
-    "./postgres": "./dist/postgres/index.js",
-    "./processes": "./dist/processes/index.js",
-    "./startup-progress": "./dist/startup-progress/index.js",
-    "./release-metadata": "./dist/release-metadata.js"
-  },
   "scripts": {
     "build": "tsc -b --clean tsconfig.build.json && tsc -p tsconfig.build.json",
     "format": "oxfmt --write .",
@@ -57,7 +49,6 @@
     "oxfmt": "0.62.0",
     "oxlint": "1.77.0",
     "oxlint-tsgolint": "7.0.2001",
-    "rolldown": "1.2.8",
     "typescript": "7.0.2",
     "unplugin-swc": "1.5.10",
     "vitest": "4.1.10"

@@ -135,7 +135,7 @@ export class ServerLaunchAttemptScenario {
   }
 }
 
-export class ControlledAttemptProcess implements AttemptProcessPort {
+class ControlledAttemptProcess implements AttemptProcessPort {
   readonly sent: ServerHostParentMessage[] = [];
   stopCalls = 0;
   detachCommittedCalls = 0;

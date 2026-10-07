@@ -12,7 +12,7 @@ export const validPid = (pid: unknown): pid is number =>
   Number.isInteger(pid) && Number(pid) >= 1 && Number(pid) <= 2_147_483_647;
 export const validUid = (uid: unknown): uid is number =>
   Number.isInteger(uid) && Number(uid) >= 0 && Number(uid) <= 4_294_967_295;
-export const validUint64 = (value: unknown): value is string => {
+const validUint64 = (value: unknown): value is string => {
   if (typeof value !== 'string' || !DECIMAL.test(value)) {
     return false;
   }
@@ -51,7 +51,7 @@ export function parseIdentity(value: unknown): ProcessIdentity | undefined {
   return undefined;
 }
 
-export interface LinuxStat {
+interface LinuxStat {
   readonly pid: number;
   readonly state: string;
   readonly startTicks: string;

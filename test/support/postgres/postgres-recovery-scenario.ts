@@ -31,25 +31,25 @@ import { ProcessIdentityService } from '../../../src/processes/process-identity.
 import { PublishedControlService } from '../../../src/processes/published-control.service.js';
 import { ClusterFixture } from './postgres-readiness-scenario.js';
 
-export type InitializationInterruption = 'before-initdb' | 'inside-initdb' | 'after-initdb';
+type InitializationInterruption = 'before-initdb' | 'inside-initdb' | 'after-initdb';
 
-export interface Supervisor {
+interface Supervisor {
   readonly port: number;
   readonly postmasterPid: number;
   kill(): Promise<void>;
 }
 
-export interface Bystander {
+interface Bystander {
   readonly pid: number;
   receivedSignals(): Promise<readonly string[]>;
 }
 
-export interface OrphanedInitialization {
+interface OrphanedInitialization {
   resume(): void;
   exited(): Promise<void>;
 }
 
-export type StartOutcome =
+type StartOutcome =
   | { readonly kind: 'started'; readonly port: number }
   | { readonly kind: 'rejected'; readonly reason: string; readonly message: string };
 

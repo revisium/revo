@@ -1,4 +1,4 @@
-import type { ProgressCounters, ProgressEvent } from '../progress/index.js';
+import type { ProgressEvent } from '../progress/index.js';
 
 export const STARTUP_PROGRESS_FILE = '.revo-progress.json';
 export const STARTUP_PROGRESS_SCHEMA_VERSION = 'revo-startup-progress/v1' as const;
@@ -33,10 +33,7 @@ export type StartupProgressRead =
 
 export interface StartupProgressFacade {
   start(phase: string): Promise<ProgressEvent>;
-  progress(
-    phase: string,
-    details?: { readonly counters?: ProgressCounters; readonly stageElapsedMs?: number },
-  ): Promise<ProgressEvent>;
+  progress(phase: string, details?: { readonly stageElapsedMs?: number }): Promise<ProgressEvent>;
   complete(phase: string): Promise<ProgressEvent>;
   fail(
     phase: string,

@@ -2,12 +2,12 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { ConfigurationResolver } from '../../../src/configuration/configuration-resolver.js';
 import type {
   ConfigurationFile,
   ConfigurationFlags,
   RevoConfiguration,
 } from '../../../src/configuration/configuration.types.js';
-import { ConfigurationResolver } from '../../../src/configuration/index.js';
 
 export class ConfigurationScenario {
   private env: Record<string, string | undefined> = {};

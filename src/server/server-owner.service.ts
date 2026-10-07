@@ -60,9 +60,9 @@ export interface OpenServerOwnerRequest {
   readonly now?: () => number;
 }
 
-export type OpenServerOwnerResult = { readonly kind: 'busy' } | ServerOwnerResource;
+type OpenServerOwnerResult = { readonly kind: 'busy' } | ServerOwnerResource;
 
-export interface ServerOwnerReady {
+interface ServerOwnerReady {
   readonly kind: 'ready';
   readonly url: string;
 }

@@ -6,8 +6,8 @@ import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import { ControlTransportError, controlEndpointByteLimit } from './control-protocol.js';
 
 export const CONTROL_SOCKET_ROOT = Symbol('CONTROL_SOCKET_ROOT');
-export const DEFAULT_CONTROL_SOCKET_ROOT = '/tmp';
-export const CONTROL_SOCKET_ROOT_VARIABLE = 'REVO_CONTROL_SOCKET_ROOT';
+const DEFAULT_CONTROL_SOCKET_ROOT = '/tmp';
+const CONTROL_SOCKET_ROOT_VARIABLE = 'REVO_CONTROL_SOCKET_ROOT';
 
 /** The socket root of this process: the override when set, otherwise `/tmp`. */
 export function controlSocketRoot(env: NodeJS.ProcessEnv = process.env): string {
@@ -21,7 +21,7 @@ export function controlSocketRoot(env: NodeJS.ProcessEnv = process.env): string 
   return override;
 }
 
-export interface ControlEndpointScope {
+interface ControlEndpointScope {
   readonly runtimeDir: string;
   readonly instanceId: string;
   readonly channel: string;

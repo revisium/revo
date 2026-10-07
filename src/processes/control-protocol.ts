@@ -11,8 +11,8 @@ const exact = (value: Record<string, unknown>, keys: string[]) =>
   Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 
-export type ControlAction = 'probe' | 'status' | 'stop' | 'stop-and-wait';
-export interface ControlRequest {
+type ControlAction = 'probe' | 'status' | 'stop' | 'stop-and-wait';
+interface ControlRequest {
   readonly schemaVersion: 1;
   readonly instanceId: string;
   readonly token: string;
@@ -67,7 +67,7 @@ export function controlEndpointByteLimit(): number {
   return process.platform === 'darwin' ? 103 : 107;
 }
 
-export function validEndpointPath(endpoint: string): boolean {
+function validEndpointPath(endpoint: string): boolean {
   return (
     isAbsolute(endpoint) &&
     !endpoint.includes('\0') &&

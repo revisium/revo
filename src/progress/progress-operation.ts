@@ -1,8 +1,4 @@
-import {
-  PROGRESS_SCHEMA_VERSION,
-  type ProgressCounters,
-  type ProgressEvent,
-} from './progress-event.js';
+import { PROGRESS_SCHEMA_VERSION, type ProgressEvent } from './progress-event.js';
 import { parseProgressEvent } from './progress-event.parser.js';
 
 export class ProgressOperation {
@@ -22,10 +18,7 @@ export class ProgressOperation {
   start(phase: string) {
     return this.emit(phase, 'started', {});
   }
-  progress(
-    phase: string,
-    details: { readonly counters?: ProgressCounters; readonly stageElapsedMs?: number } = {},
-  ) {
+  progress(phase: string, details: { readonly stageElapsedMs?: number } = {}) {
     return this.emit(phase, 'progress', details);
   }
   complete(phase: string) {
@@ -87,10 +80,7 @@ export class ProgressOperation {
     } else if (stageElapsedMs !== undefined) {
       this.phaseElapsed.set(phase, stageElapsedMs);
     }
-    const event = Object.freeze({
-      ...parsed,
-      ...(parsed.counters ? { counters: Object.freeze({ ...parsed.counters }) } : {}),
-    });
+    const event = Object.freeze({ ...parsed });
     if (status === 'progress' || status === 'started') {
       this.history.splice(
         0,
