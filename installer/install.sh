@@ -171,6 +171,11 @@ run_as_admin() {
   if [ -n "$sudo_prefix" ]; then sudo "$@"; else "$@"; fi
 }
 
+# apt retries each download, so a mirror that drops one connection does not fail the whole install.
+run_apt() {
+  run_as_admin env LC_ALL=C LANG=C apt-get -o Acquire::Retries=3 "$@" 2>&1
+}
+
 # shellcheck disable=SC2086 # install_args holds several words.
 install_libraries() {
   if [ "$manager" != apt-get ]; then
@@ -178,15 +183,12 @@ install_libraries() {
     fail "\`$command_text\` failed; fix that and run the installer again."
   fi
   # The messages are matched below, so apt must speak English whatever the user's locale is.
-  output=$(run_as_admin env LC_ALL=C LANG=C "$manager" $install_args 2>&1) && return
-  # Refresh the lists only when that is the failure: a fresh apt image has none.
+  output=$(run_apt $install_args) && return
+  # Refresh the lists when they are the failure (a fresh apt image has none) or a mirror dropped a download.
   case "$output" in
-    *'Unable to locate package'* | *'has no installation candidate'*)
+    *'Unable to locate package'* | *'has no installation candidate'* | *'Unable to fetch some archives'* | *'Failed to fetch'*)
       say 'Refreshing the package lists...'
-      output=$(
-        run_as_admin env LC_ALL=C LANG=C apt-get update 2>&1 &&
-          run_as_admin env LC_ALL=C LANG=C "$manager" $install_args 2>&1
-      ) && return
+      output=$(run_apt update && run_apt $install_args) && return
       printf '%s\n' "$output" >&2
       ;;
     *) printf '%s\n' "$output" >&2 ;;
