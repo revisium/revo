@@ -454,14 +454,20 @@ print_next_step() {
       say "Until then, run $command_link"
       ;;
   esac
-  has_terminal || say "Run \`$command_name\` to start Revo."
+  starts_command || say "Run \`$command_name\` to start Revo."
+}
+
+# REVO_INSTALL_NO_START=1 keeps the installer to printing the command even at a terminal, for
+# `docker run -t` and provisioning scripts.
+starts_command() {
+  [ "${REVO_INSTALL_NO_START:-}" != 1 ] && has_terminal
 }
 
 # With a terminal the installed command starts right away; the installer has no Revo logic of its
 # own. Without one (CI, scripts) it only printed the command above. The lock is released first because
 # exec skips the EXIT trap.
 start_command() {
-  has_terminal || return 0
+  starts_command || return 0
   say "Starting \`$command_name\`..."
   cleanup
   lock_held=0 takeover_held=0

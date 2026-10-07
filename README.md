@@ -26,7 +26,8 @@ curl -fsSL https://revisium.github.io/revo/install-alpha.sh | sh
 The alpha channel's command is `revo-alpha`; the stable channel will use `revo`. When the install
 runs in a terminal, the installer finishes by starting `revo-alpha`, which opens the terminal
 interface. Without a terminal (CI, scripts) it only prints the command to run. The installer itself
-contains no Revo logic; it only runs the installed command.
+contains no Revo logic; it only runs the installed command, replacing itself with it, so with a
+terminal the installer's exit status is the started command's.
 
 Supported platforms are Linux x64 and arm64 with glibc 2.35 or newer (for example Ubuntu 22.04 or
 newer), and macOS 15 or newer on Apple Silicon or Intel. Preinstalled Node.js, pnpm, or PostgreSQL
@@ -47,6 +48,9 @@ answer `n` and nothing changes. Run as root, it installs the library without ask
 terminal, for example in CI, it prints the command and stops unless you run it with
 `REVO_INSTALL_SYSTEM_DEPS=1`, which lets it install the library as root or with `sudo`. Without
 root, `sudo`, or a known package manager it names the library and the package to install by hand.
+
+Set `REVO_INSTALL_NO_START=1` to make the installer only print the command even at a terminal, for
+example under `docker run -t` or in provisioning scripts.
 
 The installer creates `~/.local/bin/revo-alpha`. If `~/.local/bin` is not on your `PATH`, it prints
 the line to add to your shell profile; it never edits shell profiles itself:

@@ -295,8 +295,8 @@ describe('server command presentation', () => {
 
     expect(result).toMatchObject({
       exitCode: 0,
-      stdout: 'Server is already running.\n',
-      stderr: `Revo 2.0.0 is installed, but the running server is 1.0.0. Run '${command} server stop', then '${command}' to start 2.0.0.\n`,
+      stdout: `Revo 1.0.0 is running; restart it to use 2.0.0: \`${command} server stop\`, then \`${command}\`.\n`,
+      stderr: '',
     });
   });
 
@@ -340,7 +340,7 @@ describe('server command presentation', () => {
     await expect(service.ensureRunning({ channel: 'alpha' })).resolves.toBe(stale);
 
     expect(written).toEqual([
-      "Revo 2.0.0 is installed, but the running server is 1.0.0. Run 'revo-alpha server stop', then 'revo-alpha' to start 2.0.0.",
+      'Revo 1.0.0 is running; restart it to use 2.0.0: `revo-alpha server stop`, then `revo-alpha`.',
     ]);
   });
 

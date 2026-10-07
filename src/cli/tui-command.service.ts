@@ -11,6 +11,7 @@ import { OutputService } from './output.service.js';
 import { PackageMetadataService } from './package-metadata.service.js';
 import { ServerCommandService } from './server-command.service.js';
 import { serverPublicOrigin } from './server-public-origin.js';
+import { staleServerNotice } from './stale-server-notice.js';
 
 export const TUI_LAUNCHER = Symbol('TUI_LAUNCHER');
 export const TUI_TERMINAL = Symbol('TUI_TERMINAL');
@@ -67,9 +68,12 @@ export class TuiCommandService {
     if (exitCode !== 0) {
       throw new CliExitCodeError(exitCode);
     }
-    this.output.write(
-      `Revo keeps running at ${origin}; stop it with \`${channelCommand(configuration.channel)} server stop\`.`,
-    );
+    const command = channelCommand(configuration.channel);
+    this.output.write(`Revo keeps running at ${origin}; stop it with \`${command} server stop\`.`);
+    const notice = staleServerNotice(outcome, this.metadata.version, command);
+    if (notice !== undefined) {
+      this.output.write(notice);
+    }
   }
 
   private command(flags: Readonly<ConfigurationFlags>): string {

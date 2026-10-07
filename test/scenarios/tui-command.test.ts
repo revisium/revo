@@ -47,6 +47,32 @@ describe('revo tui command', () => {
     ]);
   });
 
+  it('opens the TUI on a stale server and prints the restart line after the hint', async () => {
+    const result = await run([], {
+      outcome: {
+        kind: 'running',
+        status: { phase: 'running', publicUrl: 'http://127.0.0.1:3210', version: '0.9.0' },
+      },
+    });
+
+    expect(result.events).toEqual(['ensure', 'launch']);
+    expect(result.stdout).toBe(
+      'Revo keeps running at http://127.0.0.1:3210; stop it with `revo server stop`.\n' +
+        'Revo 0.9.0 is running; restart it to use 1.0.0: `revo server stop`, then `revo`.\n',
+    );
+  });
+
+  it('prints no restart line when the running server has the installed version', async () => {
+    const result = await run([], {
+      outcome: {
+        kind: 'running',
+        status: { phase: 'running', publicUrl: 'http://127.0.0.1:3210', version: '1.0.0' },
+      },
+    });
+
+    expect(result.stdout).not.toContain('restart it');
+  });
+
   it('reuses the advertised URL of a running server', async () => {
     const result = await run([], {
       outcome: {
