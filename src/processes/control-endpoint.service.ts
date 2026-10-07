@@ -289,13 +289,12 @@ class ControlEndpointSession {
   }
 
   private drain(): Promise<void> {
-    return (this.drainPromise ??= closeEndpoint(this.server, this.sockets, this.responder).then(
-      () => {
-        if (!this.stopAccepted) {
-          this.stop.resolve({ kind: 'not-requested' });
-        }
-      },
-    ));
+    this.drainPromise ??= closeEndpoint(this.server, this.sockets, this.responder).then(() => {
+      if (!this.stopAccepted) {
+        this.stop.resolve({ kind: 'not-requested' });
+      }
+    });
+    return this.drainPromise;
   }
 }
 
