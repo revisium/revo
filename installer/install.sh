@@ -449,9 +449,30 @@ print_next_step() {
   path_line='export PATH="$HOME/.local/bin:$PATH"'
   case ":$PATH:" in
     *":$bin_dir:"*) ;;
-    *) say "Your PATH does not include ~/.local/bin; add this line to your shell profile: $path_line" ;;
+    *)
+      say "Your PATH does not include ~/.local/bin; add this line to your shell profile: $path_line"
+      say "Until then, run $command_link"
+      ;;
   esac
-  say "Run \`$command_name\` to start Revo."
+  starts_command || say "Run \`$command_name\` to start Revo."
+}
+
+# REVO_INSTALL_NO_START=1 keeps the installer to printing the command even at a terminal, for
+# `docker run -t` and provisioning scripts.
+starts_command() {
+  [ "${REVO_INSTALL_NO_START:-}" != 1 ] && has_terminal
+}
+
+# With a terminal the installed command starts right away; the installer has no Revo logic of its
+# own. Without one (CI, scripts) it only printed the command above. The lock is released first because
+# exec skips the EXIT trap.
+start_command() {
+  starts_command || return 0
+  say "Starting \`$command_name\`..."
+  cleanup
+  lock_held=0 takeover_held=0
+  # shellcheck disable=SC2094 # The terminal is one device for input and output.
+  exec "$command_link" <"$terminal" >>"$terminal" 2>>"$terminal"
 }
 
 main() {
@@ -480,6 +501,7 @@ main() {
     report_installed
   fi
   print_next_step
+  start_command
 }
 
 main "$@"

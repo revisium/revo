@@ -22,6 +22,7 @@ import { CliUsageError } from './cli-error.js';
 import { OutputService } from './output.service.js';
 import { PackageMetadataService } from './package-metadata.service.js';
 import { startNotPerformed } from './server-public-origin.js';
+import { staleServerNotice } from './stale-server-notice.js';
 
 const DIAGNOSTICS: Readonly<Record<string, string>> = {
   START_BUSY: 'Server start is busy.',
@@ -70,7 +71,8 @@ export class ServerCommandService {
       throw new CliUsageError('Startup progress format must be jsonl.');
     }
     if (progress === undefined) {
-      this.presentStartOutcome(await this.ensureRunning(configuration));
+      const input = this.input(configuration);
+      this.presentStartOutcome(await this.launch(input), input);
       return;
     }
     const output = this.output.progress();
@@ -96,19 +98,10 @@ export class ServerCommandService {
     outcome: ServerLaunchResult,
     input: Readonly<ConfigurationInput>,
   ): void {
-    if (outcome.kind !== 'running') {
-      return;
+    const notice = this.staleNotice(outcome, input);
+    if (notice !== undefined) {
+      this.output.writeError(notice);
     }
-    const running = outcome.status.version;
-    const installed = this.metadata.version;
-    if (running === undefined || running === installed) {
-      return;
-    }
-    const command = channelCommand(selectChannel(input));
-    this.output.writeError(
-      `Revo ${installed} is installed, but the running server is ${running}. ` +
-        `Run '${command} server stop', then '${command}' to start ${installed}.`,
-    );
   }
 
   async ensureRunningWithConfiguration(
@@ -120,11 +113,22 @@ export class ServerCommandService {
     );
   }
 
-  private presentStartOutcome(outcome: ServerLaunchResult): void {
+  private staleNotice(
+    outcome: ServerLaunchResult,
+    input: Readonly<ConfigurationInput>,
+  ): string | undefined {
+    return staleServerNotice(outcome, this.metadata.version, channelCommand(selectChannel(input)));
+  }
+
+  private presentStartOutcome(
+    outcome: ServerLaunchResult,
+    input?: Readonly<ConfigurationInput>,
+  ): void {
     if (outcome.kind === 'started') {
       this.output.write(`Server started at ${outcome.url}.`);
     } else if (outcome.kind === 'running') {
-      this.output.write('Server is already running.');
+      const notice = input === undefined ? undefined : this.staleNotice(outcome, input);
+      this.output.write(notice ?? 'Server is already running.');
     } else {
       throw startNotPerformed(outcome);
     }

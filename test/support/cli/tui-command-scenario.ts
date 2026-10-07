@@ -6,6 +6,7 @@ import { CommandFactory } from 'nest-commander';
 
 import { cliFailure } from '../../../src/cli/cli-error.js';
 import { TuiCommand } from '../../../src/cli/commands/tui.command.js';
+import { OutputService } from '../../../src/cli/output.service.js';
 import { PackageMetadataService } from '../../../src/cli/package-metadata.service.js';
 import { ServerCommandService } from '../../../src/cli/server-command.service.js';
 import {
@@ -98,6 +99,7 @@ export class TuiCommandScenario {
         TuiCommand,
         TuiCommandService,
         { provide: ServerCommandService, useValue: server },
+        { provide: OutputService, useValue: { write: (text: string) => stdout.push(`${text}\n`) } },
         { provide: PackageMetadataService, useValue: { cliName: 'revo', version: '1.0.0' } },
         { provide: TUI_LAUNCHER, useValue: launch },
         { provide: TUI_TERMINAL, useValue: terminal },

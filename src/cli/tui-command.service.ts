@@ -7,9 +7,11 @@ import { runRevoTui, type RunRevoTuiOptions } from '@revisium/revo-tui/launcher'
 import { channelCommand, selectChannel } from '../channel.js';
 import type { ConfigurationFlags } from '../configuration/configuration.types.js';
 import { CliExitCodeError } from './cli-error.js';
+import { OutputService } from './output.service.js';
 import { PackageMetadataService } from './package-metadata.service.js';
 import { ServerCommandService } from './server-command.service.js';
 import { serverPublicOrigin } from './server-public-origin.js';
+import { staleServerNotice } from './stale-server-notice.js';
 
 export const TUI_LAUNCHER = Symbol('TUI_LAUNCHER');
 export const TUI_TERMINAL = Symbol('TUI_TERMINAL');
@@ -34,7 +36,19 @@ export class TuiCommandService {
     private readonly launchTui: TuiLauncher,
     @Inject(TUI_TERMINAL)
     private readonly terminal: TuiTerminalReader,
+    @Inject(OutputService)
+    private readonly output: Pick<OutputService, 'write'>,
   ) {}
+
+  /** True when the terminal can host the TUI; the default command opens it only then. */
+  interactive(): boolean {
+    const terminal = this.terminal();
+    return (
+      (terminal.platform === 'linux' || terminal.platform === 'darwin') &&
+      terminal.stdin &&
+      terminal.stdout
+    );
+  }
 
   async run(flags: Readonly<ConfigurationFlags>): Promise<void> {
     const terminal = this.terminal();
@@ -53,6 +67,12 @@ export class TuiCommandService {
     });
     if (exitCode !== 0) {
       throw new CliExitCodeError(exitCode);
+    }
+    const command = channelCommand(configuration.channel);
+    this.output.write(`Revo keeps running at ${origin}; stop it with \`${command} server stop\`.`);
+    const notice = staleServerNotice(outcome, this.metadata.version, command);
+    if (notice !== undefined) {
+      this.output.write(notice);
     }
   }
 

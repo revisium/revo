@@ -40,6 +40,111 @@ describe('install.sh', { timeout: 60_000 }, () => {
     expect(await machine.channelEntries('alpha')).toEqual(['current', 'node', 'pnpm', 'versions']);
   });
 
+  describe('hand-off to the installed command', () => {
+    const NOTHING_LEFT_BEHIND = [] as const;
+
+    it('starts the installed command on the terminal right after a fresh install', async () => {
+      const machine = await cleanMachine({ binDirOnPath: true });
+      await machine.typeAtTerminal('typed at the terminal');
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(result.stdout).toContain('Revo alpha 0.1.0-alpha.1 is installed.\n');
+      expect(result.stdout).not.toContain('to start Revo');
+      expect(await machine.revoInvocations()).toEqual(['[]']);
+      expect(await machine.terminalOutput()).toBe(
+        'fixture revo started: typed at the terminal\nfixture revo stderr\n',
+      );
+      expect(await machine.installerLeftovers('alpha')).toEqual(NOTHING_LEFT_BEHIND);
+    });
+
+    it('only prints the command without a terminal', async () => {
+      const machine = await cleanMachine();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.stdout).toContain('Run `revo-alpha` to start Revo.\n');
+      expect(await machine.revoInvocations()).toEqual([]);
+    });
+
+    it('only prints the command when the terminal cannot be opened', async () => {
+      const machine = await cleanMachine();
+      machine.detachTerminal();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(result.stdout).toContain('Run `revo-alpha` to start Revo.\n');
+      expect(await machine.revoInvocations()).toEqual([]);
+    });
+
+    it('only prints the command at a terminal when REVO_INSTALL_NO_START=1', async () => {
+      const machine = await cleanMachine();
+      await machine.attachTerminal();
+      machine.skipStart();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+      expect(result.stdout).toContain('Run `revo-alpha` to start Revo.\n');
+      expect(await machine.revoInvocations()).toEqual([]);
+      expect(await machine.installerLeftovers('alpha')).toEqual(NOTHING_LEFT_BEHIND);
+    });
+
+    it('starts the new command after an upgrade and prints the installer restart notice first', async () => {
+      const machine = await cleanMachine();
+      await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+      await machine.attachTerminal();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.2'));
+
+      expect(result.stdout).toContain(
+        'A running Revo alpha server keeps version 0.1.0-alpha.1 until it is restarted: run `revo-alpha server stop`, then `revo-alpha`.\n',
+      );
+      expect(await machine.revoInvocations()).toEqual(['[]']);
+      expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.2');
+      expect(await machine.installerLeftovers('alpha')).toEqual(NOTHING_LEFT_BEHIND);
+    });
+
+    it('starts the command on an already installed rerun', async () => {
+      const machine = await cleanMachine();
+      const release = await machine.publish('alpha', '0.1.0-alpha.1');
+      await machine.install(release);
+      await machine.attachTerminal();
+
+      const result = await machine.install(release);
+
+      expect(result.stdout).toContain('Revo alpha 0.1.0-alpha.1 is already installed.\n');
+      expect(await machine.revoInvocations()).toEqual(['[]']);
+      expect(await machine.installerLeftovers('alpha')).toEqual(NOTHING_LEFT_BEHIND);
+    });
+
+    it('names the command path when ~/.local/bin is not on PATH, and still starts it', async () => {
+      const machine = await cleanMachine();
+      await machine.attachTerminal();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.stdout).toContain('Until then, run ');
+      expect(result.stdout).toContain('/.local/bin/revo-alpha\n');
+      expect(await machine.revoInvocations()).toEqual(['[]']);
+      expect(await machine.installerLeftovers('alpha')).toEqual(NOTHING_LEFT_BEHIND);
+    });
+
+    it('exits with the status of the started command and keeps the install active', async () => {
+      const machine = await cleanMachine();
+      await machine.attachTerminal();
+      await machine.makeCommandExit(7);
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(7);
+      expect(await machine.activeVersion('alpha')).toBe('0.1.0-alpha.1');
+      expect(await machine.installerLeftovers('alpha')).toEqual(NOTHING_LEFT_BEHIND);
+    });
+  });
+
   it('makes each channel launcher declare its own channel to Revo', async () => {
     const machine = await cleanMachine();
     await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));

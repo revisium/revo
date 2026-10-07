@@ -53,6 +53,7 @@ const MINIMAL_LINUX: ReportedPlatform = {
   machine: 'x86_64',
   glibc: 'glibc 2.35',
 };
+const COMMAND_OUTPUT = /fixture revo [^\n]*\n/g;
 const FOREIGN_COMMAND = '#!/bin/sh\necho "not Revo"\n';
 const CHANNELS: readonly ReleaseChannel[] = ['stable', 'alpha'];
 const USER_PNPM_CONFIG_DIRS = [join('.config', 'pnpm'), join('Library', 'Preferences', 'pnpm')];
@@ -419,6 +420,36 @@ export class InstallMachine {
     await writeFile(this.control('tty'), '');
   }
 
+  /** A usable terminal: the installer can read it and write to it. */
+  async attachTerminal(): Promise<void> {
+    await writeFile(this.control('tty'), '');
+  }
+
+  /** The line the user types at the terminal before the installed command reads its stdin. */
+  async typeAtTerminal(line: string): Promise<void> {
+    await writeFile(this.control('tty'), `${line}\n`);
+  }
+
+  /** What the installed command wrote to the terminal, without the text typed into it. */
+  async terminalOutput(): Promise<string> {
+    const written = await readFile(this.control('tty'), 'utf8').catch(() => '');
+    return [...written.matchAll(COMMAND_OUTPUT)].map((match) => match[0]).join('');
+  }
+
+  /** The installed command exits with this status. */
+  async makeCommandExit(status: number): Promise<void> {
+    await writeFile(this.control('revo-exit'), `${status}\n`);
+  }
+
+  skipStart(): void {
+    this.userPnpmEnvironment.REVO_INSTALL_NO_START = '1';
+  }
+
+  /** The terminal path cannot be opened, as with no controlling terminal. */
+  detachTerminal(): void {
+    this.userPnpmEnvironment.REVO_TEST_TTY = join(this.root, 'no-such-directory', 'tty');
+  }
+
   /** ldconfig fails, so the installer looks in these directories; they hold libatomic or not. */
   async searchLibrariesOnlyIn(options: { readonly libatomic: boolean }): Promise<void> {
     const directory = this.control('libraries');
@@ -456,7 +487,7 @@ export class InstallMachine {
   /** What the installer wrote to the terminal after the answer. */
   async promptShown(): Promise<string> {
     const typed = await readFile(this.control('tty'), 'utf8').catch(() => '');
-    return typed.split('\n').slice(1).join('\n');
+    return typed.replace(COMMAND_OUTPUT, '').split('\n').slice(1).join('\n');
   }
 
   downloads(fragment = ''): readonly string[] {
@@ -561,12 +592,12 @@ export class InstallMachine {
       this.systemPath,
     ];
     const environment: NodeJS.ProcessEnv = {
+      REVO_TEST_TTY: this.control('tty'),
       ...this.userPnpmEnvironment,
       CURL_CA_BUNDLE: this.certificate.certPath,
       HOME: this.home,
       LC_ALL: this.locale,
       PATH: path.join(':'),
-      REVO_TEST_TTY: this.control('tty'),
     };
     if (this.options.installRoot !== undefined) {
       environment.REVO_INSTALL_ROOT = this.installRoot();
@@ -750,13 +781,22 @@ export class InstallMachine {
     return this.archive(`revo-${version}`, 'package', {
       'package/package.json': `${JSON.stringify({ name: '@revisium/revo', version, type: 'module' })}\n`,
       'package/dist/bin/revo.js': [
-        "import { appendFileSync, existsSync } from 'node:fs';",
+        "import { appendFileSync, existsSync, readFileSync, readSync, writeSync } from 'node:fs';",
         `appendFileSync(${JSON.stringify(this.control('revo-invocations.log'))}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
         "if (!existsSync(new URL('../../node_modules/.fixture-built', import.meta.url))) {",
         "  console.error('dependencies were installed without their build scripts');",
         '  process.exit(1);',
         '}',
         `if (process.argv[2] === '--version') console.log(${JSON.stringify(version)});`,
+        'if (process.argv.length === 2) {',
+        '  const buffer = Buffer.alloc(256);',
+        '  const length = readSync(0, buffer, 0, 256, null);',
+        "  const typed = buffer.toString('utf8', 0, length).split('\\n')[0];",
+        '  writeSync(1, `fixture revo started: ${typed}\\n`);',
+        "  writeSync(2, 'fixture revo stderr\\n');",
+        `  const exitFile = ${JSON.stringify(this.control('revo-exit'))};`,
+        '  process.exit(existsSync(exitFile) ? Number(readFileSync(exitFile, "utf8")) : 0);',
+        '}',
         "if (process.argv[2] === '--launcher-channel') console.log(process.env.REVO_LAUNCHER_CHANNEL);",
         '',
       ].join('\n'),
