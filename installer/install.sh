@@ -465,6 +465,7 @@ start_command() {
   say "Starting \`$command_name\`..."
   cleanup
   lock_held=0 takeover_held=0
+  # shellcheck disable=SC2094 # The terminal is one device for input and output.
   exec "$command_link" <"$terminal" >>"$terminal" 2>>"$terminal"
 }
 
