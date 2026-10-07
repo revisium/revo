@@ -168,12 +168,14 @@ install_libraries() {
     run_as_admin "$manager" $install_args && return
     fail "\`$command_text\` failed; fix that and run the installer again."
   fi
-  output=$(run_as_admin "$manager" $install_args 2>&1) && return
+  # The messages are matched below, so apt must speak English whatever the user's locale is.
+  output=$(run_as_admin env LC_ALL=C LANG=C "$manager" $install_args 2>&1) && return
   # Refresh the lists only when that is the failure: a fresh apt image has none.
   case "$output" in
     *'Unable to locate package'* | *'has no installation candidate'*)
       say 'Refreshing the package lists...'
-      run_as_admin apt-get update && run_as_admin "$manager" $install_args && return
+      run_as_admin env LC_ALL=C LANG=C apt-get update &&
+        run_as_admin env LC_ALL=C LANG=C "$manager" $install_args && return
       ;;
     *) printf '%s\n' "$output" >&2 ;;
   esac

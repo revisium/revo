@@ -558,6 +558,22 @@ describe('install.sh', { timeout: 60_000 }, () => {
       ]);
     });
 
+    it('refreshes the package lists under a localized session, because apt runs in English', async () => {
+      const machine = await machineLackingLibrary();
+      await machine.havePackageManager('apt-get', { staleLists: true, localized: true });
+      await machine.haveSudo();
+      machine.allowSystemDependencyInstall();
+
+      const result = await machine.install(await machine.publish('alpha', '0.1.0-alpha.1'));
+
+      expect(result.exitCode).toBe(0);
+      expect(await machine.systemCommands()).toEqual([
+        `sudo ${INSTALL}`,
+        'sudo apt-get update',
+        `sudo ${INSTALL}`,
+      ]);
+    });
+
     it('fails clearly when the library is still missing after the install', async () => {
       const machine = await machineLackingLibrary();
       await machine.havePackageManager('apt-get');

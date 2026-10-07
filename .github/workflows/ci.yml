@@ -114,7 +114,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ['ubuntu:22.04', 'ubuntu:24.04', 'ubuntu:26.04', 'debian:12']
+        image:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - ubuntu:26.04
+          - debian:12
+          - debian:13
+          - fedora:44
+          - rockylinux/rockylinux:9
+          - opensuse/leap:15.6
+          - archlinux:latest
+          - amazonlinux:2023
 
     steps:
       - name: Check out exact revision

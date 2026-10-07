@@ -111,6 +111,8 @@ export interface MachineOptions {
 interface PackageManagerOptions {
   /** The install fails until `update` has refreshed the package lists, as on a fresh image. */
   readonly staleLists?: boolean;
+  /** apt speaks English only under LC_ALL=C and German otherwise, as in a localized session. */
+  readonly localized?: boolean;
   /** The install fails with this message, whatever the package lists hold. */
   readonly failWith?: string;
 }
@@ -374,7 +376,15 @@ export class InstallMachine {
           ? []
           : [`echo ${quote(options.failWith)} >&2`, 'exit 1']),
         `if [ -e ${quote(this.control('lists-stale'))} ] && [ ! -e ${quote(this.control('lists-updated'))} ]; then`,
-        "  echo 'E: Unable to locate package libatomic1' >&2",
+        ...(options.localized === true
+          ? [
+              '  if [ "${LC_ALL:-}" = C ] && [ "${LANG:-}" = C ]; then',
+              "    echo 'E: Unable to locate package libatomic1' >&2",
+              '  else',
+              "    echo 'E: Paket libatomic1 kann nicht gefunden werden' >&2",
+              '  fi',
+            ]
+          : ["  echo 'E: Unable to locate package libatomic1' >&2"]),
         '  exit 100',
         'fi',
         `[ -e ${quote(this.control('install-ineffective'))} ] || : > ${quote(this.control('library-installed'))}`,
