@@ -94,6 +94,7 @@ case "${glibc#glibc }" in
     printf 'container smoke: %s is refused cleanly and nothing changed\n' "$glibc"
     exit 0
     ;;
+  *) ;;
 esac
 
 if ldconfig -p | grep -q 'libatomic\.so\.1'; then
