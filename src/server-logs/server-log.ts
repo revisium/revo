@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { open, realpath, type FileHandle } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
+import { errorCode } from '../errors.js';
 import type { ServerLifecycleConfiguration } from './server-lifecycle.types.js';
 import { ensurePrivateLogDirectory, serverLogDirectory } from './store.service.js';
 
@@ -162,6 +163,3 @@ function controlCharacter(character: string): boolean {
   const code = character.codePointAt(0) ?? 0;
   return (code < 0x20 && code !== 0x09) || (code >= 0x7f && code <= 0x9f);
 }
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

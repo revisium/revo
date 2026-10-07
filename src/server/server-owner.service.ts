@@ -12,6 +12,7 @@ import {
   CoreHostProcessResource,
   CoreHostProcessService,
 } from '../core-host/core-host-process.service.js';
+import { errorMessage } from '../errors.js';
 import { readEmbeddedPostgresCredential } from '../postgres/embedded-postgres-preparation.service.js';
 import {
   EmbeddedPostgresError,
@@ -27,14 +28,15 @@ import {
   PublishedControlError,
   PublishedControlService,
 } from '../processes/published-control.service.js';
+import { isRecord } from '../record.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import type {
   ServerLifecycleCode,
   ServerLifecycleCorePhase,
 } from '../server-logs/server-lifecycle.types.js';
+import { CORE_CLOSE_MILLISECONDS } from '../stop-timing.js';
 
 const CORE_ENTRY = fileURLToPath(new URL('../bin/revo-core-host.js', import.meta.url));
-const CLOSE_MILLISECONDS = 5_000;
 const logger = new RevoConsoleLogger('ServerOwner');
 
 export interface ServerOwnerConfiguration {
@@ -425,7 +427,7 @@ export class ServerOwnerResource {
   private async performClose(): Promise<void> {
     if (this.core) {
       try {
-        await this.core.close(Date.now() + CLOSE_MILLISECONDS);
+        await this.core.close(Date.now() + CORE_CLOSE_MILLISECONDS);
         await this.core.completionState();
       } catch (error) {
         logger.failure('Revo Core did not stop', error);
@@ -610,8 +612,6 @@ function databaseFailureDetail(failure: ServerOwnerError['databaseFailure']): st
 const errorSummary = (error: unknown) =>
   error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 
-const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
-
 const isFileSystemError = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error &&
   typeof Reflect.get(error, 'syscall') === 'string' &&
@@ -677,9 +677,6 @@ function isReadyGraphql(value: unknown): boolean {
   }
   return value.data['__typename'] === 'Query';
 }
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 async function readBoundedResponse(response: Response): Promise<string> {
   const reader = response.body?.getReader();

@@ -2,6 +2,7 @@ import { connect, isIP } from 'node:net';
 
 import { Inject, Injectable, Optional } from '@nestjs/common';
 
+import { isRecord } from '../record.js';
 import {
   CONTROL_SOCKET_ROOT,
   controlSocketRoot,
@@ -27,7 +28,7 @@ export class ControlClientService {
   async probe(recordValue: unknown, limits: ControlLimits = DEFAULT_CONTROL_LIMITS) {
     const record = await this.privateRecord(recordValue, limits);
     const response = await exchange(record, 'probe', limits);
-    if (!isObject(response) || response.ok !== true || response.schemaVersion !== 1) {
+    if (!isRecord(response) || response.ok !== true || response.schemaVersion !== 1) {
       throw new ControlTransportError();
     }
     const expected = { ...record } as Record<string, unknown>;
@@ -43,7 +44,7 @@ export class ControlClientService {
     const record = await this.privateRecord(recordValue, limits);
     const response = await exchange(record, 'stop', limits);
     if (
-      !isObject(response) ||
+      !isRecord(response) ||
       Object.keys(response).length !== 3 ||
       response.schemaVersion !== 1 ||
       response.ok !== true ||
@@ -61,11 +62,11 @@ export class ControlClientService {
     const record = await this.privateRecord(recordValue, limits);
     const response = await exchange(record, 'status', limits);
     if (
-      !isObject(response) ||
+      !isRecord(response) ||
       Object.keys(response).length !== 3 ||
       response.schemaVersion !== 1 ||
       response.ok !== true ||
-      !isObject(response.status)
+      !isRecord(response.status)
     ) {
       throw new ControlTransportError();
     }
@@ -82,7 +83,7 @@ export class ControlClientService {
       throw new ControlTransportError('Invalid stop completion timeout');
     }
     const [accepted, completed] = await exchangeStop(record, limits, completionTimeoutMs);
-    if (!isAccepted(accepted) || !isObject(completed) || completed.completed !== true) {
+    if (!isAccepted(accepted) || !isRecord(completed) || completed.completed !== true) {
       throw new ControlTransportError();
     }
     const completion = parseStopCompletion(completed);
@@ -123,7 +124,7 @@ function parseStopCompletion(value: Record<string, unknown>): ControlStopRespons
 }
 
 const isAccepted = (response: unknown) =>
-  isObject(response) &&
+  isRecord(response) &&
   Object.keys(response).length === 3 &&
   response.schemaVersion === 1 &&
   response.ok === true &&
@@ -289,9 +290,6 @@ function exchange(
     socket.once('error', () => finish(new ControlTransportError()));
   });
 }
-
-const isObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 function parseStatus(value: Record<string, unknown>): ControlServerStatus {
   if (value.phase === 'unknown' && exactKeys(value, ['phase'])) {

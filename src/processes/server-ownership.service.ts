@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { errorCode } from '../errors.js';
 import { PosixFlockAdapter, type NativeLock } from './adapters/posix-flock.adapter.js';
 import type {
   HeldServerOwnership,
@@ -150,6 +151,3 @@ export class ServerOwnershipService {
     }
   }
 }
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

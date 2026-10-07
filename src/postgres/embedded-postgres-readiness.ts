@@ -1,11 +1,12 @@
 import { Client, type ClientConfig, type QueryResult, type QueryResultRow } from 'pg';
 
+import { errorCode } from '../errors.js';
+import { isTimerTimeout } from '../timers.js';
 import { EmbeddedPostgresError } from './embedded-postgres.types.js';
 
 const HOST = '127.0.0.1' as const;
 const ADMIN_DATABASE = 'postgres' as const;
 const APPLICATION_DATABASE = 'revo' as const;
-const MAX_TIMER_MILLISECONDS = 2_147_483_647;
 const CLEANUP_RESERVE_MILLISECONDS = 100;
 
 interface EmbeddedPostgresReadinessRequest {
@@ -281,9 +282,7 @@ const validateRequest = (request: EmbeddedPostgresReadinessRequest) => {
     request.password.length === 0 ||
     typeof request.startupNonce !== 'string' ||
     request.startupNonce.length === 0 ||
-    !Number.isInteger(request.timeoutMs) ||
-    request.timeoutMs <= 0 ||
-    request.timeoutMs > MAX_TIMER_MILLISECONDS
+    !isTimerTimeout(request.timeoutMs)
   ) {
     throw new EmbeddedPostgresError(request.signal.aborted ? 'cancelled' : 'invalid');
   }
@@ -316,9 +315,6 @@ const safeError = (error: unknown, signal: AbortSignal) => {
   }
   return new EmbeddedPostgresError(signal.aborted ? 'cancelled' : 'process');
 };
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
 
 const isTransportFailure = (error: unknown) => {
   const code = errorCode(error);

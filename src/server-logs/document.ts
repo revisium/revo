@@ -1,3 +1,4 @@
+import { isRecord } from '../record.js';
 import {
   MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES,
   MAX_SERVER_LIFECYCLE_EVENT_BYTES,
@@ -70,7 +71,7 @@ export function createLifecycleEvent(
 }
 
 function validLifecycleEvent(value: unknown): value is ServerLifecycleEvent {
-  const candidate = record(value) && exactKeys(value, EVENT_FIELDS) ? value : undefined;
+  const candidate = isRecord(value) && exactKeys(value, EVENT_FIELDS) ? value : undefined;
   if (!candidate) {
     return false;
   }
@@ -111,7 +112,7 @@ export function parseLifecycleDocument(value: unknown): ServerLifecycleDocument 
     }
   }
   if (
-    !record(candidate) ||
+    !isRecord(candidate) ||
     !exactKeys(candidate, DOCUMENT_FIELDS) ||
     candidate.schemaVersion !== SERVER_LIFECYCLE_SCHEMA_VERSION ||
     !Array.isArray(candidate.events) ||
@@ -160,10 +161,6 @@ function eventBytes(event: unknown): number {
 
 function documentBytes(document: ServerLifecycleDocument): number {
   return Buffer.byteLength(`${JSON.stringify(document)}\n`, 'utf8');
-}
-
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {

@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { errorCode } from '../errors.js';
 import { EmbeddedPostgresResourceService } from '../postgres/embedded-postgres-resource.service.js';
 import { ExternalPostgresResourceService } from '../postgres/external-postgres-resource.service.js';
 import type { ServerLifecycleSink } from '../server-logs/server-lifecycle.types.js';
@@ -294,9 +295,6 @@ async function publishRecord(temporaryPath: string, locatorPath: string, record:
   }
   await rename(temporaryPath, locatorPath);
 }
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
 
 async function openLifecycle(
   request: OpenPublishedControlRequest,

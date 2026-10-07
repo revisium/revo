@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstat, mkdir, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 
+import { errorCode } from '../errors.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import { ControlTransportError, controlEndpointByteLimit } from './control-protocol.js';
 
@@ -178,6 +179,3 @@ const socketPath = (directory: string, instanceId: string) =>
 const fits = (endpoint: string) => Buffer.byteLength(endpoint) <= controlEndpointByteLimit();
 
 const overlong = () => `socket path exceeds ${String(controlEndpointByteLimit())} bytes`;
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { selectChannel } from '../channel.js';
 import { resolveRevoLayout } from '../layout.js';
+import { isRecord } from '../record.js';
 import { ConfigFileLoader } from './config-file-loader.js';
 import { invalidConfiguration } from './configuration-error.js';
 import {
@@ -110,7 +111,7 @@ export class ConfigurationResolver {
     if (value === undefined) {
       return { schemaVersion: 1 };
     }
-    if (!this.isRecord(value)) {
+    if (!isRecord(value)) {
       invalidConfiguration('config', 'config-file', 'must be an object');
     }
     const record = value;
@@ -285,10 +286,6 @@ export class ConfigurationResolver {
       invalidConfiguration(field, source, 'must be an absolute path');
     }
     return path.posix.normalize(value);
-  }
-
-  private isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
   }
 
   private layoutPaths(input: Readonly<ConfigurationInput>): void {

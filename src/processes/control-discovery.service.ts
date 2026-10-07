@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { Injectable } from '@nestjs/common';
 
+import { errorCode } from '../errors.js';
 import type { ControlDiscovery } from './control-discovery.types.js';
 import { parseControlRecord } from './control-protocol.js';
 
@@ -74,5 +75,3 @@ async function readBounded(file: FileHandle): Promise<string | undefined> {
 
 const ownedPrivate = (uid: number, mode: number) =>
   typeof process.getuid === 'function' && uid === process.getuid() && (mode & 0o077) === 0;
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

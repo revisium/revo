@@ -2,6 +2,7 @@ import net from 'node:net';
 import { isAbsolute } from 'node:path';
 
 import { MAX_STARTUP_TIMEOUT_MILLISECONDS } from '../configuration/configuration.types.js';
+import { isRecord } from '../record.js';
 import type { ServerOwnerConfiguration } from './server-owner.service.js';
 
 export const SERVER_HOST_PROTOCOL = 'revo-server-host/v1' as const;
@@ -88,7 +89,7 @@ export function parseServerHostParentMessage(value: unknown): ServerHostParentMe
   if (!boundedSerialization(value)) {
     return undefined;
   }
-  if (!record(value) || value.protocol !== SERVER_HOST_PROTOCOL) {
+  if (!isRecord(value) || value.protocol !== SERVER_HOST_PROTOCOL) {
     return undefined;
   }
   if (value.type === 'commit' || value.type === 'cancel') {
@@ -119,7 +120,7 @@ export function parseServerHostParentMessage(value: unknown): ServerHostParentMe
 }
 
 function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefined {
-  if (!record(value) || !exact(value, CONFIGURATION_FIELDS, ['databaseUrl'])) {
+  if (!isRecord(value) || !exact(value, CONFIGURATION_FIELDS, ['databaseUrl'])) {
     return undefined;
   }
   if (
@@ -152,7 +153,7 @@ function parseConfiguration(value: unknown): ServerOwnerConfiguration | undefine
 }
 
 function parseEnvironment(value: unknown): Readonly<Record<string, string>> | undefined {
-  if (!record(value) || Object.keys(value).length > MAX_ENVIRONMENT_ENTRIES) {
+  if (!isRecord(value) || Object.keys(value).length > MAX_ENVIRONMENT_ENTRIES) {
     return undefined;
   }
   const entries: [string, string][] = [];
@@ -170,8 +171,6 @@ function parseEnvironment(value: unknown): Readonly<Record<string, string>> | un
   return Object.fromEntries(entries);
 }
 
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 const exact = (
   value: Record<string, unknown>,
   fields: readonly string[],

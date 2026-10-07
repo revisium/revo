@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink, type FileHandle } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
+import { errorCode } from '../errors.js';
 import {
   createLifecycleEvent,
   parseLifecycleDocument,
@@ -274,5 +275,3 @@ const lastSequence = (events: readonly ServerLifecycleEvent[] | undefined): numb
 
 const privateOwned = (uid: number, mode: number) =>
   typeof process.getuid === 'function' && uid === process.getuid() && (mode & 0o077) === 0;
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

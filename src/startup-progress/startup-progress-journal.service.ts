@@ -5,7 +5,9 @@ import { join } from 'node:path';
 
 import { Injectable } from '@nestjs/common';
 
+import { errorCode } from '../errors.js';
 import { parseProgressEvent, type ProgressEvent } from '../progress/index.js';
+import { isRecord } from '../record.js';
 import {
   MAX_NONTERMINAL_TRANSITIONS,
   MAX_STARTUP_PROGRESS_BYTES,
@@ -152,7 +154,7 @@ function parseDocument(content: string | undefined): ProgressDocument | undefine
   try {
     const value: unknown = JSON.parse(content);
     if (
-      !record(value) ||
+      !isRecord(value) ||
       Object.keys(value)
         .sort((left, right) => left.localeCompare(right, 'en'))
         .join(',') !== 'events,operationId,schemaVersion' ||
@@ -225,9 +227,5 @@ async function readBounded(file: FileHandle): Promise<string | undefined> {
     : undefined;
 }
 
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 const ownedPrivate = (uid: number, mode: number) =>
   typeof process.getuid === 'function' && uid === process.getuid() && (mode & 0o077) === 0;
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

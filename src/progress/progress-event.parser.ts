@@ -1,3 +1,4 @@
+import { isRecord } from '../record.js';
 import {
   PROGRESS_SCHEMA_VERSION,
   type ProgressEvent,
@@ -9,15 +10,13 @@ const PHASE = /^[a-z][a-z0-9-]{0,63}$/u;
 const OPTIONAL = ['stageElapsedMs', 'code', 'logPath', 'url', 'reused'] as const;
 const BASE = ['schemaVersion', 'operationId', 'sequence', 'phase', 'status', 'elapsedMs'] as const;
 const CODE = /^[A-Z][A-Z0-9_]{0,63}$/u;
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 const nonnegative = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const exactKnown = (value: Record<string, unknown>, known: readonly string[]) =>
   Object.keys(value).every((key) => known.includes(key));
 
 export function parseProgressEvent(value: unknown): ProgressEvent | undefined {
-  if (!record(value) || !BASE.every((key) => Object.hasOwn(value, key))) {
+  if (!isRecord(value) || !BASE.every((key) => Object.hasOwn(value, key))) {
     return undefined;
   }
   if (!exactKnown(value, [...BASE, ...OPTIONAL])) {

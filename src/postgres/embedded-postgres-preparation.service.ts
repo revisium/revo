@@ -14,9 +14,12 @@ import { join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { errorCode } from '../errors.js';
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import type { OwnedProcess, ProcessCompletion } from '../processes/managed-process.types.js';
 import type { StartupProgressFacade } from '../startup-progress/index.js';
+import { CANCELLATION_TIMING } from '../stop-timing.js';
+import { isTimerTimeout } from '../timers.js';
 import { syncDirectory } from './directory-sync.js';
 import { loadEmbeddedPostgresBinaries } from './embedded-postgres-binaries.js';
 import type { EmbeddedPostgresLog } from './embedded-postgres-log.js';
@@ -29,8 +32,6 @@ import {
 
 const FILE_MODE = 0o600;
 const MAX_SMALL_FILE = 4096;
-const CANCEL_GRACE_MS = 1000;
-const CANCEL_KILL_WAIT_MS = 5000;
 const CREDENTIAL_FORMAT = /^[A-Za-z0-9_-]{32}$/u;
 const STAGED_CLUSTER_PREFIX = '.postgres-initdb';
 
@@ -194,7 +195,7 @@ export class OwnedEmbeddedPostgresPreparation {
         cwd: this.canonicalDataDir,
         env: { LC_ALL: 'C' },
         stdio: { stdin: 'ignore', stdout: descriptor, stderr: descriptor },
-        cancellation: { signal, graceMs: CANCEL_GRACE_MS, killWaitMs: CANCEL_KILL_WAIT_MS },
+        cancellation: { signal, ...CANCELLATION_TIMING },
       }),
     );
     this.observeChild(child);
@@ -255,12 +256,7 @@ const clusterLayout = (dataDir: string): ClusterLayout => ({
 });
 
 function validateRequest(request: PrepareEmbeddedPostgresRequest) {
-  if (
-    request.signal.aborted ||
-    !Number.isInteger(request.timeoutMs) ||
-    request.timeoutMs <= 0 ||
-    request.timeoutMs > 2_147_483_647
-  ) {
+  if (request.signal.aborted || !isTimerTimeout(request.timeoutMs)) {
     throw new EmbeddedPostgresError(request.signal.aborted ? 'cancelled' : 'invalid');
   }
 }
@@ -452,6 +448,3 @@ function rejectCancellation(signal: AbortSignal) {
     throw new EmbeddedPostgresError('cancelled');
   }
 }
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

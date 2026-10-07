@@ -1,3 +1,4 @@
+import { isRecord } from '../record.js';
 export const CORE_HOST_PROTOCOL = 'revo-core-host/v1' as const;
 
 type CoreHostLifecycleStage =
@@ -79,8 +80,6 @@ const types = new Set<string>([
   'listening',
   'failed',
 ]);
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 const hasOnly = (value: Record<string, unknown>, keys: readonly string[]) =>
   Object.keys(value).every((key) => keys.includes(key));
 const safeText = (value: unknown): value is string => {

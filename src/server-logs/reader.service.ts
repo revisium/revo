@@ -4,6 +4,7 @@ import type { Stats } from 'node:fs';
 import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
+import { errorCode } from '../errors.js';
 import { parseLifecycleDocument } from './document.js';
 import {
   MAX_SERVER_LIFECYCLE_DOCUMENT_BYTES,
@@ -146,5 +147,3 @@ const safeDocumentFile = (descriptor: Stats, pathname: Stats) =>
   pathname.nlink === 1 &&
   descriptor.dev === pathname.dev &&
   descriptor.ino === pathname.ino;
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

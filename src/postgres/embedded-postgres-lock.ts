@@ -4,9 +4,11 @@ import { dirname, join } from 'node:path';
 
 import { Inject, Injectable } from '@nestjs/common';
 
+import { errorCode } from '../errors.js';
 import { ManagedProcessService } from '../processes/managed-process.service.js';
 import { ProcessIdentityService } from '../processes/process-identity.service.js';
 import type { IdentityObservation } from '../processes/process-identity.types.js';
+import { CANCELLATION_TIMING } from '../stop-timing.js';
 import type { EmbeddedPostgresLog } from './embedded-postgres-log.js';
 import { EmbeddedPostgresError } from './embedded-postgres.types.js';
 
@@ -14,8 +16,6 @@ const LOCK_FILE = 'postmaster.pid';
 const MAX_LOCK_FILE_BYTES = 4096;
 const START_TOLERANCE_SECONDS = 2;
 const MAX_STOP_SECONDS = 60;
-const STOP_CANCEL_GRACE_MS = 1000;
-const STOP_CANCEL_KILL_WAIT_MS = 5000;
 
 interface ReleaseClusterLockRequest {
   readonly clusterDir: string;
@@ -149,8 +149,7 @@ export class EmbeddedPostgresLockRecovery {
         stdio: { stdin: 'ignore', stdout: descriptor, stderr: descriptor },
         cancellation: {
           signal: request.signal,
-          graceMs: STOP_CANCEL_GRACE_MS,
-          killWaitMs: STOP_CANCEL_KILL_WAIT_MS,
+          ...CANCELLATION_TIMING,
         },
       }),
     );
@@ -245,6 +244,3 @@ function refusalDetail(
 }
 
 const refused = (detail: string): LockRecovery => ({ kind: 'refused', detail });
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;

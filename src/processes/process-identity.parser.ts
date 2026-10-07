@@ -1,15 +1,15 @@
+import { isRecord } from '../record.js';
 import type { ProcessIdentity } from './process-identity.types.js';
 
+const MAX_PID = 2_147_483_647;
 const UINT64_MAX = 18_446_744_073_709_551_615n;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DECIMAL = /^(?:0|[1-9]\d*)$/u;
 
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 const exact = (value: Record<string, unknown>, keys: string[]) =>
   Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 export const validPid = (pid: unknown): pid is number =>
-  Number.isInteger(pid) && Number(pid) >= 1 && Number(pid) <= 2_147_483_647;
+  Number.isInteger(pid) && Number(pid) >= 1 && Number(pid) <= MAX_PID;
 export const validUid = (uid: unknown): uid is number =>
   Number.isInteger(uid) && Number(uid) >= 0 && Number(uid) <= 4_294_967_295;
 const validUint64 = (value: unknown): value is string => {
@@ -20,10 +20,10 @@ const validUint64 = (value: unknown): value is string => {
 };
 
 export function parseIdentity(value: unknown): ProcessIdentity | undefined {
-  if (!record(value) || !exact(value, ['platform', 'pid', 'uid', 'birth'])) {
+  if (!isRecord(value) || !exact(value, ['platform', 'pid', 'uid', 'birth'])) {
     return undefined;
   }
-  if (!validPid(value.pid) || !validUid(value.uid) || !record(value.birth)) {
+  if (!validPid(value.pid) || !validUid(value.uid) || !isRecord(value.birth)) {
     return undefined;
   }
   if (value.platform === 'linux' && exact(value.birth, ['bootId', 'startTicks'])) {

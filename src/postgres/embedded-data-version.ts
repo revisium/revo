@@ -1,6 +1,7 @@
 import { constants, type FileHandle, lstat, open, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { errorCode, errorMessage } from '../errors.js';
 import { compareSemVer, isSemVerString } from '../release-metadata.js';
 import { RevoConsoleLogger } from '../server-logs/revo-console-logger.js';
 import { syncDirectory } from './directory-sync.js';
@@ -136,7 +137,7 @@ export class EmbeddedDataVersion {
       await syncDirectory(this.dataDir);
     } catch (error) {
       throw new EmbeddedPostgresError('invalid', false, undefined, {
-        detail: `the data version file ${this.path} could not be written (${errorSummary(error)})`,
+        detail: `the data version file ${this.path} could not be written (${errorMessage(error)})`,
       });
     }
   }
@@ -190,8 +191,3 @@ function parseDataVersion(content: string): string | undefined {
   }
   return version;
 }
-
-const errorCode = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
-
-const errorSummary = (error: unknown) => (error instanceof Error ? error.message : String(error));

@@ -1,4 +1,5 @@
 import type { ProcessCompletion } from '../processes/managed-process.types.js';
+import { isRecord } from '../record.js';
 import {
   SERVER_HOST_PROTOCOL,
   parseServerHostParentMessage,
@@ -273,7 +274,7 @@ class AttemptOperation {
 }
 
 function parseChildMessage(value: unknown): ServerHostChildMessage | undefined {
-  if (!record(value) || value.protocol !== SERVER_HOST_PROTOCOL) {
+  if (!isRecord(value) || value.protocol !== SERVER_HOST_PROTOCOL) {
     return undefined;
   }
   if (value.type === 'booted' && exact(value, ['protocol', 'type'])) {
@@ -331,9 +332,6 @@ function failedMessage(
         ['completed', 'retained', 'unconfirmed'].includes(value.cleanup)))
   );
 }
-
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const exact = (value: Record<string, unknown>, fields: readonly string[]): boolean => {
   const keys = Object.keys(value);

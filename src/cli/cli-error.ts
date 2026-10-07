@@ -1,3 +1,5 @@
+import { errorMessage } from '../errors.js';
+
 interface CliFailure {
   readonly exitCode: number;
   readonly message?: string;
@@ -40,7 +42,7 @@ export function cliFailure(error: unknown): CliFailure {
     return { exitCode: 0 };
   }
 
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   if (typeof code === 'string' && USAGE_CODE.test(code)) {
     return { exitCode: 2, message };
   }

@@ -1,4 +1,5 @@
 import type { ReleaseChannel } from './layout.js';
+import { isRecord } from './record.js';
 
 const SEMVER_IDENTIFIER = String.raw`(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)`;
 const SEMVER_PATTERN = new RegExp(
@@ -17,10 +18,6 @@ interface ReleaseMetadata {
 
 export function isSemVerString(value: string): boolean {
   return SEMVER_PATTERN.test(value);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
