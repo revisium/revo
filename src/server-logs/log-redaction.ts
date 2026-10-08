@@ -20,13 +20,13 @@ export function protectDatabaseUrl(databaseUrl: string): void {
 }
 
 export function redactLog(text: string): string {
-  let redacted = text
-    .replaceAll(URL_CREDENTIALS, `$1${REDACTED}@`)
-    .replaceAll(PASSWORD_ASSIGNMENT, `$1${REDACTED}`);
+  let redacted = text;
   for (const secret of [...secrets].toSorted((left, right) => right.length - left.length)) {
     redacted = redacted.replaceAll(secret, REDACTED);
   }
-  return redacted;
+  return redacted
+    .replaceAll(URL_CREDENTIALS, `$1${REDACTED}@`)
+    .replaceAll(PASSWORD_ASSIGNMENT, `$1${REDACTED}`);
 }
 
 function decoded(value: string): string {

@@ -21,6 +21,17 @@ describe('server log redaction', () => {
     expect(redacted).toContain('connecting to postgresql://revo:[REDACTED]@db.example:5432/revo');
   });
 
+  it('redacts a protected password whole when it contains the URL userinfo separator', () => {
+    protectDatabaseUrl('postgresql://revo:tail@secret-9@db.example:5432/revo');
+
+    const redacted = redactLog(
+      'connecting to postgresql://revo:tail@secret-9@db.example:5432/revo',
+    );
+
+    expect(redacted).not.toContain('secret-9');
+    expect(redacted).toBe('connecting to postgresql://revo:[REDACTED]@db.example:5432/revo');
+  });
+
   it('redacts credentials of any database URL and password assignment', () => {
     const redacted = redactLog(
       [

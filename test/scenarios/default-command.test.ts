@@ -17,10 +17,17 @@ import {
   TuiCommandService,
 } from '../../src/cli/tui-command.service.js';
 import { WebCommandService } from '../../src/cli/web-command.service.js';
+import { ConfigurationResolver } from '../../src/configuration/configuration-resolver.js';
+import { ServerLauncherService } from '../../src/server/server-launcher.service.js';
+import { ServerStatusService } from '../../src/server/server-status.service.js';
+import { ServerStopService } from '../../src/server/server-stop.service.js';
 
 type Outcome =
   | { readonly kind: 'started'; readonly url: string }
-  | { readonly kind: 'running'; readonly status: { readonly phase: 'running'; publicUrl?: string } }
+  | {
+      readonly kind: 'running';
+      readonly status: { readonly phase: 'running'; publicUrl?: string; version?: string };
+    }
   | { readonly kind: 'stopped' }
   | { readonly kind: 'unknown' };
 
@@ -44,6 +51,22 @@ describe('revo default command', () => {
 
     expect(fixture).toMatchObject({ exitCode: 0, stderr: '', stdout: output });
     expect(fixture.ensure).toHaveBeenCalledOnce();
+  });
+
+  it('tells how to restart a stale server on stderr and prints only the URL on stdout', async () => {
+    const fixture = await run([], runningServer('0.9.0'), undefined, false, true);
+
+    expect(fixture).toMatchObject({
+      exitCode: 0,
+      stdout: 'http://127.0.0.1:3210\n',
+      stderr: 'Revo 0.9.0 is running; restart it to use 1.0.0: `revo server stop`, then `revo`.\n',
+    });
+  });
+
+  it('stays quiet when the running server has the installed version', async () => {
+    const fixture = await run([], runningServer('1.0.0'), undefined, false, true);
+
+    expect(fixture).toMatchObject({ exitCode: 0, stdout: 'http://127.0.0.1:3210\n', stderr: '' });
   });
 
   it('opens the TUI instead of printing the URL when stdin and stdout are terminals', async () => {
@@ -161,11 +184,19 @@ describe('revo default command', () => {
   });
 });
 
+function runningServer(version: string): Outcome {
+  return {
+    kind: 'running',
+    status: { phase: 'running', publicUrl: 'http://127.0.0.1:3210', version },
+  };
+}
+
 async function run(
   args: readonly string[],
   outcome: Outcome,
   open = vi.fn<(url: string) => Promise<boolean>>().mockResolvedValue(true),
   tty = false,
+  realServerCommand = false,
 ): Promise<{
   readonly launches: string[];
   readonly ensure: ReturnType<typeof vi.fn>;
@@ -202,19 +233,25 @@ async function run(
       WebCommand,
       WebCommandService,
       TuiCommandService,
-      {
-        provide: ServerCommandService,
-        useValue: {
-          ensureRunning: ensure,
-          ensureRunningWithConfiguration: async () => {
-            const launched = await ensure();
-            return {
-              configuration: { channel: 'stable', layout: { dataDir: '/fixture' } },
-              outcome: launched,
-            };
+      realServerCommand
+        ? ServerCommandService
+        : {
+            provide: ServerCommandService,
+            useValue: {
+              ensureRunning: ensure,
+              ensureRunningWithConfiguration: async () => {
+                const launched = await ensure();
+                return {
+                  configuration: { channel: 'stable', layout: { dataDir: '/fixture' } },
+                  outcome: launched,
+                };
+              },
+            },
           },
-        },
-      },
+      { provide: ServerLauncherService, useValue: { launch: ensure } },
+      { provide: ConfigurationResolver, useValue: {} },
+      { provide: ServerStatusService, useValue: {} },
+      { provide: ServerStopService, useValue: {} },
       { provide: PackageMetadataService, useValue: { version: '1.0.0' } },
       {
         provide: TUI_LAUNCHER,

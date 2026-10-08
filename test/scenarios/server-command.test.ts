@@ -344,7 +344,7 @@ describe('server command presentation', () => {
     ]);
   });
 
-  it('does not mix the restart notice into JSONL progress', async () => {
+  it('tells how to restart a stale server on stderr and keeps stdout free of it in JSONL mode', async () => {
     const stale: ServerLaunchResult = {
       kind: 'running',
       status: { phase: 'running', version: '1.0.0' },
@@ -355,7 +355,25 @@ describe('server command presentation', () => {
       version: '2.0.0',
     });
 
-    expect(result).toMatchObject({ exitCode: 0, stderr: '' });
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stderr: 'Revo 1.0.0 is running; restart it to use 2.0.0: `revo server stop`, then `revo`.\n',
+      stdout: '',
+    });
+  });
+
+  it('stays quiet in JSONL mode when the running server has the installed version', async () => {
+    const current: ServerLaunchResult = {
+      kind: 'running',
+      status: { phase: 'running', version: '2.0.0' },
+    };
+
+    const result = await run(['server', 'start', '--progress=jsonl'], {
+      launch: async () => current,
+      version: '2.0.0',
+    });
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: '', stdout: '' });
   });
 
   it.each<InspectRow>([
