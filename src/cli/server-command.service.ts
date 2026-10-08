@@ -77,7 +77,9 @@ export class ServerCommandService {
     }
     const output = this.output.progress();
     try {
-      const outcome = await this.launch(this.input(configuration), output.sink);
+      const input = this.input(configuration);
+      const outcome = await this.launch(input, output.sink);
+      this.noticeStaleServer(outcome, input);
       if (outcome.kind !== 'started' && outcome.kind !== 'running') {
         this.presentStartOutcome(outcome);
       }
